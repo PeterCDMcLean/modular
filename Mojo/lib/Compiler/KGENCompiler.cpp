@@ -1165,6 +1165,8 @@ KGENCompiler::runKGENPipeline(ModuleOp theModule, TargetInfoAttr target,
     if (options.hdlEmitSV) {
       if (!hdlBuiltModule)
         return Error("HDL lowering produced no module");
+      if (failed(lowerHDLHLMemToSV(*hdlBuiltModule)))
+        return Error("HDL hlmem lowering failed");
       mlir::PassManager circtPM(&context);
       circtPM.addPass(createHDLSeqToSVPass());
       // `seq.initial` leaves a dead placeholder unrealized cast behind.

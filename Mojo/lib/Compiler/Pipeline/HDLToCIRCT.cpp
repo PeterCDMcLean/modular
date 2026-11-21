@@ -47,6 +47,8 @@
 #include "circt/Dialect/HW/PortImplementation.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "circt/Dialect/SV/SVDialect.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "Mojo/KGENDialect/KGENAttrs.h"
 #include "Mojo/KGENDialect/KGENDialect.h"
 #include "Mojo/KGENDialect/KGENOps.h"
@@ -58,6 +60,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
@@ -762,6 +765,7 @@ private:
   Value getConstant(bool value);
   Value getOrCreateReg(unsigned fieldIndex, Type type);
   SmallVector<Value> &getOrCreateArrayStorage(unsigned fieldIndex);
+  Value getOrCreateHLMem(unsigned fieldIndex);
   Value createRegister(unsigned id, Type type, llvm::APInt resetValue,
                         llvm::APInt initialValue, int style);
 
@@ -813,6 +817,8 @@ private:
   DenseMap<unsigned, SmallVector<Value>> arrayEnable;
   DenseMap<unsigned, SmallVector<bool>> arrayWritten;
   DenseMap<unsigned, bool> arrayIsLogic;
+  DenseMap<unsigned, bool> arrayIsExplicitRam;
+  DenseMap<unsigned, Value> hlMemOps;
   DenseMap<unsigned, Value> wireValues;
   struct ArrayElementAccess {
     unsigned field;
@@ -1219,9 +1225,16 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
                     isPowerOn || isClockDivider;
     Type arrayPayload;
     unsigned arrayDepth = 0;
-    bool isArrayStorage =
-        !isConfig && getArrayStorageInfo(fieldType, &bindings, arrayPayload,
-                                         arrayDepth);
+    bool isRam = !isConfig && StringRef(typeName).ends_with("Ram");
+    bool isArrayStorage = isRam;
+    if (isRam) {
+      arrayPayload = getDslTypeParam(fieldType, 0);
+      if (auto depth = getDslTypeIntParam(fieldType, 1, &bindings))
+        arrayDepth = depth->getZExtValue();
+    } else if (!isConfig) {
+      isArrayStorage = getArrayStorageInfo(fieldType, &bindings, arrayPayload,
+                                           arrayDepth);
+    }
     bool isWire = !isConfig && !isArrayStorage &&
                   StringRef(typeName).ends_with("Wire");
     bool isReg = !isConfig && !isArrayStorage && !isWire &&
@@ -1278,6 +1291,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
       fieldModuleNames.push_back({});
       arrayIsLogic[fieldIsArrayStorage.size() - 1] =
           getDslTypeName(arrayPayload).contains("Logic");
+      arrayIsExplicitRam[fieldIsArrayStorage.size() - 1] = isRam;
       continue;
     }
 
@@ -1404,6 +1418,21 @@ CirctModuleEmitter::getOrCreateArrayStorage(unsigned fieldIndex) {
   arrayEnable[fieldIndex] = SmallVector<Value>(depth, ceZero);
   arrayWritten[fieldIndex] = SmallVector<bool>(depth, false);
   return regs;
+}
+
+Value CirctModuleEmitter::getOrCreateHLMem(unsigned fieldIndex) {
+  auto found = hlMemOps.find(fieldIndex);
+  if (found != hlMemOps.end())
+    return found->second;
+  unsigned width = fieldArrayWidths[fieldIndex];
+  unsigned depth = fieldArrayDepths[fieldIndex];
+  auto elementType = IntegerType::get(builder.getContext(), width);
+  auto name = "ram_" + std::to_string(fieldIndex);
+  auto memOp = seq::HLMemOp::create(
+      builder, loc, clk, resetSignal, name,
+      llvm::SmallVector<int64_t>{static_cast<int64_t>(depth)}, elementType);
+  hlMemOps[fieldIndex] = memOp.getHandle();
+  return memOp.getHandle();
 }
 
 Operation *CirctModuleEmitter::findBuiltModule(StringRef name) {
@@ -1883,6 +1912,58 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         return op->emitError()
                << "HDL lowering: array index was not lowered";
       arrayElements[op->getResult(0)] = {array->second, index};
+      return success();
+    }
+
+    // An explicit `Ram[T, N]` lowers to `seq.hlmem` with read/write ports.
+    if (callee.contains("Ram::write") || callee.contains("Ram::read")) {
+      if (op->getNumOperands() < 3)
+        return op->emitError() << "HDL lowering: malformed RAM access";
+      auto ram = fieldPtrs.find(op->getOperand(0));
+      if (ram == fieldPtrs.end() ||
+          ram->second >= fieldIsArrayStorage.size() ||
+          !arrayIsExplicitRam.lookup(ram->second))
+        return op->emitError()
+               << "HDL lowering: RAM access on a non-RAM field";
+      unsigned field = ram->second;
+      if (arrayIsLogic.lookup(field))
+        return op->emitError()
+               << "HDL lowering: Ram[Logic[W], N] is not supported yet";
+      Value index = getValue(op->getOperand(1));
+      if (!index)
+        return op->emitError() << "HDL lowering: RAM index was not lowered";
+      unsigned depth = fieldArrayDepths[field];
+      unsigned addrWidth = 1;
+      while (addrWidth < 64 && (uint64_t(1) << addrWidth) < depth)
+        ++addrWidth;
+      Value addr = index;
+      if (index.getType().getIntOrFloatBitWidth() != addrWidth)
+        addr = comb::ExtractOp::create(builder, loc, index, 0, addrWidth);
+      Value mem = getOrCreateHLMem(field);
+
+      if (callee.contains("Ram::write")) {
+        Value data = getValue(op->getOperand(2));
+        if (!data)
+          return op->emitError()
+                 << "HDL lowering: RAM write data was not lowered";
+        Value enable = getConstant(true);
+        if (op->getNumOperands() > 3) {
+          enable = getValue(op->getOperand(3));
+          if (!enable)
+            return op->emitError()
+                   << "HDL lowering: RAM write enable was not lowered";
+        }
+        seq::WritePortOp::create(builder, loc, mem, {addr}, data, enable, 1);
+        return success();
+      }
+
+      Value readData = seq::ReadPortOp::create(
+                            builder, loc, mem, {addr}, getConstant(true), 0)
+                           .getReadData();
+      Value dest = op->getOperand(2);
+      values[dest] = readData;
+      if (dest == resultPtr)
+        returnValue = readData;
       return success();
     }
 
@@ -3082,6 +3163,92 @@ std::unique_ptr<Pass> createHDLToCIRCTPass(const HDLEmitOptions &options) {
 
 std::unique_ptr<Pass> createHDLSeqToSVPass() {
   return circt::createLowerSeqToSVPass();
+}
+
+LogicalResult lowerHDLHLMemToSV(ModuleOp module) {
+  module.getContext()->getOrLoadDialect<sv::SVDialect>();
+  SmallVector<seq::HLMemOp> mems;
+  module.walk([&](seq::HLMemOp mem) { mems.push_back(mem); });
+
+  for (seq::HLMemOp mem : mems) {
+    auto memType = mem.getMemType();
+    if (memType.getRank() != 1)
+      return mem.emitError()
+             << "HDL lowering: only unidimensional RAM is supported";
+    int64_t depth = memType.getShape()[0];
+    Type elementType = memType.getElementType();
+    Value clk = mem.getClk();
+    Value rst = mem.getRst();
+
+    struct WritePort {
+      seq::WritePortOp op;
+      Value address;
+      Value data;
+      Value enable;
+    };
+    SmallVector<WritePort> writes;
+    SmallVector<seq::ReadPortOp> reads;
+    for (Operation *user : mem.getHandle().getUsers()) {
+      if (auto write = dyn_cast<seq::WritePortOp>(user)) {
+        if (write.getLatency() != 1)
+          return write.emitError()
+                 << "HDL lowering: only write latency 1 is supported";
+        if (write.getAddresses().size() != 1)
+          return write.emitError()
+                 << "HDL lowering: only unidimensional RAM is supported";
+        writes.push_back({write, write.getAddresses()[0], write.getInData(),
+                          write.getWrEn()});
+      } else if (auto read = dyn_cast<seq::ReadPortOp>(user)) {
+        if (read.getLatency() != 0)
+          return read.emitError()
+                 << "HDL lowering: only read latency 0 is supported";
+        if (read.getAddresses().size() != 1)
+          return read.emitError()
+                 << "HDL lowering: only unidimensional RAM is supported";
+        reads.push_back(read);
+      } else {
+        return user->emitError()
+               << "HDL lowering: unsupported seq.hlmem user";
+      }
+    }
+
+    IRRewriter rewriter(module.getContext());
+    rewriter.setInsertionPoint(mem);
+    auto memArrayType = hw::UnpackedArrayType::get(elementType, depth);
+    Value svMem =
+        sv::VarOp::create(rewriter, mem.getLoc(), memArrayType,
+                          rewriter.getStringAttr(mem.getName()))
+            .getResult();
+
+    Value hwClk = seq::FromClockOp::create(rewriter, mem.getLoc(), clk);
+    sv::AlwaysFFOp::create(
+        rewriter, mem.getLoc(), sv::EventControl::AtPosEdge, hwClk,
+        sv::ResetType::SyncReset, sv::EventControl::AtPosEdge, rst, [&] {
+          for (WritePort &write : writes) {
+            sv::IfOp::create(rewriter, mem.getLoc(), write.enable, [&] {
+              Value memLoc = sv::ArrayIndexInOutOp::create(
+                  rewriter, mem.getLoc(), svMem, write.address);
+              sv::PAssignOp::create(rewriter, mem.getLoc(), memLoc,
+                                    write.data);
+            });
+          }
+        });
+
+    for (WritePort &write : writes)
+      rewriter.eraseOp(write.op);
+
+    for (seq::ReadPortOp read : reads) {
+      rewriter.setInsertionPointAfter(read);
+      Value memLoc = sv::ArrayIndexInOutOp::create(
+          rewriter, read.getLoc(), svMem, read.getAddresses()[0]);
+      Value data =
+          sv::ReadInOutOp::create(rewriter, read.getLoc(), memLoc);
+      read.getReadData().replaceAllUsesWith(data);
+      rewriter.eraseOp(read);
+    }
+    rewriter.eraseOp(mem);
+  }
+  return success();
 }
 
 LogicalResult exportHDLSystemVerilog(ModuleOp module, raw_ostream &os) {

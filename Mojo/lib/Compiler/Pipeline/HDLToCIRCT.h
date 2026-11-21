@@ -79,6 +79,9 @@ std::unique_ptr<mlir::Pass> createHDLToCIRCTPass(const HDLEmitOptions &options);
 /// normal (non-nested) pass after the HDL lowering.
 std::unique_ptr<mlir::Pass> createHDLSeqToSVPass();
 
+/// Lower the `seq.hlmem` memory form to explicit `sv` memory ops.
+mlir::LogicalResult lowerHDLHLMemToSV(mlir::ModuleOp module);
+
 /// Export SystemVerilog from the already-lowered module. Runs outside any pass
 /// manager execution context, which is what CIRCT's exporter expects.
 mlir::LogicalResult exportHDLSystemVerilog(mlir::ModuleOp module,

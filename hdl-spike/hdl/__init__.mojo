@@ -10,6 +10,7 @@ from .bits import Bits, mux
 from .logic import Logic, XMode, bit, logic, mux_logic
 from .mem import Mem
 from .packed import Packed
+from .ram import Ram
 from .wire import Wire
 from .hdl_type import HdlType
 from .reg import Reg
