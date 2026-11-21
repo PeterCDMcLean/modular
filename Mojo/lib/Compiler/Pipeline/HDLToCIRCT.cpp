@@ -278,6 +278,9 @@ static Type getHwType(Type type) {
   return IntegerType::get(type.getContext(), width);
 }
 
+static std::optional<bool>
+getTypedAttrBool(TypedAttr attr, const ParamBindings *bindings);
+
 /// Decode an integer from a typed parameter attribute, resolving parameter
 /// declarations through `bindings` when this is a specialization.
 static std::optional<llvm::APInt>
@@ -309,18 +312,158 @@ getTypedAttrInt(TypedAttr attr, const ParamBindings *bindings = nullptr) {
     if (!bindings)
       return std::nullopt;
     auto opcode = expr.getOpcode();
-    if (opcode != KGEN::POC::Add && opcode != KGEN::POC::Mul &&
-        opcode != KGEN::POC::MulNoWrap)
+    auto operands = expr.getOperands();
+
+    if (opcode == KGEN::POC::Add || opcode == KGEN::POC::Mul ||
+        opcode == KGEN::POC::MulNoWrap || opcode == KGEN::POC::Max ||
+        opcode == KGEN::POC::Min) {
+      if (operands.empty())
+        return std::nullopt;
+      auto first = getTypedAttrInt(operands[0], bindings);
+      if (!first)
+        return std::nullopt;
+      llvm::APInt accum = first->zextOrTrunc(64);
+      for (unsigned i = 1; i < operands.size(); ++i) {
+        auto value = getTypedAttrInt(operands[i], bindings);
+        if (!value)
+          return std::nullopt;
+        auto bits = value->zextOrTrunc(64);
+        if (opcode == KGEN::POC::Add)
+          accum += bits;
+        else if (opcode == KGEN::POC::Mul || opcode == KGEN::POC::MulNoWrap)
+          accum *= bits;
+        else if (opcode == KGEN::POC::Max)
+          accum = accum.ugt(bits) ? accum : bits;
+        else
+          accum = accum.ult(bits) ? accum : bits;
+      }
+      return accum;
+    }
+
+    if ((opcode == KGEN::POC::Div || opcode == KGEN::POC::DivS ||
+         opcode == KGEN::POC::DivU || opcode == KGEN::POC::Mod ||
+         opcode == KGEN::POC::FloorDivS || opcode == KGEN::POC::RemS ||
+         opcode == KGEN::POC::RemU) &&
+        operands.size() == 2) {
+      auto lhs = getTypedAttrInt(operands[0], bindings);
+      auto rhs = getTypedAttrInt(operands[1], bindings);
+      if (!lhs || !rhs || rhs->isZero())
+        return std::nullopt;
+      auto a = lhs->zextOrTrunc(64);
+      auto b = rhs->zextOrTrunc(64);
+      if (opcode == KGEN::POC::Div)
+        return a.udiv(b);
+      if (opcode == KGEN::POC::DivS || opcode == KGEN::POC::FloorDivS)
+        return a.sdiv(b);
+      if (opcode == KGEN::POC::Mod || opcode == KGEN::POC::RemU)
+        return a.urem(b);
+      return a.srem(b);
+    }
+
+    if (opcode == KGEN::POC::Cond && operands.size() == 3) {
+      auto cond = getTypedAttrBool(operands[0], bindings);
+      if (!cond)
+        return std::nullopt;
+      return getTypedAttrInt(operands[(*cond) ? 1 : 2], bindings);
+    }
+
+    if (opcode == KGEN::POC::Apply && operands.size() >= 3) {
+      auto func = KGEN::FuncSymbolGenerator::dynCast(operands[0]);
+      auto name = func ? func.getSymbol().getLeafReference().getValue()
+                       : StringRef();
+      auto lhs = getTypedAttrInt(operands[1], bindings);
+      auto rhs = getTypedAttrInt(operands[2], bindings);
+      if (!lhs || !rhs || rhs->isZero())
+        return std::nullopt;
+      auto a = lhs->zextOrTrunc(64);
+      auto b = rhs->zextOrTrunc(64);
+      if (name.contains("__floordiv__"))
+        return a.udiv(b);
+      if (name.contains("__ceildiv__"))
+        return a.udiv(b) + (a.urem(b).isZero() ? 0 : 1);
+      if (name.contains("__mod__"))
+        return a.urem(b);
+      if (name.contains("__mul__"))
+        return a * b;
+      if (name.contains("__add__"))
+        return a + b;
       return std::nullopt;
-    llvm::APInt accum(64, opcode == KGEN::POC::Add ? 0 : 1);
-    for (TypedAttr operand : expr.getOperands()) {
-      auto value = getTypedAttrInt(operand, bindings);
+    }
+    return std::nullopt;
+  }
+  return std::nullopt;
+}
+
+static std::optional<bool>
+getTypedAttrBool(TypedAttr attr, const ParamBindings *bindings) {
+  if (!attr)
+    return std::nullopt;
+  if (auto simd = dyn_cast<KGEN::SIMDAttr>(attr)) {
+    if (simd.getType().getResolvedSize() == 1 &&
+        simd.getType().getResolvedDType() == KGENDType::kBool)
+      return simd.getAsBool();
+  }
+  if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+    if (intAttr.getType().isInteger(1))
+      return intAttr.getValue().getBoolValue();
+
+  if (auto ident = dyn_cast<KGEN::ParamIdenticalAttr>(attr)) {
+    auto operands = ident.getOperands();
+    if (operands.size() < 2)
+      return std::nullopt;
+    auto lhs = getTypedAttrInt(operands[0], bindings);
+    auto rhs = getTypedAttrInt(operands[1], bindings);
+    if (lhs && rhs)
+      return lhs->zextOrTrunc(64) == rhs->zextOrTrunc(64);
+    auto lhsBool = getTypedAttrBool(operands[0], bindings);
+    auto rhsBool = getTypedAttrBool(operands[1], bindings);
+    if (lhsBool && rhsBool)
+      return *lhsBool == *rhsBool;
+    return std::nullopt;
+  }
+
+  auto expr = dyn_cast<KGEN::ParamOperatorAttr>(attr);
+  if (!expr)
+    return std::nullopt;
+  auto opcode = expr.getOpcode();
+  auto operands = expr.getOperands();
+  if ((opcode == KGEN::POC::EQ || opcode == KGEN::POC::LT ||
+       opcode == KGEN::POC::LE) &&
+      operands.size() == 2) {
+    auto lhs = getTypedAttrInt(operands[0], bindings);
+    auto rhs = getTypedAttrInt(operands[1], bindings);
+    if (!lhs || !rhs)
+      return std::nullopt;
+    auto a = lhs->zextOrTrunc(64);
+    auto b = rhs->zextOrTrunc(64);
+    if (opcode == KGEN::POC::EQ)
+      return a == b;
+    if (opcode == KGEN::POC::LT)
+      return a.ult(b);
+    return a.ule(b);
+  }
+  if ((opcode == KGEN::POC::And || opcode == KGEN::POC::Or ||
+       opcode == KGEN::POC::Xor) &&
+      !operands.empty()) {
+    bool accum = opcode == KGEN::POC::And;
+    for (TypedAttr operand : operands) {
+      auto value = getTypedAttrBool(operand, bindings);
       if (!value)
         return std::nullopt;
-      auto bits = value->zextOrTrunc(64);
-      accum = opcode == KGEN::POC::Add ? accum + bits : accum * bits;
+      if (opcode == KGEN::POC::And)
+        accum = accum && *value;
+      else if (opcode == KGEN::POC::Or)
+        accum = accum || *value;
+      else
+        accum = accum != *value;
     }
     return accum;
+  }
+  if (opcode == KGEN::POC::Cond && operands.size() == 3) {
+    auto cond = getTypedAttrBool(operands[0], bindings);
+    if (!cond)
+      return std::nullopt;
+    return getTypedAttrBool(operands[(*cond) ? 1 : 2], bindings);
   }
   return std::nullopt;
 }
