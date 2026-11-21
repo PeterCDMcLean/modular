@@ -13,9 +13,9 @@ struct MixedLogicReset:
         self.async_state = Reg[Logic[8], 2](5)
 
     def sync_step(mut self, d: Logic[8]) -> Logic[8]:
-        self.sync_state.next(~(self.sync_state.get() & d))
+        self.sync_state.next(1) <= ~(self.sync_state.get() & d)
         return self.sync_state.get()
 
     def async_step(mut self, e: Logic[8]) -> Logic[8]:
-        self.async_state.next(~(self.async_state.get() & e))
+        self.async_state.next(1) <= ~(self.async_state.get() & e)
         return self.async_state.get()

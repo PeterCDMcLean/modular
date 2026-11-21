@@ -14,7 +14,7 @@ struct RegDemo:
 
     def run(mut self, en: Bool) -> Bits[8]:
         var next = self.count.get() + Bits[8](1)
-        self.count.next(next)
+        self.count.next(1) <= next
         if en:
-            self.held.next(self.held.get() + Bits[8](2))
+            self.held.next(1) <= self.held.get() + Bits[8](2)
         return self.count.get() ^ self.held.get()

@@ -828,6 +828,8 @@ private:
   struct DelayedNext {
     unsigned field;
     unsigned delay;
+    Value elementIndex;
+    bool isArrayElement;
   };
   DenseMap<Value, DelayedNext> delayedTargets;
   DenseMap<unsigned, SmallVector<Value>> delayedNextRegs;
@@ -1041,7 +1043,26 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
 
     DenseMap<Value, unsigned> fieldIndexes;
     DenseMap<Value, llvm::APInt> constants;
+    DenseMap<Value, llvm::APInt> packedConstants;
     DenseMap<Value, Value> storeSources;
+    auto resolveConstant = [&](Value value) -> std::optional<llvm::APInt> {
+      if (auto constant = constants.find(value); constant != constants.end())
+        return constant->second;
+      Operation *defining = value.getDefiningOp();
+      if (!defining)
+        return std::nullopt;
+      if (defining->getName().getStringRef() == "kgen.call" &&
+          callCalleeName(defining).contains("Packed::__init__")) {
+        Value argument = defining->getOperand(0);
+        if (auto constant = constants.find(argument);
+            constant != constants.end())
+          return constant->second;
+        if (Operation *argDef = argument.getDefiningOp())
+          return getConstantInt(argDef, &bindings);
+        return std::nullopt;
+      }
+      return getConstantInt(defining, &bindings);
+    };
     for (Operation &op : entry.getOperations()) {
       StringRef name = op.getName().getStringRef();
       if (name == "kgen.struct.gep") {
@@ -1073,8 +1094,20 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
       if (!callee.contains("Bits::__init__") &&
           !callee.contains("Logic::__init__") &&
           !callee.contains("Reg::__init__") &&
+          !callee.contains("Packed::__init__") &&
           !callee.contains("Mem::__init__"))
         continue;
+      // A packed constructor writes its integer constant through a
+      // destination pointer; remember it so a following `Reg[Packed]`
+      // constructor can resolve its reset value.
+      if (callee.contains("Packed::__init__") &&
+          !callee.contains("__init__(move:")) {
+        Value dest = op.getOperand(op.getNumOperands() - 1);
+        if (auto value = resolveConstant(op.getOperand(0)))
+          packedConstants[dest] = *value;
+        continue;
+      }
+
       // A memory constructor can carry one constant per entry. The variadic
       // form builds a VariadicList over a `pop.array.create` whose elements
       // are pointers to stored constants.
@@ -1146,13 +1179,12 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
         auto field = fieldIndexes.find(op.getOperand(1));
         if (field == fieldIndexes.end())
           continue;
-        Operation *valueOp = op.getOperand(0).getDefiningOp();
-        auto value = constants.find(op.getOperand(0));
         std::optional<llvm::APInt> result;
-        if (value != constants.end())
-          result = value->second;
-        else if (valueOp)
-          result = getConstantInt(valueOp, &bindings);
+        if (auto packed = packedConstants.find(op.getOperand(0));
+            packed != packedConstants.end())
+          result = packed->second;
+        else
+          result = resolveConstant(op.getOperand(0));
         if (result)
           resetValues[field->second] = *result;
         continue;
@@ -1354,6 +1386,8 @@ LogicalResult CirctModuleEmitter::findMethods() {
   return success();
 }
 
+static void setHoldValue(Value reg);
+
 SmallVector<Value> &
 CirctModuleEmitter::getOrCreateArrayStorage(unsigned fieldIndex) {
   auto found = arrayRegs.find(fieldIndex);
@@ -1419,6 +1453,11 @@ CirctModuleEmitter::getOrCreateArrayStorage(unsigned fieldIndex) {
       }
     }
   }
+  for (Value reg : regs)
+    setHoldValue(reg);
+  if (isLogic)
+    for (Value reg : arrayXzRegs[fieldIndex])
+      setHoldValue(reg);
   arrayNext[fieldIndex] = regs;
   if (isLogic)
     arrayXzNext[fieldIndex] = arrayXzRegs[fieldIndex];
@@ -1519,6 +1558,8 @@ CirctModuleEmitter::getOrCreateLogicReg(unsigned fieldIndex, unsigned width) {
       createRegister(fieldIndex * 2, type, resetValue, initialValue, style);
   Value xzReg =
       createRegister(fieldIndex * 2 + 1, type, zeroValue, zeroValue, style);
+  setHoldValue(valReg);
+  setHoldValue(xzReg);
   LogicValue regs{valReg, xzReg};
   logicRegs[fieldIndex] = regs;
   logicNext[fieldIndex] = regs;
@@ -1592,6 +1633,16 @@ Value CirctModuleEmitter::createRegister(unsigned id, Type type,
                                 initial);
 }
 
+/// Make an unwritten register hold its current value instead of zero.
+static void setHoldValue(Value reg) {
+  if (auto comp = reg.getDefiningOp<seq::CompRegOp>())
+    comp->setOperand(0, reg);
+  else if (auto fir = reg.getDefiningOp<seq::FirRegOp>())
+    fir->setOperand(0, reg);
+  else if (auto ce = reg.getDefiningOp<seq::CompRegClockEnabledOp>())
+    ce->setOperand(0, reg);
+}
+
 Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
   if (auto delayed = delayedNextRegs.find(fieldIndex);
       delayed != delayedNextRegs.end() && !delayed->second.empty())
@@ -1610,6 +1661,7 @@ Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
       fieldIndex < fieldResetStyle.size() ? fieldResetStyle[fieldIndex]
                                           : resetStyle;
   Value reg = createRegister(fieldIndex, type, resetValue, initialValue, style);
+  setHoldValue(reg);
   fieldRegs[fieldIndex] = reg;
   fieldNext[fieldIndex] = reg;
   return reg;
@@ -2472,12 +2524,40 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       if (target == delayedTargets.end())
         return op->emitError()
                << "HDL lowering: unknown delayed-next target";
+      unsigned field = target->second.field;
+      if (target->second.isArrayElement) {
+        bool isLogic = arrayIsLogic.lookup(field);
+        if (isLogic) {
+          LogicValue value = getLogicValue(op->getOperand(1));
+          if (!value)
+            return op->emitError()
+                   << "HDL lowering: delayed-next value was not lowered";
+          return arrayWrite(field, target->second.elementIndex, value.val,
+                            value.xz, true, Value(), condition);
+        }
+        Value value = getValue(op->getOperand(1));
+        if (!value)
+          return op->emitError()
+                 << "HDL lowering: delayed-next value was not lowered";
+        return arrayWrite(field, target->second.elementIndex, value, Value(),
+                          false, Value(), condition);
+      }
+      if (field < fieldIsLogic.size() && fieldIsLogic[field]) {
+        if (target->second.delay > 1)
+          return op->emitError()
+                 << "HDL lowering: delayed next on Logic state is not "
+                    "supported yet";
+        LogicValue value = getLogicValue(op->getOperand(1));
+        if (!value)
+          return op->emitError()
+                 << "HDL lowering: delayed-next value was not lowered";
+        return storeLogicField(field, value, condition);
+      }
       Value value = getValue(op->getOperand(1));
       if (!value)
         return op->emitError()
                << "HDL lowering: delayed-next value was not lowered";
-      return delayedWrite(target->second.field, target->second.delay, value,
-                          condition);
+      return delayedWrite(field, target->second.delay, value, condition);
     }
 
     // `Reg[T, style]` is a typed state field. `.next` is the clocked update
@@ -2490,17 +2570,29 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       // Record the delayed-update target returned by `q.next(n)`.
       if (callee.contains("::next") && op->getNumOperands() == 3 &&
           callee.contains("::SIMD")) {
-        auto field = fieldPtrs.find(op->getOperand(0));
-        if (field == fieldPtrs.end())
+        unsigned field = 0;
+        Value elementIndex;
+        bool isArrayElement = false;
+        if (auto element = arrayElements.find(op->getOperand(0));
+            element != arrayElements.end()) {
+          field = element->second.field;
+          elementIndex = element->second.index;
+          isArrayElement = true;
+        } else if (auto fieldPtr = fieldPtrs.find(op->getOperand(0));
+                   fieldPtr != fieldPtrs.end()) {
+          field = fieldPtr->second;
+        } else {
           return op->emitError()
                  << "HDL lowering: delayed next on a non-field value";
+        }
         auto delay = getConstantInt(op->getOperand(1).getDefiningOp(),
                                     &bindings);
         if (!delay)
           return op->emitError()
                  << "HDL lowering: delayed next requires a constant delay";
         delayedTargets[op->getOperand(2)] = {
-            field->second, static_cast<unsigned>(delay->getZExtValue())};
+            field, static_cast<unsigned>(delay->getZExtValue()), elementIndex,
+            isArrayElement};
         return success();
       }
 

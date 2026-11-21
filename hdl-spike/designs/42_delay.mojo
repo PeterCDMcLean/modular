@@ -23,5 +23,5 @@ struct PastDelay:
         self.d = Reg[Bits[8]]()
 
     def run(mut self, din: Bits[8]) -> Bits[8]:
-        self.d.next(din)
+        self.d.next(1) <= din
         return self.d.past(2)

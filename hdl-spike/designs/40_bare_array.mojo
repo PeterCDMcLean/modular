@@ -13,7 +13,7 @@ struct BareArray:
 
     def run(mut self, addr: Int, wd: Bits[8], we: Bool) -> Bits[8]:
         if we:
-            self.mem[addr].next(wd)
+            self.mem[addr].next(1) <= wd
         return self.mem[addr].get()
 
 
@@ -26,7 +26,7 @@ struct StaticArray:
 
     def run(mut self, wd: Bits[8], we: Bool) -> Bits[8]:
         if we:
-            self.mem[0].next(wd)
+            self.mem[0].next(1) <= wd
         return self.mem[1].get()
 
 
@@ -39,5 +39,5 @@ struct LogicArray:
 
     def run(mut self, addr: Int, wd: Logic[8], we: Bool) -> Logic[8]:
         if we:
-            self.mem[addr].next(wd)
+            self.mem[addr].next(1) <= wd
         return self.mem[addr].get()

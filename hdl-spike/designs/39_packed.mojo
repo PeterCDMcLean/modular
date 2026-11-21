@@ -17,7 +17,7 @@ struct PackedHold:
         self.r = Reg[Packed[Bits[8], 4]]()
 
     def run(mut self, din: Packed[Bits[8], 4]) -> Packed[Bits[8], 4]:
-        self.r.next(din)
+        self.r.next(1) <= din
         return self.r.get()
 
 

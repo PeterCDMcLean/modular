@@ -9,7 +9,7 @@ selects the register-level reset behavior:
 * 2: asynchronous, active-high
 * 3: asynchronous, active-low
 
-`.next(value)` is the clocked update; `.get()` reads the current value.
+`.next(n) <= value` is the clocked update; `.get()` reads the current value.
 """
 
 from .hdl_type import HdlType
@@ -42,10 +42,6 @@ struct Reg[T: HdlType & Deinitable & Defaultable, style: Int = 0](
     def copy(self) -> Self:
         """Returns a copy."""
         return Reg[Self.T, Self.style](self.inner.copy())
-
-    def next(mut self, value: Self.T):
-        """Sets the next-state value (clocked update)."""
-        self.inner = value.copy()
 
     def next(mut self, delay: Int) -> NextTarget[
         Self.T, origin_of(self), Self.style

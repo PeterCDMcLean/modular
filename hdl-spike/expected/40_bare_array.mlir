@@ -102,7 +102,7 @@ hw.module @StaticArray(in %wd : i8, in %we : i1, in %clk : !seq.clock, in %rst :
     %c0_i8_2 = hw.constant 0 : i8
     seq.yield %c0_i8_2 : i8
   } : () -> !seq.immutable<i8>
-  %mem_0_1 = seq.compreg.ce sym @mem_0_1 %c0_i8, %clk, %false reset %rst, %c0_i8_1 initial %1 : i8  
+  %mem_0_1 = seq.compreg.ce sym @mem_0_1 %mem_0_1, %clk, %false reset %rst, %c0_i8_1 initial %1 : i8  
   %true = hw.constant true
   %2 = comb.and %we, %true : i1
   %c1_i64 = hw.constant 1 : i64
