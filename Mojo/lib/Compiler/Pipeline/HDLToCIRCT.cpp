@@ -2376,6 +2376,77 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           returnValue = constant;
         return success();
       }
+      auto resize = [&](Value value, unsigned width) -> Value {
+        unsigned valueWidth = value.getType().getIntOrFloatBitWidth();
+        if (valueWidth == width)
+          return value;
+        if (valueWidth < width) {
+          Value zeros = hw::ConstantOp::create(
+              builder, loc, llvm::APInt(width - valueWidth, 0));
+          return comb::ConcatOp::create(builder, loc,
+                                        ArrayRef<Value>{zeros, value});
+        }
+        return comb::ExtractOp::create(builder, loc, value, 0, width);
+      };
+
+      if (callee.contains("__getitem__") && op->getNumOperands() == 3) {
+        unsigned packedWidth = getCallPackedWidth(op, &bindings);
+        if (!packedWidth)
+          return op->emitError()
+                 << "HDL lowering: unsupported Packed element access";
+        unsigned laneWidth = getHdlWidth(getCallTypeParam(op, 0), &bindings);
+        Value packed = getValue(op->getOperand(0));
+        Value index = getValue(op->getOperand(1));
+        if (!packed || !index)
+          return op->emitError()
+                 << "HDL lowering: Packed element operand was not lowered";
+        Value shift = resize(index, packedWidth);
+        Value laneWidthValue = hw::ConstantOp::create(
+            builder, loc, llvm::APInt(packedWidth, laneWidth));
+        Value offset =
+            comb::MulOp::create(builder, loc, shift, laneWidthValue);
+        Value shifted = comb::ShrUOp::create(builder, loc, packed, offset);
+        Value lane = comb::ExtractOp::create(builder, loc, shifted, 0,
+                                             laneWidth);
+        Value dest = op->getOperand(2);
+        values[dest] = lane;
+        if (dest == resultPtr)
+          returnValue = lane;
+        return success();
+      }
+
+      if (callee.contains("__setitem__") && op->getNumOperands() == 3) {
+        unsigned packedWidth = getCallPackedWidth(op, &bindings);
+        if (!packedWidth)
+          return op->emitError()
+                 << "HDL lowering: unsupported Packed element access";
+        unsigned laneWidth = getHdlWidth(getCallTypeParam(op, 0), &bindings);
+        Value packed = getValue(op->getOperand(0));
+        Value index = getValue(op->getOperand(1));
+        Value value = getValue(op->getOperand(2));
+        if (!packed || !index || !value)
+          return op->emitError()
+                 << "HDL lowering: Packed element operand was not lowered";
+        Value shift = resize(index, packedWidth);
+        Value laneWidthValue = hw::ConstantOp::create(
+            builder, loc, llvm::APInt(packedWidth, laneWidth));
+        Value offset =
+            comb::MulOp::create(builder, loc, shift, laneWidthValue);
+        Value valueWide = resize(value, packedWidth);
+        Value shiftedValue =
+            comb::ShlOp::create(builder, loc, valueWide, offset);
+        llvm::APInt laneMask = llvm::APInt::getLowBitsSet(packedWidth,
+                                                          laneWidth);
+        Value mask = hw::ConstantOp::create(builder, loc, laneMask);
+        Value shiftedMask = comb::ShlOp::create(builder, loc, mask, offset);
+        Value cleared =
+            comb::AndOp::create(builder, loc, packed, bitNot(shiftedMask));
+        Value updated =
+            comb::OrOp::create(builder, loc, cleared, shiftedValue);
+        values[op->getOperand(0)] = updated;
+        return success();
+      }
+
       if (op->getNumOperands() == 2) {
         Value source = getValue(op->getOperand(0));
         if (!source)
