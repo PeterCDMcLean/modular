@@ -1220,6 +1220,31 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         } else if (callee.contains("::__xor__")) {
           result.val = comb::XorOp::create(builder, loc, a.val, b.val);
           result.xz = comb::OrOp::create(builder, loc, a.xz, b.xz);
+        } else if (callee.contains("::__eq__") ||
+                   callee.contains("::__ne__")) {
+          // A known difference decides the comparison; otherwise any unknown
+          // bit makes the single-bit result unknown (value 0, mask 1).
+          Value eitherXz = comb::OrOp::create(builder, loc, a.xz, b.xz);
+          Value known = bitNot(eitherXz);
+          Value differsBits =
+              comb::AndOp::create(builder, loc, known,
+                                  comb::XorOp::create(builder, loc, a.val,
+                                                      b.val));
+          unsigned width = a.val.getType().getIntOrFloatBitWidth();
+          auto zero =
+              hw::ConstantOp::create(builder, loc, llvm::APInt(width, 0));
+          Value differs = comb::ICmpOp::create(
+              builder, loc, comb::ICmpPredicate::ne, differsBits, zero);
+          Value hasUnknown = comb::ICmpOp::create(
+              builder, loc, comb::ICmpPredicate::ne, eitherXz, zero);
+          Value notDiffers = bitNot(differs);
+          result.xz =
+              comb::AndOp::create(builder, loc, hasUnknown, notDiffers);
+          if (callee.contains("::__eq__"))
+            result.val = comb::AndOp::create(
+                builder, loc, notDiffers, bitNot(hasUnknown));
+          else
+            result.val = differs;
         } else {
           return op->emitError() << "HDL lowering: unsupported Logic call '"
                                  << callee << "'";

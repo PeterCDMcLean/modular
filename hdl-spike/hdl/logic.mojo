@@ -67,6 +67,56 @@ struct Logic[W: Int = 1, xmode: XMode = XMode.taint](Copyable, Movable):
         """Returns whether one bit is unknown."""
         return self.xz.bit(index)
 
+    def __eq__(self, other: Self) -> Logic[1, Self.xmode]:
+        """4-state equality.
+
+        A known difference is a known false; otherwise any unknown bit makes
+        the result unknown; only fully-known equal operands are known true.
+        """
+        var differs = False
+        var unknown = False
+        for i in range(Self.W):
+            var ax = self.xz.bit(i)
+            var bx = other.xz.bit(i)
+            if ax or bx:
+                unknown = True
+            elif self.val.bit(i) != other.val.bit(i):
+                differs = True
+        var result = Logic[1, Self.xmode]()
+        if differs:
+            result.val.raw.set(0, False)
+            result.xz.raw.set(0, False)
+        elif unknown:
+            result.val.raw.set(0, False)
+            result.xz.raw.set(0, True)
+        else:
+            result.val.raw.set(0, True)
+            result.xz.raw.set(0, False)
+        return result^
+
+    def __ne__(self, other: Self) -> Logic[1, Self.xmode]:
+        """4-state inequality, the dual of ``__eq__``."""
+        var differs = False
+        var unknown = False
+        for i in range(Self.W):
+            var ax = self.xz.bit(i)
+            var bx = other.xz.bit(i)
+            if ax or bx:
+                unknown = True
+            elif self.val.bit(i) != other.val.bit(i):
+                differs = True
+        var result = Logic[1, Self.xmode]()
+        if differs:
+            result.val.raw.set(0, True)
+            result.xz.raw.set(0, False)
+        elif unknown:
+            result.val.raw.set(0, False)
+            result.xz.raw.set(0, True)
+        else:
+            result.val.raw.set(0, False)
+            result.xz.raw.set(0, False)
+        return result^
+
     def __invert__(self) -> Logic[Self.W, Self.xmode]:
         """Bitwise complement; the mask is unchanged."""
         return Logic[Self.W, Self.xmode](~self.val, self.xz.copy())

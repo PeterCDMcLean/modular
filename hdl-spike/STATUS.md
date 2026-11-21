@@ -22,7 +22,7 @@ Build and test record:
   1,188.7 s, 8,639 actions.
 * `hdl-spike/tests/run_all.sh`: **green** in both `-c dbg` and `-c opt`
   (00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15, 16,
-  17). `--emit=circt` and `--emit=sv` run in-process.
+  17, 18). `--emit=circt` and `--emit=sv` run in-process.
 * Verilator lint: skipped (not installed).
 * CLI adaptation: the current compiler uses `-I <dir>`; the tests were updated
   from `-mojo-search-paths`.
@@ -36,7 +36,7 @@ Build and test record:
 | 2. Lower `Inv` → `hw`/`comb` | **green** | `designs/01_inv.mojo` | Emitted MLIR is byte-identical to `expected/01_inv.mlir`; the operations are real CIRCT `hw`/`comb` ops built in-process. `--emit=sv` exports SystemVerilog **in-process** through CIRCT's ExportVerilog (no `circt-opt` subprocess), matching `expected/01_inv.sv` after comment/blank-line normalization. |
 | Type layer | **green (prototype)** | `hdl/bits.mojo`, `hdl/logic.mojo` | `Bits[W]` wraps bitlib's `BitInteger[W]` with stable result types; `Logic[W]` adds a 4-state value+mask. Native Sim tests cover add/mux/wrap and X/Z propagation (`03_sim_types`). |
 | 3. Widths and arithmetic | **green (combinational)** | `designs/03_add8.mojo`, `designs/06_bits_ops.mojo`, `designs/07_bits_bit.mojo`, `designs/10_var_bit.mojo` | Primitive `UInt8` add lowers to `comb.add` (`04_add8`). The compiler now reads the *source* signature, so `Bits[W]` keeps its declared width at ports: a `Bits[12]` module lowers add/sub/and/or/xor/invert to `comb` ops (`06_bits_ops`), and `a.bit(3)` to `comb.extract` (`07_bits_bit`). A dynamic `a.bit(i)` lowers to `comb.shru` plus `comb.extract`, with the index truncated to `W` bits (`10_var_bit`). `index`/`uindex` ports map to 64-bit values. A `Bits[W]` by-ref result is recognized from the `byref_result` argument convention and written to `hw.output`. |
-| Logic[W] 4-state | **green (comb + state)** | `designs/11_logic_ops.mojo`, `designs/17_logic_state.mojo` | Each `Logic[W]` port becomes a value net plus a `<name>_xz` mask net. `&`/`\|` apply dominant known-zero/known-one rules, `^` ORs the masks, `~` keeps the mask, and `mux_logic` resolves unknown selects. A `Logic[W]` state field becomes a value register plus an X/Z mask register, with constructor constants as reset/power-on values and the same enable mux as `Bits` (`17_logic_state`). X/Z-aware comparisons remain open. |
+| Logic[W] 4-state | **green (comb + state)** | `designs/11_logic_ops.mojo`, `designs/17_logic_state.mojo`, `designs/18_logic_compare.mojo` | Each `Logic[W]` port becomes a value net plus a `<name>_xz` mask net. `&`/`\|` apply dominant known-zero/known-one rules, `^` ORs the masks, `~` keeps the mask, and `mux_logic` resolves unknown selects. A `Logic[W]` state field becomes a value register plus an X/Z mask register, with constructor constants as reset/power-on values and the same enable mux as `Bits` (`17_logic_state`). `==`/`!=` return a 4-state `Logic[1]`: a known difference yields a known false/true, any unknown bit without a known difference yields an unknown result, and only fully-known equal operands are known true (`18_logic_compare`). |
 | 4. Registers/reset | **partial** | `designs/04_counter.mojo`, `designs/08_bits_counter.mojo`, `designs/09_preset_counter.mojo`, `designs/12_enable_counter.mojo` | A primitive struct field store/load becomes `seq.compreg` (`05_counter`). `Bits[W]` fields are decoded from the source struct definition, so a `Bits[12]` counter lowers to a 12-bit register (`08_bits_counter`). Constructor constants are decoded as reset values: `self.count = Bits[12](5)` produces `seq.compreg ... reset %rst, %c5_i12` and `if (rst) q <= 12'h5;` under an ambient `rst` port (`09_preset_counter`). The same constant is wrapped in `seq.initial` as the power-on value, exporting as `var logic [11:0] _GEN_0 = 12'h5;`. A conditional state update (`if en:`) becomes an input mux that holds the register when disabled (`assign _GEN = en ? q + 1 : q`), giving enable gating in combinational form (`12_enable_counter`). Reset polarity/style options and `seq.compreg.ce` emission are not implemented yet. |
 | Parameters/generate | **green (prototype)** | `designs/16_params.mojo` | A `@module` struct can take an integer parameter used in field and port widths (`ParamCounter[W]`). Concrete bindings discovered from instance fields specialize the generic body into `ParamCounter_8` / `ParamCounter_16`, and the parent instantiates both. One integer parameter is supported; dependent or multiple parameters remain open. |
 | Processes/domains | **green (prototype)** | `designs/15_two_domains.mojo` | The single-method restriction is removed. Each method is a process; every stateful method root gets its own `clk_<method>`/`rst_<method>` pair, its registers are clocked by that domain, and multi-method outputs default to `<method>_out`. Cross-domain read/write checks and multiple drivers are not implemented yet. |
@@ -44,7 +44,7 @@ Build and test record:
 | 5–10 | not started | — | — |
 
 `tests/run_all.sh` runs 00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11,
-12, 13, 14, 15, 16, and 17; all pass.
+12, 13, 14, 15, 16, 17, and 18; all pass.
 
 **Second phase (combined CIRCT/LLVM lowering).** The compiler now builds *real*
 CIRCT ops. CIRCT is a **git submodule** at `third_party/circt` pointing at the
