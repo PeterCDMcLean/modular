@@ -940,6 +940,7 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
 
     DenseMap<Value, unsigned> fieldIndexes;
     DenseMap<Value, llvm::APInt> constants;
+    DenseMap<Value, Value> storeSources;
     for (Operation &op : entry.getOperations()) {
       StringRef name = op.getName().getStringRef();
       if (name == "kgen.struct.gep") {
@@ -954,6 +955,7 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
         continue;
       }
       if (name == "pop.store") {
+        storeSources[op.getOperand(1)] = op.getOperand(0);
         auto field = fieldIndexes.find(op.getOperand(1));
         if (field == fieldIndexes.end())
           continue;
@@ -973,28 +975,69 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
           !callee.contains("ResettableLogic::__init__") &&
           !callee.contains("Mem::__init__"))
         continue;
-      // A multi-operand memory constructor carries one constant per entry.
+      // A memory constructor can carry one constant per entry. The variadic
+      // form builds a VariadicList over a `pop.array.create` whose elements
+      // are pointers to stored constants.
       if (callee.contains("Mem::__init__") &&
-          !callee.contains("__init__(move:") && op.getNumOperands() >= 3) {
+          !callee.contains("__init__(move:")) {
         Value dest = op.getOperand(op.getNumOperands() - 1);
         auto field = fieldIndexes.find(dest);
         if (field == fieldIndexes.end())
           continue;
         SmallVector<llvm::APInt> values;
-        bool allConstants = true;
-        for (unsigned i = 0; i + 1 < op.getNumOperands(); ++i) {
-          Operation *valueOp = op.getOperand(i).getDefiningOp();
-          auto value =
-              valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
-          if (!value) {
-            allConstants = false;
-            break;
+        if (op.getNumOperands() == 2) {
+          auto listStored = storeSources.find(op.getOperand(0));
+          if (listStored != storeSources.end()) {
+            Operation *listOp = listStored->second.getDefiningOp();
+            if (listOp && listOp->getName().getStringRef() == "kgen.call" &&
+                listOp->getNumOperands() == 1) {
+              auto arrayStored = storeSources.find(listOp->getOperand(0));
+              if (arrayStored != storeSources.end()) {
+                Operation *arrayOp = arrayStored->second.getDefiningOp();
+                if (arrayOp &&
+                    arrayOp->getName().getStringRef() == "pop.array.create") {
+                  bool allConstants = true;
+                  for (Value elementPtr : arrayOp->getOperands()) {
+                    auto elementStored = storeSources.find(elementPtr);
+                    Operation *valueOp =
+                        elementStored == storeSources.end()
+                            ? nullptr
+                            : elementStored->second.getDefiningOp();
+                    auto value = valueOp
+                                     ? getConstantInt(valueOp, &bindings)
+                                     : std::nullopt;
+                    if (!value) {
+                      allConstants = false;
+                      break;
+                    }
+                    values.push_back(*value);
+                  }
+                  if (!allConstants)
+                    values.clear();
+                }
+              }
+            }
           }
-          values.push_back(*value);
+        } else {
+          bool allConstants = true;
+          for (unsigned i = 0; i + 1 < op.getNumOperands(); ++i) {
+            Operation *valueOp = op.getOperand(i).getDefiningOp();
+            auto value =
+                valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
+            if (!value) {
+              allConstants = false;
+              break;
+            }
+            values.push_back(*value);
+          }
+          if (!allConstants)
+            values.clear();
         }
-        if (allConstants && !values.empty())
+        if (!values.empty()) {
           memoryResetSequences[field->second] = values;
-        continue;
+          continue;
+        }
+        // A single-value fill falls through to the generic constant path.
       }
 
       // A direct `Bits[W](constant)` assignment can initialize the field

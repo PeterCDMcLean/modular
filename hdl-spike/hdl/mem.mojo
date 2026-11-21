@@ -28,13 +28,14 @@ struct Mem[W: Int = 8, N: Int = 4](Copyable, Movable):
         for _ in range(Self.N):
             self.data.append(Bits[Self.W](fill))
 
-    def __init__(out self, a: Int, b: Int, c: Int, d: Int):
-        """Constructs a four-entry memory from explicit constants."""
+    def __init__(out self, *values: Int):
+        """Constructs N words from a sequence of constants."""
         self.data = List[Bits[Self.W]]()
-        self.data.append(Bits[Self.W](a))
-        self.data.append(Bits[Self.W](b))
-        self.data.append(Bits[Self.W](c))
-        self.data.append(Bits[Self.W](d))
+        for i in range(Self.N):
+            if i < len(values):
+                self.data.append(Bits[Self.W](values[i]))
+            else:
+                self.data.append(Bits[Self.W]())
 
     def write(mut self, index: Int, value: Bits[Self.W], enable: Bool = True):
         """Writes `value` at `index` when `enable`."""
