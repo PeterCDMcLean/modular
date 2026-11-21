@@ -12,6 +12,7 @@ from .mem import Mem
 from .resettable import Resettable
 from .resettable_logic import ResettableLogic
 from .wire import Wire
+from .reg import Reg
 
 
 struct ResetStyle[style: Int = 0](Copyable, Movable):

@@ -978,6 +978,7 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
           !callee.contains("Logic::__init__") &&
           !callee.contains("Resettable::__init__") &&
           !callee.contains("ResettableLogic::__init__") &&
+          !callee.contains("Reg::__init__") &&
           !callee.contains("Mem::__init__"))
         continue;
       // A memory constructor can carry one constant per entry. The variadic
@@ -1109,6 +1110,8 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     bool isMemory = !isConfig && StringRef(typeName).ends_with("Mem");
     bool isWire = !isConfig && !isMemory &&
                   StringRef(typeName).ends_with("Wire");
+    bool isReg = !isConfig && !isMemory && !isWire &&
+                 StringRef(typeName).ends_with("Reg");
     fieldIsConfig.push_back(isConfig);
     fieldIsMemory.push_back(isMemory);
     fieldIsWire.push_back(isWire);
@@ -1125,6 +1128,15 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
           resetStyle = static_cast<int>(value->getZExtValue());
       }
       fieldWidths.push_back(0);
+      fieldIsInstance.push_back(false);
+      fieldIsLogic.push_back(false);
+      fieldModuleNames.push_back({});
+      continue;
+    }
+
+    if (isReg) {
+      auto params = getDslTypeBindings(fieldType, &bindings);
+      fieldWidths.push_back(params.empty() ? 0 : params[0].getZExtValue());
       fieldIsInstance.push_back(false);
       fieldIsLogic.push_back(false);
       fieldModuleNames.push_back({});
@@ -1996,6 +2008,54 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         }
       }
       return op->emitError() << "HDL lowering: unsupported Resettable call '"
+                             << callee << "'";
+    }
+
+    // `Reg[W]` is a typed state field. `.next` is the clocked update and
+    // `.get` reads the current value.
+    if (callee.contains("Reg::")) {
+      if (callee.contains("::__deinit__") || callee.contains("::__del__"))
+        return success();
+      if (callee.contains("__init__") && callee.contains("::SIMD")) {
+        unsigned width = getCallParamWidth(op, &bindings);
+        Operation *valueOp = op->getOperand(0).getDefiningOp();
+        auto value =
+            valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
+        if (!width || !value)
+          return op->emitError()
+                 << "HDL lowering: unsupported Reg constructor";
+        Value constant = hw::ConstantOp::create(
+            builder, loc, value->zextOrTrunc(width));
+        Value dest = op->getOperand(1);
+        if (auto field = fieldPtrs.find(dest); field != fieldPtrs.end())
+          resetValues[field->second] = *value;
+        else
+          values[dest] = constant;
+        return success();
+      }
+      if (op->getNumOperands() == 2) {
+        if (callee.contains("::next")) {
+          auto field = fieldPtrs.find(op->getOperand(0));
+          Value value = getValue(op->getOperand(1));
+          if (field == fieldPtrs.end() || !value)
+            return op->emitError()
+                   << "HDL lowering: Reg::next operand was not lowered";
+          return storeField(field->second, value, condition);
+        }
+        Value source = getValue(op->getOperand(0));
+        if (!source)
+          return op->emitError()
+                 << "HDL lowering: Reg operand was not lowered";
+        Value dest = op->getOperand(1);
+        if (dest == resultPtr)
+          returnValue = source;
+        else if (auto field = fieldPtrs.find(dest); field != fieldPtrs.end())
+          return storeField(field->second, source, condition);
+        else
+          values[dest] = source;
+        return success();
+      }
+      return op->emitError() << "HDL lowering: unsupported Reg call '"
                              << callee << "'";
     }
 
