@@ -731,6 +731,7 @@ private:
   SmallVector<unsigned> fieldMemDepths;
   SmallVector<int> fieldResetStyle;
   DenseMap<unsigned, SmallVector<Value>> memoryRegs;
+  DenseMap<unsigned, SmallVector<llvm::APInt>> memoryResetSequences;
   int resetStyle = 0;
   std::optional<llvm::APInt> powerOnValue;
   Value selfPtr;
@@ -968,6 +969,30 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
           !callee.contains("Resettable::__init__") &&
           !callee.contains("Mem::__init__"))
         continue;
+      // A multi-operand memory constructor carries one constant per entry.
+      if (callee.contains("Mem::__init__") &&
+          !callee.contains("__init__(move:") && op.getNumOperands() >= 3) {
+        Value dest = op.getOperand(op.getNumOperands() - 1);
+        auto field = fieldIndexes.find(dest);
+        if (field == fieldIndexes.end())
+          continue;
+        SmallVector<llvm::APInt> values;
+        bool allConstants = true;
+        for (unsigned i = 0; i + 1 < op.getNumOperands(); ++i) {
+          Operation *valueOp = op.getOperand(i).getDefiningOp();
+          auto value =
+              valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
+          if (!value) {
+            allConstants = false;
+            break;
+          }
+          values.push_back(*value);
+        }
+        if (allConstants && !values.empty())
+          memoryResetSequences[field->second] = values;
+        continue;
+      }
+
       // A direct `Bits[W](constant)` assignment can initialize the field
       // through the field pointer without a temporary.
       if (op.getNumOperands() == 2 && !callee.contains("__init__(move:")) {
@@ -1130,22 +1155,24 @@ CirctModuleEmitter::getOrCreateMemory(unsigned fieldIndex) {
   unsigned depth = fieldMemDepths[fieldIndex];
   auto type = IntegerType::get(builder.getContext(), width);
   auto zero = hw::ConstantOp::create(builder, loc, type, 0);
-  llvm::APInt resetBits(width, 0);
-  if (auto value = resetValues.find(fieldIndex); value != resetValues.end())
-    resetBits = value->second.zextOrTrunc(width);
-  llvm::APInt initialBits = resetBits;
-  if (powerOnValue)
-    initialBits = powerOnValue->zextOrTrunc(width);
-  auto resetValue = hw::ConstantOp::create(builder, loc, resetBits);
   auto ceZero =
       hw::ConstantOp::create(builder, loc, builder.getIntegerType(1), 0);
   Value reset = (resetStyle & 1) ? bitNot(resetSignal) : resetSignal;
   bool async = resetStyle >= 2;
-  Value initial;
-  if (!async)
-    initial = seq::createConstantInitialValue(
-        builder, loc, IntegerAttr::get(type, initialBits));
+  auto sequence = memoryResetSequences.find(fieldIndex);
   for (unsigned k = 0; k < depth; ++k) {
+    llvm::APInt resetBits(width, 0);
+    if (sequence != memoryResetSequences.end() &&
+        k < sequence->second.size())
+      resetBits = sequence->second[k].zextOrTrunc(width);
+    else if (auto value = resetValues.find(fieldIndex);
+             value != resetValues.end())
+      resetBits = value->second.zextOrTrunc(width);
+    llvm::APInt initialBits = resetBits;
+    if (powerOnValue)
+      initialBits = powerOnValue->zextOrTrunc(width);
+
+    auto resetValue = hw::ConstantOp::create(builder, loc, resetBits);
     auto name = StringAttr::get(
         builder.getContext(),
         "mem_" + std::to_string(fieldIndex) + "_" + std::to_string(k));
@@ -1155,6 +1182,8 @@ CirctModuleEmitter::getOrCreateMemory(unsigned fieldIndex) {
           hw::InnerSymAttr(), /*isAsync=*/true,
           /*preset=*/IntegerAttr::get(type, initialBits)));
     } else {
+      auto initial = seq::createConstantInitialValue(
+          builder, loc, IntegerAttr::get(type, initialBits));
       regs.push_back(seq::CompRegClockEnabledOp::create(
           builder, loc, zero, clk, ceZero, reset, resetValue, name, initial));
     }

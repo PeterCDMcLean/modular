@@ -29,7 +29,7 @@ fi
 diff -u "$root/hdl-spike/expected/27_mem_init.mlir" "$out/27_mem_init.mlir"
 grep -q 'sym @mem_0_0.*reset %rst, %c5_i8' "$out/27_mem_init.mlir"
 grep -q 'sym @mem_0_3.*reset %rst, %c5_i8' "$out/27_mem_init.mlir"
-grep -q '%c5_i8_3 = hw.constant 5' "$out/27_mem_init.mlir"
+grep -q 'c5_i8.*= hw.constant 5' "$out/27_mem_init.mlir"
 
 "$MOJO" build --emit=sv -o "$out/27_mem_init.raw.sv" "${inc[@]}" \
     "$root/hdl-spike/designs/27_mem_init.mojo"
