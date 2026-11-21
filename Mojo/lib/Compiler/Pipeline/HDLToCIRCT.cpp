@@ -789,8 +789,12 @@ Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
     resetValue = value->second.zextOrTrunc(width);
   auto zero = hw::ConstantOp::create(builder, loc, type, 0);
   auto resetConstant = hw::ConstantOp::create(builder, loc, resetValue);
+  // Power-on value: the same constructor-derived constant, wrapped in
+  // `seq.initial` so it is a true initializer rather than reset logic.
+  auto initialValue = seq::createConstantInitialValue(
+      builder, loc, IntegerAttr::get(type, resetValue));
   auto reg = seq::CompRegOp::create(builder, loc, zero, clk, resetSignal,
-                                    resetConstant);
+                                    resetConstant, initialValue);
   fieldRegs[fieldIndex] = reg;
   return reg;
 }

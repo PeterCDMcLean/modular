@@ -1167,6 +1167,8 @@ KGENCompiler::runKGENPipeline(ModuleOp theModule, TargetInfoAttr target,
         return Error("HDL lowering produced no module");
       mlir::PassManager circtPM(&context);
       circtPM.addPass(createHDLSeqToSVPass());
+      // `seq.initial` leaves a dead placeholder unrealized cast behind.
+      circtPM.addPass(mlir::createCanonicalizerPass());
       if (failed(circtPM.run(*hdlBuiltModule)))
         return Error("HDL seq-to-sv lowering failed");
       llvm::raw_ostream &os =

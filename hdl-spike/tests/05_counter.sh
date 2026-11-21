@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stage 4: a struct field becomes a seq.compreg, with clk and always_ff.
+# Stage 4: a struct field becomes a seq.compreg with clk, reset, and power-on.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -19,6 +19,6 @@ grep -q 'seq.compreg' "$out/04_counter.mlir"
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' "$out/04_counter.raw.sv" \
     | grep -v '^$' > "$out/04_counter.sv"
 diff -u "$root/hdl-spike/expected/04_counter.sv" "$out/04_counter.sv"
-grep -q 'always_ff @(posedge clk)' "$out/04_counter.sv"
+grep -q 'always @(posedge clk)' "$out/04_counter.sv"
 
 echo "05_counter: ok"

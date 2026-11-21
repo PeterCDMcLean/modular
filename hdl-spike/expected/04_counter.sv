@@ -4,8 +4,8 @@ module Counter(
   output [7:0] out
 );
   wire      [7:0] _GEN;
-  var logic [7:0] _GEN_0;
-  always_ff @(posedge clk) begin
+  var logic [7:0] _GEN_0 = 8'h0;
+  always @(posedge clk) begin
     if (rst)
       _GEN_0 <= 8'h0;
     else

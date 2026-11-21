@@ -35,7 +35,7 @@ grep -q 'i12' "$out/08_bits_counter.mlir"
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' "$out/08_bits_counter.raw.sv" \
     | grep -v '^$' > "$out/08_bits_counter.sv"
 diff -u "$root/hdl-spike/expected/08_bits_counter.sv" "$out/08_bits_counter.sv"
-grep -q 'always_ff @(posedge clk)' "$out/08_bits_counter.sv"
+grep -q 'always @(posedge clk)' "$out/08_bits_counter.sv"
 grep -q 'output \[11:0\] out' "$out/08_bits_counter.sv"
 
 echo "08_bits_counter: ok"

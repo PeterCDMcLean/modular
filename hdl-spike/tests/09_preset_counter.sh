@@ -28,7 +28,7 @@ fi
     "$root/hdl-spike/designs/09_preset_counter.mojo"
 diff -u "$root/hdl-spike/expected/09_preset_counter.mlir" "$out/09_preset_counter.mlir"
 grep -q 'in %rst : i1' "$out/09_preset_counter.mlir"
-grep -q 'seq.compreg %1, %clk reset %rst, %c5_i12' "$out/09_preset_counter.mlir"
+grep -q 'reset %rst, %c5_i12' "$out/09_preset_counter.mlir"
 
 "$MOJO" build --emit=sv -o "$out/09_preset_counter.raw.sv" "${inc[@]}" \
     "$root/hdl-spike/designs/09_preset_counter.mojo"
@@ -37,5 +37,6 @@ sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' "$out/09_preset_counter.
 diff -u "$root/hdl-spike/expected/09_preset_counter.sv" "$out/09_preset_counter.sv"
 grep -q 'if (rst)' "$out/09_preset_counter.sv"
 grep -q "_GEN_0 <= 12'h5;" "$out/09_preset_counter.sv"
+grep -q "_GEN_0 = 12'h5;" "$out/09_preset_counter.sv"
 
 echo "09_preset_counter: ok"
