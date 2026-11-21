@@ -496,6 +496,8 @@ private:
   Operation *findBuiltModule(StringRef name);
   Value getValue(Value value);
   LogicValue getLogicValue(Value value);
+  LogicValue getOrCreateLogicReg(unsigned fieldIndex, unsigned width);
+  void storeLogicField(unsigned fieldIndex, LogicValue value, Value condition);
   Value bitNot(Value value);
   Value getConstant(bool value);
   Value getOrCreateReg(unsigned fieldIndex, Type type);
@@ -513,6 +515,8 @@ private:
 
   DenseMap<Value, Value> values;
   DenseMap<Value, LogicValue> logicValues;
+  DenseMap<unsigned, LogicValue> logicRegs;
+  DenseMap<unsigned, LogicValue> logicNext;
   DenseMap<Value, llvm::APInt> intConstants;
   DenseMap<Value, unsigned> fieldPtrs;
   DenseMap<Value, unsigned> instancePtrs;
@@ -527,6 +531,7 @@ private:
   SmallVector<std::string> fieldStructNames;
   SmallVector<std::string> fieldModuleNames;
   SmallVector<bool> fieldIsInstance;
+  SmallVector<bool> fieldIsLogic;
   Value selfPtr;
   Value resultPtr;
   Value returnXz;
@@ -754,7 +759,8 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
         continue;
 
       StringRef callee = callCalleeName(&op);
-      if (!callee.contains("Bits::__init__"))
+      if (!callee.contains("Bits::__init__") &&
+          !callee.contains("Logic::__init__"))
         continue;
       // A direct `Bits[W](constant)` assignment can initialize the field
       // through the field pointer without a temporary.
@@ -821,6 +827,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
           break;
         }
     fieldIsInstance.push_back(isInstance);
+    fieldIsLogic.push_back(getDslTypeName(fieldType).contains("Logic"));
     if (isInstance) {
       std::string display = StringRef(typeName).rsplit("::").second.str();
       if (auto binding = getDslTypeBinding(fieldType, &bindings))
@@ -895,7 +902,56 @@ CirctModuleEmitter::LogicValue CirctModuleEmitter::getLogicValue(Value value) {
   auto it = logicValues.find(value);
   if (it != logicValues.end())
     return it->second;
+  auto field = fieldPtrs.find(value);
+  if (field != fieldPtrs.end() && field->second < fieldIsLogic.size() &&
+      fieldIsLogic[field->second])
+    return getOrCreateLogicReg(field->second, fieldWidths[field->second]);
   return {};
+}
+
+CirctModuleEmitter::LogicValue
+CirctModuleEmitter::getOrCreateLogicReg(unsigned fieldIndex, unsigned width) {
+  auto found = logicRegs.find(fieldIndex);
+  if (found != logicRegs.end())
+    return found->second;
+
+  auto type = IntegerType::get(builder.getContext(), width);
+  llvm::APInt resetValue(width, 0);
+  if (auto value = resetValues.find(fieldIndex); value != resetValues.end())
+    resetValue = value->second.zextOrTrunc(width);
+  llvm::APInt zeroValue(width, 0);
+
+  auto valZero = hw::ConstantOp::create(builder, loc, type, 0);
+  auto xzZero = hw::ConstantOp::create(builder, loc, type, 0);
+  auto valReset = hw::ConstantOp::create(builder, loc, resetValue);
+  auto xzReset = hw::ConstantOp::create(builder, loc, zeroValue);
+  auto valInitial = seq::createConstantInitialValue(
+      builder, loc, IntegerAttr::get(type, resetValue));
+  auto xzInitial = seq::createConstantInitialValue(
+      builder, loc, IntegerAttr::get(type, zeroValue));
+  Value valReg = seq::CompRegOp::create(builder, loc, valZero, clk, resetSignal,
+                                        valReset, valInitial);
+  Value xzReg = seq::CompRegOp::create(builder, loc, xzZero, clk, resetSignal,
+                                       xzReset, xzInitial);
+  LogicValue regs{valReg, xzReg};
+  logicRegs[fieldIndex] = regs;
+  logicNext[fieldIndex] = regs;
+  return regs;
+}
+
+void CirctModuleEmitter::storeLogicField(unsigned fieldIndex, LogicValue value,
+                                         Value condition) {
+  LogicValue regs =
+      getOrCreateLogicReg(fieldIndex, value.val.getType().getIntOrFloatBitWidth());
+  LogicValue hold = logicNext.lookup(fieldIndex);
+  LogicValue next = value;
+  if (condition && hold) {
+    next.val = comb::MuxOp::create(builder, loc, condition, value.val, hold.val);
+    next.xz = comb::MuxOp::create(builder, loc, condition, value.xz, hold.xz);
+  }
+  logicNext[fieldIndex] = next;
+  regs.val.getDefiningOp()->setOperand(0, next.val);
+  regs.xz.getDefiningOp()->setOperand(0, next.xz);
 }
 
 /// Bitwise complement at the operand's width.
@@ -1098,6 +1154,13 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       auto storeResult = [&](Value dest, LogicValue value) -> LogicalResult {
         if (!value)
           return failure();
+        if (auto field = fieldPtrs.find(dest);
+            field != fieldPtrs.end() &&
+            field->second < fieldIsLogic.size() &&
+            fieldIsLogic[field->second]) {
+          storeLogicField(field->second, value, condition);
+          return success();
+        }
         logicValues[dest] = value;
         if (dest == resultPtr) {
           returnValue = value.val;
