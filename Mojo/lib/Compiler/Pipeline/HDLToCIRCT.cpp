@@ -501,6 +501,7 @@ private:
   Value bitNot(Value value);
   Value getConstant(bool value);
   Value getOrCreateReg(unsigned fieldIndex, Type type);
+  Value createRegister(unsigned id, Type type, llvm::APInt resetValue);
 
   ModuleOp source;
   StringRef structName;
@@ -532,6 +533,8 @@ private:
   SmallVector<std::string> fieldModuleNames;
   SmallVector<bool> fieldIsInstance;
   SmallVector<bool> fieldIsLogic;
+  SmallVector<bool> fieldIsConfig;
+  int resetStyle = 0;
   Value selfPtr;
   Value resultPtr;
   Value returnXz;
@@ -686,6 +689,8 @@ LogicalResult CirctModuleEmitter::collectMethodDomains() {
       unsigned field = index.getInt();
       if (field >= fieldIsInstance.size())
         return;
+      if (field < fieldIsConfig.size() && fieldIsConfig[field])
+        return;
       if (!fieldIsInstance[field]) {
         stateful = true;
         return;
@@ -818,6 +823,19 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     fieldNames.push_back(field.getName().getValue().str());
     std::string typeName = getDslTypeName(fieldType).str();
     fieldStructNames.push_back(typeName);
+
+    bool isConfig = StringRef(typeName).contains("ResetStyle");
+    fieldIsConfig.push_back(isConfig);
+    if (isConfig) {
+      if (auto style = getDslTypeBinding(fieldType, &bindings))
+        resetStyle = static_cast<int>(style->getZExtValue());
+      fieldWidths.push_back(0);
+      fieldIsInstance.push_back(false);
+      fieldIsLogic.push_back(false);
+      fieldModuleNames.push_back({});
+      continue;
+    }
+
     fieldWidths.push_back(getHdlWidth(fieldType, &bindings));
     bool isInstance = false;
     if (!typeName.empty())
@@ -921,18 +939,8 @@ CirctModuleEmitter::getOrCreateLogicReg(unsigned fieldIndex, unsigned width) {
     resetValue = value->second.zextOrTrunc(width);
   llvm::APInt zeroValue(width, 0);
 
-  auto valZero = hw::ConstantOp::create(builder, loc, type, 0);
-  auto xzZero = hw::ConstantOp::create(builder, loc, type, 0);
-  auto valReset = hw::ConstantOp::create(builder, loc, resetValue);
-  auto xzReset = hw::ConstantOp::create(builder, loc, zeroValue);
-  auto valInitial = seq::createConstantInitialValue(
-      builder, loc, IntegerAttr::get(type, resetValue));
-  auto xzInitial = seq::createConstantInitialValue(
-      builder, loc, IntegerAttr::get(type, zeroValue));
-  Value valReg = seq::CompRegOp::create(builder, loc, valZero, clk, resetSignal,
-                                        valReset, valInitial);
-  Value xzReg = seq::CompRegOp::create(builder, loc, xzZero, clk, resetSignal,
-                                       xzReset, xzInitial);
+  Value valReg = createRegister(fieldIndex * 2, type, resetValue);
+  Value xzReg = createRegister(fieldIndex * 2 + 1, type, zeroValue);
   LogicValue regs{valReg, xzReg};
   logicRegs[fieldIndex] = regs;
   logicNext[fieldIndex] = regs;
@@ -971,6 +979,29 @@ Value CirctModuleEmitter::getConstant(bool value) {
   return slot;
 }
 
+Value CirctModuleEmitter::createRegister(unsigned id, Type type,
+                                         llvm::APInt resetValue) {
+  auto zero = hw::ConstantOp::create(builder, loc, type, 0);
+  auto resetConstant = hw::ConstantOp::create(builder, loc, resetValue);
+  bool activeLow = (resetStyle & 1) != 0;
+  Value reset = activeLow ? bitNot(resetSignal) : resetSignal;
+  bool async = resetStyle >= 2;
+  if (async) {
+    auto name =
+        StringAttr::get(builder.getContext(), "reg_" + std::to_string(id));
+    return seq::FirRegOp::create(
+        builder, loc, zero, clk, name, reset, resetConstant,
+        hw::InnerSymAttr(), /*isAsync=*/true,
+        /*preset=*/IntegerAttr::get(type, resetValue));
+  }
+  // Power-on value: the same constructor-derived constant, wrapped in
+  // `seq.initial` so it is a true initializer rather than reset logic.
+  auto initialValue = seq::createConstantInitialValue(
+      builder, loc, IntegerAttr::get(type, resetValue));
+  return seq::CompRegOp::create(builder, loc, zero, clk, reset, resetConstant,
+                                initialValue);
+}
+
 Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
   auto found = fieldRegs.find(fieldIndex);
   if (found != fieldRegs.end())
@@ -979,14 +1010,7 @@ Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
   llvm::APInt resetValue(width, 0);
   if (auto value = resetValues.find(fieldIndex); value != resetValues.end())
     resetValue = value->second.zextOrTrunc(width);
-  auto zero = hw::ConstantOp::create(builder, loc, type, 0);
-  auto resetConstant = hw::ConstantOp::create(builder, loc, resetValue);
-  // Power-on value: the same constructor-derived constant, wrapped in
-  // `seq.initial` so it is a true initializer rather than reset logic.
-  auto initialValue = seq::createConstantInitialValue(
-      builder, loc, IntegerAttr::get(type, resetValue));
-  auto reg = seq::CompRegOp::create(builder, loc, zero, clk, resetSignal,
-                                    resetConstant, initialValue);
+  Value reg = createRegister(fieldIndex, type, resetValue);
   fieldRegs[fieldIndex] = reg;
   fieldNext[fieldIndex] = reg;
   return reg;
@@ -1104,10 +1128,16 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
               return op->emitError()
                      << "HDL lowering: instance needs a clock";
             inputs.push_back(clk);
-          } else if (port.name.getValue() == "rst") {
+          } else if (port.name.getValue() == "rst" ||
+                     port.name.getValue() == "rst_n") {
             if (!resetSignal)
               return op->emitError() << "HDL lowering: instance needs a reset";
-            inputs.push_back(resetSignal);
+            bool childLow = port.name.getValue() == "rst_n";
+            bool parentLow = (resetStyle & 1) != 0;
+            Value reset = resetSignal;
+            if (childLow != parentLow)
+              reset = bitNot(reset);
+            inputs.push_back(reset);
           } else {
             if (operandIndex + 1 >= op->getNumOperands())
               return op->emitError()
@@ -1583,7 +1613,9 @@ LogicalResult CirctModuleEmitter::build() {
       continue;
     bool single = methods.size() == 1;
     std::string clkName = single ? "clk" : "clk_" + methodNames[m];
-    std::string rstName = single ? "rst" : "rst_" + methodNames[m];
+    std::string rstBase = (resetStyle & 1) ? "rst_n" : "rst";
+    std::string rstName =
+        single ? rstBase : rstBase + "_" + methodNames[m];
 
     hw::PortInfo clkInfo;
     clkInfo.name = StringAttr::get(ctx, clkName);
