@@ -40,3 +40,15 @@ struct PowerOn[value: Int = 0](Copyable, Movable):
 
     def __init__(out self):
         pass
+
+
+struct ClockDivider[pow2: Int = 1](Copyable, Movable):
+    """An in-hierarchy clock source dividing the ambient clock by `pow2`.
+
+    The compiler clocks the module's registers and child instances from
+    `seq.clock_div ambient by pow2`, rooting a sub-domain inside the module.
+    The field itself has no hardware representation.
+    """
+
+    def __init__(out self):
+        pass

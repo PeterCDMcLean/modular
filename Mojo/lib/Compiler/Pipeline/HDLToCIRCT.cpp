@@ -736,6 +736,7 @@ private:
   DenseMap<unsigned, SmallVector<bool>> memoryWritten;
   DenseMap<unsigned, SmallVector<llvm::APInt>> memoryResetSequences;
   int resetStyle = 0;
+  int clockDivisor = 1;
   std::optional<llvm::APInt> powerOnValue;
   Value selfPtr;
   Value resultPtr;
@@ -1098,8 +1099,9 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     fieldStructNames.push_back(typeName);
 
     bool isPowerOn = StringRef(typeName).contains("PowerOn");
-    bool isConfig =
-        StringRef(typeName).contains("ResetStyle") || isPowerOn;
+    bool isClockDivider = StringRef(typeName).contains("ClockDivider");
+    bool isConfig = StringRef(typeName).contains("ResetStyle") ||
+                    isPowerOn || isClockDivider;
     bool isMemory = !isConfig && StringRef(typeName).ends_with("Mem");
     fieldIsConfig.push_back(isConfig);
     fieldIsMemory.push_back(isMemory);
@@ -1110,6 +1112,8 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
       if (auto value = getDslTypeBinding(fieldType, &bindings)) {
         if (isPowerOn)
           powerOnValue = *value;
+        else if (isClockDivider)
+          clockDivisor = static_cast<int>(value->getZExtValue());
         else
           resetStyle = static_cast<int>(value->getZExtValue());
       }
@@ -2362,13 +2366,16 @@ LogicalResult CirctModuleEmitter::build() {
     currentMethod = m;
     selfPtr = selfArgs[m];
     resultPtr = resultArgs[m];
+    builder.setInsertionPoint(body->getTerminator());
     clk = domainClk[m];
+    if (clockDivisor > 1)
+      clk = seq::ClockDividerOp::create(builder, loc, clk,
+                                        builder.getI64IntegerAttr(clockDivisor));
     resetSignal = domainReset[m];
     returnIsLogic = false;
     returnXz = Value();
 
     Value returnValue;
-    builder.setInsertionPoint(body->getTerminator());
     if (failed(emitOps(methods[m], returnValue)))
       return failure();
     if (methodOutputCounts[m] == 0)
