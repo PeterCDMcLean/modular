@@ -305,6 +305,23 @@ getTypedAttrInt(TypedAttr attr, const ParamBindings *bindings = nullptr) {
         return found->second;
     }
   }
+  if (auto expr = dyn_cast<KGEN::ParamOperatorAttr>(attr)) {
+    if (!bindings)
+      return std::nullopt;
+    auto opcode = expr.getOpcode();
+    if (opcode != KGEN::POC::Add && opcode != KGEN::POC::Mul &&
+        opcode != KGEN::POC::MulNoWrap)
+      return std::nullopt;
+    llvm::APInt accum(64, opcode == KGEN::POC::Add ? 0 : 1);
+    for (TypedAttr operand : expr.getOperands()) {
+      auto value = getTypedAttrInt(operand, bindings);
+      if (!value)
+        return std::nullopt;
+      auto bits = value->zextOrTrunc(64);
+      accum = opcode == KGEN::POC::Add ? accum + bits : accum * bits;
+    }
+    return accum;
+  }
   return std::nullopt;
 }
 
@@ -402,6 +419,24 @@ getDslTypeBinding(Type type, const ParamBindings *bindings = nullptr) {
   return getTypedAttrInt(ref.getParamValues().front(), bindings);
 }
 
+/// Return every type parameter of a DSL reference.
+static SmallVector<llvm::APInt>
+getDslTypeBindings(Type type, const ParamBindings *bindings = nullptr) {
+  SmallVector<llvm::APInt> result;
+  if (auto ptr = dyn_cast<KGEN::PointerType>(type))
+    type = ptr.getElementType();
+  auto typeValue = dyn_cast<KGEN::TypeValueType>(type);
+  if (!typeValue)
+    return result;
+  auto ref = dyn_cast<KGEN::TypeGeneratorRefAttr>(typeValue.getTypeValue());
+  if (!ref)
+    return result;
+  for (TypedAttr param : ref.getParamValues())
+    if (auto value = getTypedAttrInt(param, bindings))
+      result.push_back(*value);
+  return result;
+}
+
 /// Return the generator type carrier of a `kgen.func` / `kgen.generator`.
 static KGEN::FuncTypeGeneratorType getFuncTypeGenerator(Operation *op) {
   if (auto gen = dyn_cast<KGEN::GeneratorOp>(op))
@@ -426,7 +461,12 @@ static std::string getMethodName(StringRef symbol, StringRef structName) {
 }
 
 /// Decode a scalar integer constant op, if this is one.
-static std::optional<llvm::APInt> getConstantInt(Operation *op) {
+static std::optional<llvm::APInt>
+getConstantInt(Operation *op, const ParamBindings *bindings = nullptr) {
+  if (auto value = op->getAttr("value"))
+    if (auto typed = dyn_cast<TypedAttr>(value))
+      if (auto result = getTypedAttrInt(typed, bindings))
+        return result;
   for (NamedAttribute attr : op->getAttrs()) {
     if (auto simd = dyn_cast<KGEN::SIMDAttr>(attr.getValue())) {
       if (simd.getValues().size() == 1)
@@ -754,7 +794,7 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
         continue;
       }
       if (name == "kgen.param.constant" || name == "pop.constant") {
-        if (auto value = getConstantInt(&op))
+        if (auto value = getConstantInt(&op, &bindings))
           constants[op.getResult(0)] = *value;
         continue;
       }
@@ -763,7 +803,8 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
         if (field == fieldIndexes.end())
           continue;
         Operation *valueOp = op.getOperand(0).getDefiningOp();
-        if (auto value = valueOp ? getConstantInt(valueOp) : std::nullopt)
+        if (auto value = valueOp ? getConstantInt(valueOp, &bindings)
+                                     : std::nullopt)
           resetValues[field->second] = *value;
         continue;
       }
@@ -786,7 +827,7 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
         if (value != constants.end())
           result = value->second;
         else if (valueOp)
-          result = getConstantInt(valueOp);
+          result = getConstantInt(valueOp, &bindings);
         if (result)
           resetValues[field->second] = *result;
         continue;
@@ -855,8 +896,8 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     fieldIsLogic.push_back(getDslTypeName(fieldType).contains("Logic"));
     if (isInstance) {
       std::string display = StringRef(typeName).rsplit("::").second.str();
-      if (auto binding = getDslTypeBinding(fieldType, &bindings))
-        display += "_" + std::to_string(binding->getZExtValue());
+      for (auto binding : getDslTypeBindings(fieldType, &bindings))
+        display += "_" + std::to_string(binding.getZExtValue());
       fieldModuleNames.push_back(display);
     } else {
       fieldModuleNames.push_back({});
@@ -1187,7 +1228,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       values[op->getResult(0)] = getConstant(*value);
       return success();
     }
-    if (auto value = getConstantInt(op)) {
+    if (auto value = getConstantInt(op, &bindings)) {
       intConstants[op->getResult(0)] = *value;
       return success();
     }
@@ -1474,7 +1515,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             !callee.contains("__init__(move:")) {
           unsigned width = getCallParamWidth(op, &bindings);
           Operation *valueOp = op->getOperand(0).getDefiningOp();
-          auto value = valueOp ? getConstantInt(valueOp) : std::nullopt;
+          auto value = valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
           if (!width || !value)
             return op->emitError()
                    << "HDL lowering: unsupported Bits constructor argument";
@@ -1502,7 +1543,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         }
         if (callee.contains("Bits::bit(")) {
           Operation *indexOp = op->getOperand(1).getDefiningOp();
-          auto index = indexOp ? getConstantInt(indexOp) : std::nullopt;
+          auto index = indexOp ? getConstantInt(indexOp, &bindings) : std::nullopt;
           if (index && index->isIntN(32)) {
             values[op->getResult(0)] = comb::ExtractOp::create(
                 builder, loc, source,
@@ -1878,14 +1919,6 @@ static KGEN::StructGeneratorOp findStructGenerator(ModuleOp source,
   return {};
 }
 
-/// Return the first declared parameter name, or empty if none.
-static StringRef getFirstParamName(KGEN::StructGeneratorOp generator) {
-  auto params = generator.getInputParams();
-  if (params.empty())
-    return {};
-  return params.front().getName().getValue();
-}
-
 /// Discover concrete module specializations and order them children-first.
 static SmallVector<ModuleSpec> collectModuleSpecs(ModuleOp source,
                                                   ArrayAttr modules) {
@@ -1893,8 +1926,11 @@ static SmallVector<ModuleSpec> collectModuleSpecs(ModuleOp source,
   for (Attribute attr : modules)
     known.insert(cast<StringAttr>(attr).getValue());
 
-  // Concrete bindings referenced by a struct field somewhere in the design.
-  std::map<std::string, std::set<int64_t>> discovered;
+  using BindingTuple = std::vector<int64_t>;
+
+  // Concrete binding tuples referenced by a struct field somewhere in the
+  // design.
+  std::map<std::string, std::set<BindingTuple>> discovered;
   for (Attribute attr : modules) {
     auto parentType = getStructInstanceType(source,
                                            cast<StringAttr>(attr).getValue());
@@ -1905,8 +1941,13 @@ static SmallVector<ModuleSpec> collectModuleSpecs(ModuleOp source,
       std::string child = getDslTypeName(fieldType).str();
       if (!known.contains(child))
         continue;
-      if (auto binding = getDslTypeBinding(fieldType))
-        discovered[child].insert(binding->getZExtValue());
+      auto bindings = getDslTypeBindings(fieldType);
+      if (bindings.empty())
+        continue;
+      BindingTuple tuple;
+      for (auto binding : bindings)
+        tuple.push_back(binding.getZExtValue());
+      discovered[child].insert(tuple);
     }
   }
 
@@ -1919,15 +1960,19 @@ static SmallVector<ModuleSpec> collectModuleSpecs(ModuleOp source,
       specs[unqualified] = ModuleSpec{name, unqualified, ParamBindings()};
       continue;
     }
-    StringRef paramName = getFirstParamName(generator);
-    for (int64_t value : discovered[name]) {
+    auto params = generator.getInputParams();
+    for (const BindingTuple &tuple : discovered[name]) {
       ModuleSpec spec;
       spec.structName = name;
-      spec.displayName = unqualified + "_" + std::to_string(value);
-      spec.bindings[paramName] = llvm::APInt(64, value);
-      // The lowered body refers to struct parameters by index (for example
-      // `*(0, 0)`), so bind index zero as well.
-      spec.bindings["#0"] = llvm::APInt(64, value);
+      spec.displayName = unqualified;
+      for (unsigned i = 0; i < tuple.size() && i < params.size(); ++i) {
+        spec.displayName += "_" + std::to_string(tuple[i]);
+        StringRef paramName = params[i].getName().getValue();
+        spec.bindings[paramName] = llvm::APInt(64, tuple[i]);
+        // The lowered body refers to struct parameters by index (for example
+        // `*(0, 0)`), so bind indices as well.
+        spec.bindings["#" + std::to_string(i)] = llvm::APInt(64, tuple[i]);
+      }
       specs[spec.displayName] = spec;
     }
   }
@@ -1943,8 +1988,8 @@ static SmallVector<ModuleSpec> collectModuleSpecs(ModuleOp source,
       if (!known.contains(child))
         continue;
       std::string childDisplay = StringRef(child).rsplit("::").second.str();
-      if (auto binding = getDslTypeBinding(fieldType, &spec.bindings))
-        childDisplay += "_" + std::to_string(binding->getZExtValue());
+      for (auto binding : getDslTypeBindings(fieldType, &spec.bindings))
+        childDisplay += "_" + std::to_string(binding.getZExtValue());
       if (specs.contains(childDisplay))
         edges[key].push_back(childDisplay);
     }
