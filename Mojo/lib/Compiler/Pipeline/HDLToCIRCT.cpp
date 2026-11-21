@@ -379,6 +379,12 @@ static StringRef callCalleeName(Operation *op) {
   return symbol.getSymbol().getLeafReference().getValue();
 }
 
+/// Return the source method name from a `Struct::method(...)` symbol.
+static std::string getMethodName(StringRef symbol, StringRef structName) {
+  StringRef rest = symbol.drop_front(structName.size() + 2);
+  return rest.take_front(rest.find('(')).str();
+}
+
 /// Decode a scalar integer constant op, if this is one.
 static std::optional<llvm::APInt> getConstantInt(Operation *op) {
   for (NamedAttribute attr : op->getAttrs()) {
@@ -440,6 +446,7 @@ private:
   LogicalResult collectPorts();
   LogicalResult collectFieldWidths();
   LogicalResult collectResetValues();
+  LogicalResult collectMethodDomains();
   LogicalResult findMethods();
   LogicalResult emitOps(Operation *fn, Value &returnValue);
   LogicalResult emitBlock(Block &block, Value condition, Value &returnValue);
@@ -470,6 +477,9 @@ private:
   DenseMap<unsigned, Value> fieldNext;
   DenseMap<unsigned, llvm::APInt> resetValues;
   SmallVector<unsigned> fieldWidths;
+  SmallVector<unsigned> methodOutputCounts;
+  SmallVector<bool> methodHasState;
+  SmallVector<std::string> methodNames;
   SmallVector<std::string> fieldNames;
   SmallVector<std::string> fieldStructNames;
   SmallVector<bool> fieldIsInstance;
@@ -479,7 +489,6 @@ private:
   bool returnIsLogic = false;
   Value clk;
   Value resetSignal;
-  bool hasState = false;
   Value trueConstant;
   Value falseConstant;
   Location loc;
@@ -489,7 +498,9 @@ private:
 LogicalResult CirctModuleEmitter::collectPorts() {
   llvm::StringSet<> seen;
 
-  for (Operation *fn : methods) {
+  for (unsigned methodIndex = 0; methodIndex < methods.size();
+       ++methodIndex) {
+    Operation *fn = methods[methodIndex];
     auto funcType = getFuncTypeGenerator(fn);
     if (!funcType)
       continue;
@@ -507,6 +518,7 @@ LogicalResult CirctModuleEmitter::collectPorts() {
       returnNames = dyn_cast_or_null<ArrayAttr>(dict.get(methodKey));
 
     unsigned outputIndex = 0;
+    unsigned methodOutputCount = 0;
 
     // Inputs and by-ref outputs, walking the source signature so that named
     // DSL types keep their declared width.
@@ -531,9 +543,16 @@ LogicalResult CirctModuleEmitter::collectPorts() {
       if (isResult) {
         if (returnNames && outputIndex < returnNames.size())
           name = cast<StringAttr>(returnNames[outputIndex]).getValue().str();
-        if (name.empty())
-          name = outputIndex == 0 ? "out" : "out" + std::to_string(outputIndex);
+        if (name.empty()) {
+          if (methods.size() == 1)
+            name = outputIndex == 0 ? "out"
+                                    : "out" + std::to_string(outputIndex);
+          else
+            name = methodNames[methodIndex] + "_out" +
+                   (outputIndex == 0 ? "" : std::to_string(outputIndex));
+        }
         ++outputIndex;
+        ++methodOutputCount;
       } else {
         if (argNames && index < argNames.size())
           name = cast<StringAttr>(argNames[index]).getValue().str();
@@ -570,9 +589,15 @@ LogicalResult CirctModuleEmitter::collectPorts() {
       std::string name;
       if (returnNames && outputIndex < returnNames.size())
         name = cast<StringAttr>(returnNames[outputIndex]).getValue().str();
-      if (name.empty())
-        name = outputIndex == 0 ? "out" : "out" + std::to_string(outputIndex);
+      if (name.empty()) {
+        if (methods.size() == 1)
+          name = outputIndex == 0 ? "out" : "out" + std::to_string(outputIndex);
+        else
+          name = methodNames[methodIndex] + "_out" +
+                 (outputIndex == 0 ? "" : std::to_string(outputIndex));
+      }
       ++outputIndex;
+      ++methodOutputCount;
       if (!seen.insert(name).second) {
         fn->emitError() << "HDL lowering: duplicate port name '" << name << "'";
         return failure();
@@ -589,6 +614,42 @@ LogicalResult CirctModuleEmitter::collectPorts() {
         ports.push_back({maskName, width, /*isInput=*/false, false});
       }
     }
+    methodOutputCounts.push_back(methodOutputCount);
+  }
+  return success();
+}
+
+LogicalResult CirctModuleEmitter::collectMethodDomains() {
+  methodHasState.assign(methods.size(), false);
+  for (unsigned m = 0; m < methods.size(); ++m) {
+    auto func = dyn_cast<FunctionOpInterface>(methods[m]);
+    if (!func || func.getFunctionBody().empty())
+      continue;
+    Value self = func.getFunctionBody().front().getArgument(0);
+    bool stateful = false;
+    methods[m]->walk([&](Operation *op) {
+      if (op->getName().getStringRef() != "kgen.struct.gep" ||
+          op->getNumOperands() != 1 || op->getOperand(0) != self)
+        return;
+      auto index = op->getAttrOfType<IntegerAttr>("index");
+      if (!index)
+        return;
+      unsigned field = index.getInt();
+      if (field >= fieldIsInstance.size())
+        return;
+      if (!fieldIsInstance[field]) {
+        stateful = true;
+        return;
+      }
+      Operation *childOp = findBuiltModule(fieldStructNames[field]);
+      if (!childOp)
+        return;
+      for (hw::PortInfo port : cast<hw::HWModuleOp>(childOp).getPortList())
+        if (port.dir == hw::ModulePort::Direction::Input &&
+            isa<seq::ClockType>(port.type))
+          stateful = true;
+    });
+    methodHasState[m] = stateful;
   }
   return success();
 }
@@ -733,16 +794,11 @@ LogicalResult CirctModuleEmitter::findMethods() {
     if (method.starts_with("__"))
       continue;
     methods.push_back(&op);
+    methodNames.push_back(getMethodName(symbol.getValue(), structName));
   }
   if (methods.empty()) {
     source.emitError() << "HDL lowering: @module struct '" << structName
                        << "' has no elaborated methods";
-    return failure();
-  }
-  if (methods.size() != 1) {
-    source.emitError() << "HDL lowering: multiple processes per module are "
-                          "not supported yet ("
-                       << structName << " has " << methods.size() << ")";
     return failure();
   }
   return success();
@@ -890,6 +946,9 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     // Memory-only results are written through the by-ref result pointer and
     // `return` itself yields `none`.
     if (returnValue)
+      return success();
+    Operation *valueOp = op->getOperand(0).getDefiningOp();
+    if (valueOp && valueOp->getAttrOfType<KGEN::NoneAttr>("value"))
       return success();
     return op->emitError() << "HDL lowering: return value was not lowered";
   }
@@ -1351,24 +1410,9 @@ LogicalResult CirctModuleEmitter::emitBlock(Block &block, Value condition,
 
 LogicalResult CirctModuleEmitter::build() {
   if (failed(findMethods()) || failed(collectFieldWidths()) ||
-      failed(collectResetValues()) || failed(collectPorts()))
+      failed(collectResetValues()) || failed(collectMethodDomains()) ||
+      failed(collectPorts()))
     return failure();
-
-  // A module is stateful if it has a register field or instantiates a
-  // stateful child (which needs clock/reset forwarded).
-  for (unsigned i = 0; i < fieldIsInstance.size(); ++i) {
-    if (!fieldIsInstance[i]) {
-      hasState = true;
-      continue;
-    }
-    Operation *childOp = findBuiltModule(fieldStructNames[i]);
-    if (!childOp)
-      continue;
-    for (hw::PortInfo port : cast<hw::HWModuleOp>(childOp).getPortList())
-      if (port.dir == hw::ModulePort::Direction::Input &&
-          isa<seq::ClockType>(port.type))
-        hasState = true;
-  }
 
   loc = source.getLoc();
   MLIRContext *ctx = source.getContext();
@@ -1390,17 +1434,23 @@ LogicalResult CirctModuleEmitter::build() {
     }
   }
 
-  if (hasState) {
-    hw::PortInfo info;
-    info.name = StringAttr::get(ctx, "clk");
-    info.type = seq::ClockType::get(ctx);
-    info.dir = hw::ModulePort::Direction::Input;
-    info.argNum = inputs.size();
-    inputs.push_back(info);
+  // One ambient clock/reset pair per stateful method (domain root).
+  for (unsigned m = 0; m < methods.size(); ++m) {
+    if (!methodHasState[m])
+      continue;
+    bool single = methods.size() == 1;
+    std::string clkName = single ? "clk" : "clk_" + methodNames[m];
+    std::string rstName = single ? "rst" : "rst_" + methodNames[m];
 
-    // Ambient, active-high reset for every register in the module.
+    hw::PortInfo clkInfo;
+    clkInfo.name = StringAttr::get(ctx, clkName);
+    clkInfo.type = seq::ClockType::get(ctx);
+    clkInfo.dir = hw::ModulePort::Direction::Input;
+    clkInfo.argNum = inputs.size();
+    inputs.push_back(clkInfo);
+
     hw::PortInfo resetInfo;
-    resetInfo.name = StringAttr::get(ctx, "rst");
+    resetInfo.name = StringAttr::get(ctx, rstName);
     resetInfo.type = IntegerType::get(ctx, 1);
     resetInfo.dir = hw::ModulePort::Direction::Input;
     resetInfo.argNum = inputs.size();
@@ -1417,20 +1467,25 @@ LogicalResult CirctModuleEmitter::build() {
 
   Block *body = builtModule.getBodyBlock();
   size_t portIndex = 0;
-  for (Operation *fn : methods) {
-    auto func = cast<FunctionOpInterface>(fn);
-    auto sourceFunc = getSourceFuncType(fn);
+
+  // Map every method's user inputs and remember its `self`/result slots. All
+  // user inputs come before the per-domain clock/reset pairs.
+  SmallVector<Value> selfArgs(methods.size());
+  SmallVector<Value> resultArgs(methods.size());
+  for (unsigned m = 0; m < methods.size(); ++m) {
+    auto func = cast<FunctionOpInterface>(methods[m]);
+    auto sourceFunc = getSourceFuncType(methods[m]);
     Block &entry = func.getFunctionBody().front();
     unsigned argIndex = 0;
     for (BlockArgument arg : entry.getArguments()) {
       unsigned index = argIndex++;
       if (index == 0) {
-        selfPtr = arg;
+        selfArgs[m] = arg;
         continue;
       }
       if (sourceFunc && sourceFunc.getArgConvention(index) ==
                             ArgConvention::ByRefResult) {
-        resultPtr = arg;
+        resultArgs[m] = arg;
         continue;
       }
       Type sourceType =
@@ -1443,28 +1498,42 @@ LogicalResult CirctModuleEmitter::build() {
         values[arg] = body->getArgument(portIndex++);
       }
     }
-    if (hasState) {
-      clk = body->getArgument(portIndex++);
-      resetSignal = body->getArgument(portIndex++);
-    }
+  }
+
+  SmallVector<Value> domainClk(methods.size());
+  SmallVector<Value> domainReset(methods.size());
+  for (unsigned m = 0; m < methods.size(); ++m) {
+    if (!methodHasState[m])
+      continue;
+    domainClk[m] = body->getArgument(portIndex++);
+    domainReset[m] = body->getArgument(portIndex++);
+  }
+
+  SmallVector<Value> outputValues;
+  for (unsigned m = 0; m < methods.size(); ++m) {
+    selfPtr = selfArgs[m];
+    resultPtr = resultArgs[m];
+    clk = domainClk[m];
+    resetSignal = domainReset[m];
+    returnIsLogic = false;
+    returnXz = Value();
 
     Value returnValue;
-    // The module builder created an `hw.output` terminator; emit before it.
     builder.setInsertionPoint(body->getTerminator());
-    if (failed(emitOps(fn, returnValue)))
+    if (failed(emitOps(methods[m], returnValue)))
       return failure();
+    if (methodOutputCounts[m] == 0)
+      continue;
     if (!returnValue || (returnIsLogic && !returnXz))
-      return fn->emitError() << "HDL lowering: no value for module output";
-
-    // `hw.module` was built with a terminator; fill in the outputs.
-    auto output = cast<hw::OutputOp>(body->getTerminator());
-    SmallVector<Value> outputValues;
+      return methods[m]->emitError()
+             << "HDL lowering: no value for module output";
     outputValues.push_back(returnValue);
     if (returnIsLogic)
       outputValues.push_back(returnXz);
-    output->setOperands(outputValues);
   }
 
+  auto output = cast<hw::OutputOp>(body->getTerminator());
+  output->setOperands(outputValues);
   return success();
 }
 
