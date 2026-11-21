@@ -323,6 +323,24 @@ static unsigned getCallParamWidth(Operation *op) {
   return 0;
 }
 
+/// Return the leaf name of a DSL type reference (`Bits`, `Logic`, ...), or
+/// empty if this is not a `typevalue<genref<...>>`.
+static StringRef getDslTypeName(Type type) {
+  if (auto ptr = dyn_cast<KGEN::PointerType>(type))
+    type = ptr.getElementType();
+  auto typeValue = dyn_cast<KGEN::TypeValueType>(type);
+  if (!typeValue)
+    return {};
+  auto ref = dyn_cast<KGEN::TypeGeneratorRefAttr>(typeValue.getTypeValue());
+  if (!ref)
+    return {};
+  return ref.getSymbol().getLeafReference().getValue();
+}
+
+static bool isLogicType(Type type) {
+  return getDslTypeName(type).contains("Logic");
+}
+
 /// Return the HDL bit width of a DSL port type. `Bits[W]`/`Logic[W]` source
 /// types carry `W` as a type parameter; anything else is resolved from its
 /// lowered representation.
@@ -407,6 +425,13 @@ private:
     std::string name;
     unsigned width;
     bool isInput;
+    bool isLogic;
+  };
+
+  struct LogicValue {
+    Value val;
+    Value xz;
+    explicit operator bool() const { return val && xz; }
   };
 
   LogicalResult collectPorts();
@@ -416,6 +441,8 @@ private:
   LogicalResult emitOps(Operation *fn, Value &returnValue);
   LogicalResult emitOp(Operation *op, Value &returnValue);
   Value getValue(Value value);
+  LogicValue getLogicValue(Value value);
+  Value bitNot(Value value);
   Value getConstant(bool value);
   Value getOrCreateReg(unsigned fieldIndex, Type type);
 
@@ -428,6 +455,7 @@ private:
   SmallVector<Operation *> methods;
 
   DenseMap<Value, Value> values;
+  DenseMap<Value, LogicValue> logicValues;
   DenseMap<Value, llvm::APInt> intConstants;
   DenseMap<Value, unsigned> fieldPtrs;
   DenseMap<unsigned, Value> fieldRegs;
@@ -435,6 +463,8 @@ private:
   SmallVector<unsigned> fieldWidths;
   Value selfPtr;
   Value resultPtr;
+  Value returnXz;
+  bool returnIsLogic = false;
   Value clk;
   Value resetSignal;
   bool hasState = false;
@@ -502,7 +532,18 @@ LogicalResult CirctModuleEmitter::collectPorts() {
         fn->emitError() << "HDL lowering: duplicate port name '" << name << "'";
         return failure();
       }
-      ports.push_back({name, width, /*isInput=*/!isResult});
+      bool isLogic = isLogicType(sourceType);
+      ports.push_back({name, width, /*isInput=*/!isResult, isLogic});
+      if (isLogic) {
+        // A 4-state value is carried as a value net plus an X/Z mask net.
+        std::string maskName = name + "_xz";
+        if (!seen.insert(maskName).second) {
+          fn->emitError() << "HDL lowering: duplicate port name '" << maskName
+                          << "'";
+          return failure();
+        }
+        ports.push_back({maskName, width, /*isInput=*/!isResult, false});
+      }
     }
 
     // By-value results (the primitive DSL path returns scalars directly).
@@ -524,7 +565,17 @@ LogicalResult CirctModuleEmitter::collectPorts() {
         fn->emitError() << "HDL lowering: duplicate port name '" << name << "'";
         return failure();
       }
-      ports.push_back({name, width, /*isInput=*/false});
+      bool isLogic = isLogicType(resType);
+      ports.push_back({name, width, /*isInput=*/false, isLogic});
+      if (isLogic) {
+        std::string maskName = name + "_xz";
+        if (!seen.insert(maskName).second) {
+          fn->emitError() << "HDL lowering: duplicate port name '" << maskName
+                          << "'";
+          return failure();
+        }
+        ports.push_back({maskName, width, /*isInput=*/false, false});
+      }
     }
   }
   return success();
@@ -704,6 +755,20 @@ Value CirctModuleEmitter::getValue(Value value) {
   return {};
 }
 
+CirctModuleEmitter::LogicValue CirctModuleEmitter::getLogicValue(Value value) {
+  auto it = logicValues.find(value);
+  if (it != logicValues.end())
+    return it->second;
+  return {};
+}
+
+/// Bitwise complement at the operand's width.
+Value CirctModuleEmitter::bitNot(Value value) {
+  unsigned width = value.getType().getIntOrFloatBitWidth();
+  auto ones = hw::ConstantOp::create(builder, loc, llvm::APInt::getAllOnes(width));
+  return comb::XorOp::create(builder, loc, value, ones);
+}
+
 Value CirctModuleEmitter::getConstant(bool value) {
   Value &slot = value ? trueConstant : falseConstant;
   if (slot)
@@ -761,6 +826,96 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
 
   if (name == "kgen.call") {
     StringRef callee = callCalleeName(op);
+
+    // `Logic[W]` values are lowered as a (value, xz-mask) pair of `comb`
+    // nets. Binary calls take `(lhs, rhs, out-ptr)`, `mux_logic` takes
+    // `(cond, a, b, out-ptr)`, and `__invert__` takes `(src, out-ptr)`.
+    if (callee.contains("Logic::") || callee.contains("mux_logic")) {
+      auto storeResult = [&](Value dest, LogicValue value) -> LogicalResult {
+        if (!value)
+          return failure();
+        logicValues[dest] = value;
+        if (dest == resultPtr) {
+          returnValue = value.val;
+          returnXz = value.xz;
+          returnIsLogic = true;
+        }
+        return success();
+      };
+
+      if (callee.contains("mux_logic")) {
+        if (op->getNumOperands() != 4)
+          return op->emitError() << "HDL lowering: unexpected mux_logic form";
+        LogicValue cond = getLogicValue(op->getOperand(0));
+        LogicValue a = getLogicValue(op->getOperand(1));
+        LogicValue b = getLogicValue(op->getOperand(2));
+        if (!cond || !a || !b)
+          return op->emitError()
+                 << "HDL lowering: mux_logic operand was not lowered";
+        Value val = comb::MuxOp::create(builder, loc, cond.val, a.val, b.val);
+        Value normalXz =
+            comb::MuxOp::create(builder, loc, cond.val, a.xz, b.xz);
+        Value bothKnown =
+            bitNot(comb::OrOp::create(builder, loc, a.xz, b.xz));
+        Value equal =
+            bitNot(comb::XorOp::create(builder, loc, a.val, b.val));
+        Value unknownXz =
+            bitNot(comb::AndOp::create(builder, loc, bothKnown, equal));
+        Value xz = comb::MuxOp::create(builder, loc, cond.xz, unknownXz,
+                                       normalXz);
+        return storeResult(op->getOperand(3), {val, xz});
+      }
+
+      if (op->getNumOperands() == 3) {
+        LogicValue a = getLogicValue(op->getOperand(0));
+        LogicValue b = getLogicValue(op->getOperand(1));
+        if (!a || !b)
+          return op->emitError()
+                 << "HDL lowering: Logic operand was not lowered";
+        LogicValue result;
+        if (callee.contains("::__and__")) {
+          Value eitherXz = comb::OrOp::create(builder, loc, a.xz, b.xz);
+          Value aKnownOrVal = comb::OrOp::create(builder, loc, a.xz, a.val);
+          Value bKnownOrVal = comb::OrOp::create(builder, loc, b.xz, b.val);
+          Value xz = comb::AndOp::create(builder, loc, eitherXz, aKnownOrVal);
+          result.xz = comb::AndOp::create(builder, loc, xz, bKnownOrVal);
+          result.val = comb::AndOp::create(builder, loc, a.val, b.val);
+        } else if (callee.contains("::__or__")) {
+          Value eitherXz = comb::OrOp::create(builder, loc, a.xz, b.xz);
+          Value aUnknownOrNotVal =
+              comb::OrOp::create(builder, loc, a.xz, bitNot(a.val));
+          Value bUnknownOrNotVal =
+              comb::OrOp::create(builder, loc, b.xz, bitNot(b.val));
+          Value xz =
+              comb::AndOp::create(builder, loc, eitherXz, aUnknownOrNotVal);
+          result.xz = comb::AndOp::create(builder, loc, xz, bUnknownOrNotVal);
+          result.val = comb::OrOp::create(builder, loc, a.val, b.val);
+        } else if (callee.contains("::__xor__")) {
+          result.val = comb::XorOp::create(builder, loc, a.val, b.val);
+          result.xz = comb::OrOp::create(builder, loc, a.xz, b.xz);
+        } else {
+          return op->emitError() << "HDL lowering: unsupported Logic call '"
+                                 << callee << "'";
+        }
+        return storeResult(op->getOperand(2), result);
+      }
+
+      if (op->getNumOperands() == 2) {
+        LogicValue source = getLogicValue(op->getOperand(0));
+        if (!source)
+          return op->emitError()
+                 << "HDL lowering: Logic operand was not lowered";
+        if (callee.contains("::__invert__"))
+          return storeResult(op->getOperand(1),
+                             {bitNot(source.val), source.xz});
+        if (callee.contains("Logic::copy") ||
+            callee.contains("Logic::__init__"))
+          return storeResult(op->getOperand(1), source);
+      }
+
+      return op->emitError() << "HDL lowering: unsupported Logic call '"
+                             << callee << "'";
+    }
 
     // `Bits[W]` methods lower directly to `comb` ops. The DSL returns values
     // through a stack slot, so a binary call is `(lhs, rhs, out-ptr)`.
@@ -1095,7 +1250,15 @@ LogicalResult CirctModuleEmitter::build() {
         resultPtr = arg;
         continue;
       }
-      values[arg] = body->getArgument(portIndex++);
+      Type sourceType =
+          sourceFunc ? sourceFunc.getArgument(index) : arg.getType();
+      if (isLogicType(sourceType)) {
+        logicValues[arg] = {body->getArgument(portIndex),
+                            body->getArgument(portIndex + 1)};
+        portIndex += 2;
+      } else {
+        values[arg] = body->getArgument(portIndex++);
+      }
     }
     if (hasState) {
       clk = body->getArgument(portIndex++);
@@ -1107,12 +1270,16 @@ LogicalResult CirctModuleEmitter::build() {
     builder.setInsertionPoint(body->getTerminator());
     if (failed(emitOps(fn, returnValue)))
       return failure();
-    if (!returnValue)
+    if (!returnValue || (returnIsLogic && !returnXz))
       return fn->emitError() << "HDL lowering: no value for module output";
 
     // `hw.module` was built with a terminator; fill in the outputs.
     auto output = cast<hw::OutputOp>(body->getTerminator());
-    output->setOperands(ValueRange{returnValue});
+    SmallVector<Value> outputValues;
+    outputValues.push_back(returnValue);
+    if (returnIsLogic)
+      outputValues.push_back(returnXz);
+    output->setOperands(outputValues);
   }
 
   return success();
