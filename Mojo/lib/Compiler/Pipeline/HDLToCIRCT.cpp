@@ -1213,18 +1213,24 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                                  << "' was not built";
         auto child = cast<hw::HWModuleOp>(childOp);
         MLIRContext *ctx = source.getContext();
+        SmallVector<hw::PortInfo> childInputs;
+        for (hw::PortInfo port : child.getPortList())
+          if (port.dir == hw::ModulePort::Direction::Input)
+            childInputs.push_back(port);
+
         SmallVector<Value> inputs;
         unsigned operandIndex = 1;
-        for (hw::PortInfo port : child.getPortList()) {
-          if (port.dir != hw::ModulePort::Direction::Input)
-            continue;
+        for (unsigned p = 0; p < childInputs.size(); ++p) {
+          hw::PortInfo port = childInputs[p];
           if (isa<seq::ClockType>(port.type)) {
             if (!clk)
               return op->emitError()
                      << "HDL lowering: instance needs a clock";
             inputs.push_back(clk);
-          } else if (port.name.getValue() == "rst" ||
-                     port.name.getValue() == "rst_n") {
+            continue;
+          }
+          if (port.name.getValue() == "rst" ||
+              port.name.getValue() == "rst_n") {
             if (!resetSignal)
               return op->emitError() << "HDL lowering: instance needs a reset";
             bool childLow = port.name.getValue() == "rst_n";
@@ -1233,16 +1239,41 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             if (childLow != parentLow)
               reset = bitNot(reset);
             inputs.push_back(reset);
-          } else {
+            continue;
+          }
+
+          // A Logic[W] input is a value/mask port pair driven by one call
+          // operand.
+          std::string maskName = port.name.getValue().str() + "_xz";
+          bool isLogicValue =
+              p + 1 < childInputs.size() &&
+              childInputs[p + 1].name.getValue() == maskName;
+          if (isLogicValue) {
             if (operandIndex + 1 >= op->getNumOperands())
               return op->emitError()
                      << "HDL lowering: too few instance operands";
-            Value value = getValue(op->getOperand(operandIndex++));
+            LogicValue value = getLogicValue(op->getOperand(operandIndex++));
             if (!value)
               return op->emitError()
                      << "HDL lowering: instance operand was not lowered";
-            inputs.push_back(value);
+            inputs.push_back(value.val);
+            inputs.push_back(value.xz);
+            ++p;
+            continue;
           }
+          if (port.name.getValue().ends_with("_xz"))
+            return op->emitError()
+                   << "HDL lowering: unmatched Logic mask port '"
+                   << port.name.getValue() << "'";
+
+          if (operandIndex + 1 >= op->getNumOperands())
+            return op->emitError()
+                   << "HDL lowering: too few instance operands";
+          Value value = getValue(op->getOperand(operandIndex++));
+          if (!value)
+            return op->emitError()
+                   << "HDL lowering: instance operand was not lowered";
+          inputs.push_back(value);
         }
         if (operandIndex + 1 != op->getNumOperands())
           return op->emitError()
