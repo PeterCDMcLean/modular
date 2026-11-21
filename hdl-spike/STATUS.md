@@ -21,7 +21,7 @@ Build and test record:
 * Mojo (`-c opt`, same targets plus `//Mojo/stdlib/std`): **green**,
   1,188.7 s, 8,639 actions.
 * `hdl-spike/tests/run_all.sh`: **green** in both `-c dbg` and `-c opt`
-  (00, 00b, 01, 02). `--emit=circt` and `--emit=sv` run in-process.
+  (00, 00b, 01, 02, 03, 04, 05). `--emit=circt` and `--emit=sv` run in-process.
 * Verilator lint: skipped (not installed).
 * CLI adaptation: the current compiler uses `-I <dir>`; the tests were updated
   from `-mojo-search-paths`.
@@ -33,11 +33,12 @@ Build and test record:
 | 0. Build + `--emit=mlir` | **green** | `designs/00_hello.mojo` | `mojo build --emit=mlir` prints the compiler's own KGEN module. Hand-written CIRCT (a custom-syntax `hw.module` and a generic-syntax constant/xor fixture) parses through the compiler's own printer and re-parses with `circt-opt`. |
 | 1. LIT/early-KGEN hook | **green** | `designs/01_inv.mojo`, `designs/02_stateful_dump.mojo` | Hook is after `LowerLIT`, **before** `ElaborateGenerators` (see "Insertion point"); `--emit=circt --hdl-dump-ir` prints the IR the pass consumes. |
 | 2. Lower `Inv` → `hw`/`comb` | **green** | `designs/01_inv.mojo` | Emitted MLIR is byte-identical to `expected/01_inv.mlir`; the operations are real CIRCT `hw`/`comb` ops built in-process. `--emit=sv` exports SystemVerilog **in-process** through CIRCT's ExportVerilog (no `circt-opt` subprocess), matching `expected/01_inv.sv` after comment/blank-line normalization. |
-| 3. Widths and arithmetic | not started | — | — |
-| 4. Registers/reset | not started | — | — |
+| Type layer | **green (prototype)** | `hdl/bits.mojo`, `hdl/logic.mojo` | `Bits[W]` wraps bitlib's `BitInteger[W]` with stable result types; `Logic[W]` adds a 4-state value+mask. Native Sim tests cover add/mux/wrap and X/Z propagation (`03_sim_types`). |
+| 3. Widths and arithmetic | **partial** | `designs/03_add8.mojo` | Primitive `UInt8` add lowers to `comb.add` and exports `assign y = a + b` (`04_add8`). The bitlib `Bits[W]` type is Sim-complete; tagging it for CIRCT is the next step. |
+| 4. Registers/reset | **partial** | `designs/04_counter.mojo` | A struct field store/load becomes `seq.compreg` with a `clk` port and `always_ff` (`05_counter`). Reset/power-on and enable gating are not implemented yet. |
 | 5–10 | not started | — | — |
 
-`tests/run_all.sh` runs the whole flow: 00, 00b, 01 and 02 all pass.
+`tests/run_all.sh` runs 00, 00b, 01, 02, 03, 04, and 05; all pass.
 
 **Second phase (combined CIRCT/LLVM lowering).** The compiler now builds *real*
 CIRCT ops. CIRCT is a **git submodule** at `third_party/circt` pointing at the

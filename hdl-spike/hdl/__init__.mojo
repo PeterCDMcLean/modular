@@ -1,17 +1,10 @@
-"""Minimal HDL DSL surface for the compiler-spike stages.
+"""MojoHDL prototype surface.
 
-This is not the final library design (see mojo-hdl-analysis/02-dsl-and-types.md).
-Each stage adds exactly the markers the lowering pass understands:
-
-  * Stage 2: ``Sig[T]`` names a port payload; ``@module`` marks the module
-    struct. Both are markers only — the IR the compiler already builds from
-    ordinary Mojo values is what gets lowered.
-
-Note for this compiler version: parametric aliases are ``comptime``
-declarations (``comptime Sig[T: AnyType] = T``), not ``alias``.
+`Bits[W]` is the 2-state leaf (bitlib-backed); `Logic[W]` is the 4-state layer
+above it. `Sig[T]` is a marker read by the compiler pass.
 """
 
-# A port payload. For the CIRCT path the value is the plain Mojo value; the
-# module struct's method signature tells the lowering pass which values are
-# ports.
 comptime Sig[T: AnyType] = T
+
+from .bits import Bits, mux
+from .logic import Logic, XMode, bit, logic, mux_logic

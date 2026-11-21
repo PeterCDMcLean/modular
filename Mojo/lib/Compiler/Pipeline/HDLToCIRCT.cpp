@@ -45,6 +45,8 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/HW/PortImplementation.h"
+#include "circt/Dialect/Seq/SeqDialect.h"
+#include "circt/Dialect/Seq/SeqOps.h"
 #include "Mojo/KGENDialect/KGENAttrs.h"
 #include "Mojo/KGENDialect/KGENDialect.h"
 #include "Mojo/KGENDialect/KGENOps.h"
@@ -258,6 +260,16 @@ static unsigned getBitWidth(Type type) {
   return 0;
 }
 
+/// Convert a DSL/KGEN value type to the integer type used by CIRCT.
+static Type getHwType(Type type) {
+  if (isa<IntegerType>(type))
+    return type;
+  unsigned width = getBitWidth(type);
+  if (!width)
+    return {};
+  return IntegerType::get(type.getContext(), width);
+}
+
 /// Return the generator type carrier of a `kgen.func` / `kgen.generator`.
 static KGEN::FuncTypeGeneratorType getFuncTypeGenerator(Operation *op) {
   if (auto gen = dyn_cast<KGEN::GeneratorOp>(op))
@@ -273,6 +285,19 @@ static StringRef callCalleeName(Operation *op) {
   if (!symbol)
     return {};
   return symbol.getSymbol().getLeafReference().getValue();
+}
+
+/// Decode a scalar integer constant op, if this is one.
+static std::optional<llvm::APInt> getConstantInt(Operation *op) {
+  for (NamedAttribute attr : op->getAttrs()) {
+    if (auto simd = dyn_cast<KGEN::SIMDAttr>(attr.getValue())) {
+      if (simd.getValues().size() == 1)
+        return simd.getValues()[0].getIntVal();
+    }
+    if (auto intAttr = dyn_cast<IntegerAttr>(attr.getValue()))
+      return intAttr.getValue();
+  }
+  return std::nullopt;
 }
 
 /// Decode a scalar-bool constant op, if this is one.
@@ -317,6 +342,7 @@ private:
   LogicalResult emitOp(Operation *op, Value &returnValue);
   Value getValue(Value value);
   Value getConstant(bool value);
+  Value getOrCreateReg(unsigned fieldIndex, Type type);
 
   ModuleOp source;
   StringRef structName;
@@ -327,6 +353,11 @@ private:
   SmallVector<Operation *> methods;
 
   DenseMap<Value, Value> values;
+  DenseMap<Value, unsigned> fieldPtrs;
+  DenseMap<unsigned, Value> fieldRegs;
+  Value selfPtr;
+  Value clk;
+  bool hasState = false;
   Value trueConstant;
   Value falseConstant;
   Location loc;
@@ -425,6 +456,12 @@ LogicalResult CirctModuleEmitter::findMethods() {
                        << "' has no elaborated methods";
     return failure();
   }
+  for (Operation *method : methods) {
+    method->walk([&](Operation *op) {
+      if (op->getName().getStringRef() == "kgen.struct.gep")
+        hasState = true;
+    });
+  }
   if (methods.size() != 1) {
     source.emitError() << "HDL lowering: multiple processes per module are "
                           "not supported yet ("
@@ -451,6 +488,16 @@ Value CirctModuleEmitter::getConstant(bool value) {
   return slot;
 }
 
+Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
+  auto found = fieldRegs.find(fieldIndex);
+  if (found != fieldRegs.end())
+    return found->second;
+  auto zero = hw::ConstantOp::create(builder, loc, type, 0);
+  auto reg = seq::CompRegOp::create(builder, loc, zero, clk);
+  fieldRegs[fieldIndex] = reg;
+  return reg;
+}
+
 LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
   StringRef name = op->getName().getStringRef();
 
@@ -465,12 +512,17 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
   }
 
   if (name == "kgen.param.constant" || name == "pop.constant") {
-    auto value = getConstantBool(op);
-    if (!value)
-      return op->emitError()
-             << "HDL lowering: unsupported constant in HDL method";
-    values[op->getResult(0)] = getConstant(*value);
-    return success();
+    if (auto value = getConstantBool(op)) {
+      values[op->getResult(0)] = getConstant(*value);
+      return success();
+    }
+    if (auto value = getConstantInt(op)) {
+      values[op->getResult(0)] =
+          hw::ConstantOp::create(builder, loc, *value);
+      return success();
+    }
+    return op->emitError()
+           << "HDL lowering: unsupported constant in HDL method";
   }
 
   if (name == "kgen.call") {
@@ -491,6 +543,59 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
           comb::XorOp::create(builder, loc, operand, getConstant(true));
       return success();
     }
+
+    // SIMD lane arithmetic from the primitive `UInt8`/`UInt16` DSL path.
+    if (op->getNumOperands() == 2) {
+      Value lhs = getValue(op->getOperand(0));
+      Value rhs = getValue(op->getOperand(1));
+      if (!lhs || !rhs)
+        return op->emitError() << "HDL lowering: binary operand was not lowered";
+      if (callee.contains("SIMD::__add__")) {
+        values[op->getResult(0)] = comb::AddOp::create(builder, loc, lhs, rhs);
+        return success();
+      }
+      if (callee.contains("SIMD::__sub__")) {
+        values[op->getResult(0)] = comb::SubOp::create(builder, loc, lhs, rhs);
+        return success();
+      }
+      if (callee.contains("SIMD::__mul__")) {
+        values[op->getResult(0)] = comb::MulOp::create(builder, loc, lhs, rhs);
+        return success();
+      }
+      if (callee.contains("SIMD::__and__")) {
+        values[op->getResult(0)] = comb::AndOp::create(builder, loc, lhs, rhs);
+        return success();
+      }
+      if (callee.contains("SIMD::__or__")) {
+        values[op->getResult(0)] = comb::OrOp::create(builder, loc, lhs, rhs);
+        return success();
+      }
+      if (callee.contains("SIMD::__xor__")) {
+        values[op->getResult(0)] = comb::XorOp::create(builder, loc, lhs, rhs);
+        return success();
+      }
+      if (callee.contains("SIMD::__eq__")) {
+        values[op->getResult(0)] = comb::ICmpOp::create(
+            builder, loc, comb::ICmpPredicate::eq, lhs, rhs);
+        return success();
+      }
+      if (callee.contains("SIMD::__ne__")) {
+        values[op->getResult(0)] = comb::ICmpOp::create(
+            builder, loc, comb::ICmpPredicate::ne, lhs, rhs);
+        return success();
+      }
+      if (callee.contains("SIMD::__lt__")) {
+        values[op->getResult(0)] = comb::ICmpOp::create(
+            builder, loc, comb::ICmpPredicate::ult, lhs, rhs);
+        return success();
+      }
+      if (callee.contains("SIMD::__le__")) {
+        values[op->getResult(0)] = comb::ICmpOp::create(
+            builder, loc, comb::ICmpPredicate::ule, lhs, rhs);
+        return success();
+      }
+    }
+
     return op->emitError() << "HDL lowering: unsupported call to '" << callee
                            << "'";
   }
@@ -504,15 +609,38 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
     return success();
   }
 
+  if (name == "kgen.struct.gep") {
+    auto index = op->getAttrOfType<IntegerAttr>("index");
+    if (!index || op->getNumOperands() != 1 || op->getOperand(0) != selfPtr)
+      return op->emitError()
+             << "HDL lowering: unsupported struct field access";
+    fieldPtrs[op->getResult(0)] = index.getInt();
+    return success();
+  }
+
   if (name == "pop.store") {
     Value stored = getValue(op->getOperand(0));
     if (!stored)
       return op->emitError() << "HDL lowering: stored value was not lowered";
+    auto field = fieldPtrs.find(op->getOperand(1));
+    if (field != fieldPtrs.end()) {
+      auto reg = getOrCreateReg(field->second, stored.getType());
+      reg.getDefiningOp()->setOperand(0, stored);
+      return success();
+    }
     values[op->getOperand(1)] = stored;
     return success();
   }
 
   if (name == "pop.load") {
+    auto field = fieldPtrs.find(op->getOperand(0));
+    if (field != fieldPtrs.end()) {
+      auto type = getHwType(op->getResult(0).getType());
+      if (!type)
+        return op->emitError() << "HDL lowering: unsupported state type";
+      values[op->getResult(0)] = getOrCreateReg(field->second, type);
+      return success();
+    }
     Value stored = getValue(op->getOperand(0));
     if (!stored)
       return op->emitError() << "HDL lowering: loaded value was not lowered";
@@ -565,6 +693,15 @@ LogicalResult CirctModuleEmitter::build() {
     }
   }
 
+  if (hasState) {
+    hw::PortInfo info;
+    info.name = StringAttr::get(ctx, "clk");
+    info.type = seq::ClockType::get(ctx);
+    info.dir = hw::ModulePort::Direction::Input;
+    info.argNum = inputs.size();
+    inputs.push_back(info);
+  }
+
   // Use the struct's unqualified name as the module name.
   StringRef displayName = StringRef(structName).rsplit("::").second;
 
@@ -580,10 +717,14 @@ LogicalResult CirctModuleEmitter::build() {
     auto func = cast<FunctionOpInterface>(fn);
     Block &entry = func.getFunctionBody().front();
     for (BlockArgument arg : entry.getArguments()) {
-      if (argIndex++ == 0)
+      if (argIndex++ == 0) {
+        selfPtr = arg;
         continue;
+      }
       values[arg] = body->getArgument(portIndex++);
     }
+    if (hasState)
+      clk = body->getArgument(portIndex);
 
     Value returnValue;
     // The module builder created an `hw.output` terminator; emit before it.

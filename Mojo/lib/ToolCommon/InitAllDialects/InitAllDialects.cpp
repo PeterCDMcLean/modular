@@ -16,6 +16,7 @@
 
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/HW/HWDialect.h"
+#include "circt/Dialect/Seq/SeqDialect.h"
 #include "Mojo/CODialect/CODialect.h"
 #include "Mojo/DepGraphDialect/DepGraphDialect.h"
 #include "Mojo/HLCFDialect/HLCFDialect.h"
@@ -299,7 +300,8 @@ void M::registerAllKGENDialects(mlir::DialectRegistry &registry) {
       mlir::ub::UBDialect,
       // Prototype fork: vendored CIRCT dialects for the HDL lowering.
       circt::hw::HWDialect,
-      circt::comb::CombDialect
+      circt::comb::CombDialect,
+      circt::seq::SeqDialect
       // clang-format on
       >();
 
@@ -333,7 +335,8 @@ void M::preloadAllKGENDialects(MLIRContext *ctx) {
       mlir::ub::UBDialect,
       // Prototype fork: vendored CIRCT dialects for the HDL lowering.
       circt::hw::HWDialect,
-      circt::comb::CombDialect
+      circt::comb::CombDialect,
+      circt::seq::SeqDialect
       // clang-format on
       >();
 
