@@ -18,8 +18,10 @@ Build and test record:
   **green**, 354.7 s, 2,026 actions, against LLVM `eaabd239f5`.
 * Mojo (`//Mojo/tools/kgen:kgen`, `//Mojo/tools/mojo:mojo`, `-c dbg`,
   `--jobs=3`): **green**, 1,179.2 s, 8,590 actions.
-* `hdl-spike/tests/run_all.sh`: **green** (00, 00b, 01, 02).
-  `--emit=circt` and `--emit=sv` run in-process.
+* Mojo (`-c opt`, same targets plus `//Mojo/stdlib/std`): **green**,
+  1,188.7 s, 8,639 actions.
+* `hdl-spike/tests/run_all.sh`: **green** in both `-c dbg` and `-c opt`
+  (00, 00b, 01, 02). `--emit=circt` and `--emit=sv` run in-process.
 * Verilator lint: skipped (not installed).
 * CLI adaptation: the current compiler uses `-I <dir>`; the tests were updated
   from `-mojo-search-paths`.
