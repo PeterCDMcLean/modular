@@ -492,13 +492,14 @@ private:
   LogicalResult emitOps(Operation *fn, Value &returnValue);
   LogicalResult emitBlock(Block &block, Value condition, Value &returnValue);
   LogicalResult emitOp(Operation *op, Value condition, Value &returnValue);
-  void storeField(unsigned fieldIndex, Value value, Value condition);
+  LogicalResult storeField(unsigned fieldIndex, Value value, Value condition);
   void convertCEToPlain(unsigned fieldIndex);
   Operation *findBuiltModule(StringRef name);
   Value getValue(Value value);
   LogicValue getLogicValue(Value value);
   LogicValue getOrCreateLogicReg(unsigned fieldIndex, unsigned width);
-  void storeLogicField(unsigned fieldIndex, LogicValue value, Value condition);
+  LogicalResult storeLogicField(unsigned fieldIndex, LogicValue value,
+                                Value condition);
   Value bitNot(Value value);
   Value getConstant(bool value);
   Value getOrCreateReg(unsigned fieldIndex, Type type);
@@ -526,6 +527,9 @@ private:
   DenseMap<unsigned, Value> fieldNext;
   DenseMap<unsigned, Value> fieldEnable;
   DenseMap<unsigned, bool> fieldMuxed;
+  DenseMap<unsigned, unsigned> fieldWriter;
+  DenseMap<unsigned, std::set<unsigned>> fieldReaders;
+  unsigned currentMethod = 0;
   DenseMap<unsigned, llvm::APInt> resetValues;
   SmallVector<unsigned> fieldWidths;
   SmallVector<unsigned> methodOutputCounts;
@@ -913,6 +917,9 @@ Value CirctModuleEmitter::getValue(Value value) {
     unsigned index = field->second;
     if (index >= fieldWidths.size() || !fieldWidths[index])
       return {};
+    if (index < fieldIsLogic.size() && fieldIsLogic[index])
+      return {};
+    fieldReaders[index].insert(currentMethod);
     auto type = IntegerType::get(value.getContext(), fieldWidths[index]);
     return getOrCreateReg(index, type);
   }
@@ -925,8 +932,10 @@ CirctModuleEmitter::LogicValue CirctModuleEmitter::getLogicValue(Value value) {
     return it->second;
   auto field = fieldPtrs.find(value);
   if (field != fieldPtrs.end() && field->second < fieldIsLogic.size() &&
-      fieldIsLogic[field->second])
+      fieldIsLogic[field->second]) {
+    fieldReaders[field->second].insert(currentMethod);
     return getOrCreateLogicReg(field->second, fieldWidths[field->second]);
+  }
   return {};
 }
 
@@ -950,8 +959,18 @@ CirctModuleEmitter::getOrCreateLogicReg(unsigned fieldIndex, unsigned width) {
   return regs;
 }
 
-void CirctModuleEmitter::storeLogicField(unsigned fieldIndex, LogicValue value,
-                                         Value condition) {
+LogicalResult CirctModuleEmitter::storeLogicField(unsigned fieldIndex,
+                                                 LogicValue value,
+                                                 Value condition) {
+  if (auto writer = fieldWriter.find(fieldIndex);
+      writer != fieldWriter.end() && writer->second != currentMethod)
+    return source.emitError()
+           << "HDL lowering: field '" << fieldNames[fieldIndex]
+           << "' is driven from multiple processes ('"
+           << methodNames[writer->second] << "' and '"
+           << methodNames[currentMethod] << "')";
+  fieldWriter[fieldIndex] = currentMethod;
+
   LogicValue regs =
       getOrCreateLogicReg(fieldIndex, value.val.getType().getIntOrFloatBitWidth());
   LogicValue hold = logicNext.lookup(fieldIndex);
@@ -963,6 +982,7 @@ void CirctModuleEmitter::storeLogicField(unsigned fieldIndex, LogicValue value,
   logicNext[fieldIndex] = next;
   regs.val.getDefiningOp()->setOperand(0, next.val);
   regs.xz.getDefiningOp()->setOperand(0, next.xz);
+  return success();
 }
 
 /// Bitwise complement at the operand's width.
@@ -1035,8 +1055,17 @@ void CirctModuleEmitter::convertCEToPlain(unsigned fieldIndex) {
   fieldRegs[fieldIndex] = plain;
 }
 
-void CirctModuleEmitter::storeField(unsigned fieldIndex, Value value,
-                                    Value condition) {
+LogicalResult CirctModuleEmitter::storeField(unsigned fieldIndex, Value value,
+                                             Value condition) {
+  if (auto writer = fieldWriter.find(fieldIndex);
+      writer != fieldWriter.end() && writer->second != currentMethod)
+    return source.emitError()
+           << "HDL lowering: field '" << fieldNames[fieldIndex]
+           << "' is driven from multiple processes ('"
+           << methodNames[writer->second] << "' and '"
+           << methodNames[currentMethod] << "')";
+  fieldWriter[fieldIndex] = currentMethod;
+
   Value reg = getOrCreateReg(fieldIndex, value.getType());
   bool logicField =
       fieldIndex < fieldIsLogic.size() && fieldIsLogic[fieldIndex];
@@ -1051,7 +1080,7 @@ void CirctModuleEmitter::storeField(unsigned fieldIndex, Value value,
       if (existing == condition) {
         ce->setOperand(0, value);
         fieldNext[fieldIndex] = value;
-        return;
+        return success();
       }
       convertCEToPlain(fieldIndex);
       reg = fieldRegs[fieldIndex];
@@ -1071,7 +1100,7 @@ void CirctModuleEmitter::storeField(unsigned fieldIndex, Value value,
         fieldRegs[fieldIndex] = newReg;
         fieldNext[fieldIndex] = value;
         fieldEnable[fieldIndex] = condition;
-        return;
+        return success();
       }
     }
   }
@@ -1092,6 +1121,7 @@ void CirctModuleEmitter::storeField(unsigned fieldIndex, Value value,
     next = comb::MuxOp::create(builder, loc, condition, value, hold);
   fieldNext[fieldIndex] = next;
   reg.getDefiningOp()->setOperand(0, next);
+  return success();
 }
 
 LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
@@ -1253,8 +1283,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             field != fieldPtrs.end() &&
             field->second < fieldIsLogic.size() &&
             fieldIsLogic[field->second]) {
-          storeLogicField(field->second, value, condition);
-          return success();
+          return storeLogicField(field->second, value, condition);
         }
         logicValues[dest] = value;
         if (dest == resultPtr) {
@@ -1478,7 +1507,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             returnValue = source;
           } else if (auto field = fieldPtrs.find(op->getOperand(1));
                      field != fieldPtrs.end()) {
-            storeField(field->second, source, condition);
+            return storeField(field->second, source, condition);
           } else {
             values[op->getOperand(1)] = source;
           }
@@ -1596,10 +1625,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     if (!stored)
       return op->emitError() << "HDL lowering: stored value was not lowered";
     auto field = fieldPtrs.find(op->getOperand(1));
-    if (field != fieldPtrs.end()) {
-      storeField(field->second, stored, condition);
-      return success();
-    }
+    if (field != fieldPtrs.end())
+      return storeField(field->second, stored, condition);
     values[op->getOperand(1)] = stored;
     return success();
   }
@@ -1748,6 +1775,7 @@ LogicalResult CirctModuleEmitter::build() {
 
   SmallVector<Value> outputValues;
   for (unsigned m = 0; m < methods.size(); ++m) {
+    currentMethod = m;
     selfPtr = selfArgs[m];
     resultPtr = resultArgs[m];
     clk = domainClk[m];
@@ -1767,6 +1795,20 @@ LogicalResult CirctModuleEmitter::build() {
     outputValues.push_back(returnValue);
     if (returnIsLogic)
       outputValues.push_back(returnXz);
+  }
+
+  // Report cross-domain reads after every method has been seen, so method
+  // order does not matter.
+  for (auto &[field, readers] : fieldReaders) {
+    auto writer = fieldWriter.find(field);
+    if (writer == fieldWriter.end())
+      continue;
+    for (unsigned reader : readers)
+      if (reader != writer->second)
+        return source.emitError()
+               << "HDL lowering: field '" << fieldNames[field]
+               << "' is read from process '" << methodNames[reader]
+               << "' but driven from '" << methodNames[writer->second] << "'";
   }
 
   auto output = cast<hw::OutputOp>(body->getTerminator());
