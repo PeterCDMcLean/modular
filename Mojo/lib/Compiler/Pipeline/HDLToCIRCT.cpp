@@ -439,7 +439,9 @@ private:
   LogicalResult collectResetValues();
   LogicalResult findMethods();
   LogicalResult emitOps(Operation *fn, Value &returnValue);
-  LogicalResult emitOp(Operation *op, Value &returnValue);
+  LogicalResult emitBlock(Block &block, Value condition, Value &returnValue);
+  LogicalResult emitOp(Operation *op, Value condition, Value &returnValue);
+  void storeField(unsigned fieldIndex, Value value, Value condition);
   Value getValue(Value value);
   LogicValue getLogicValue(Value value);
   Value bitNot(Value value);
@@ -459,6 +461,7 @@ private:
   DenseMap<Value, llvm::APInt> intConstants;
   DenseMap<Value, unsigned> fieldPtrs;
   DenseMap<unsigned, Value> fieldRegs;
+  DenseMap<unsigned, Value> fieldNext;
   DenseMap<unsigned, llvm::APInt> resetValues;
   SmallVector<unsigned> fieldWidths;
   Value selfPtr;
@@ -796,11 +799,64 @@ Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
   auto reg = seq::CompRegOp::create(builder, loc, zero, clk, resetSignal,
                                     resetConstant, initialValue);
   fieldRegs[fieldIndex] = reg;
+  fieldNext[fieldIndex] = reg;
   return reg;
 }
 
-LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
+void CirctModuleEmitter::storeField(unsigned fieldIndex, Value value,
+                                    Value condition) {
+  Value reg = getOrCreateReg(fieldIndex, value.getType());
+  Value hold = fieldNext.lookup(fieldIndex);
+  Value next = value;
+  // A conditional write holds the previous next-state value when disabled,
+  // which is the input-mux form of a clock enable.
+  if (condition && hold)
+    next = comb::MuxOp::create(builder, loc, condition, value, hold);
+  fieldNext[fieldIndex] = next;
+  reg.getDefiningOp()->setOperand(0, next);
+}
+
+LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
+                                         Value &returnValue) {
   StringRef name = op->getName().getStringRef();
+
+  if (name == "hlcf.yield")
+    return success();
+
+  if (name == "hlcf.if") {
+    if (op->getNumOperands() != 1 || op->getNumRegions() != 2 ||
+        op->getNumResults() != 0)
+      return op->emitError()
+             << "HDL lowering: unsupported conditional in HDL method";
+    Value cond = getValue(op->getOperand(0));
+    if (!cond)
+      return op->emitError() << "HDL lowering: condition was not lowered";
+    auto hasBody = [](Region &region) {
+      if (region.empty())
+        return false;
+      for (Operation &op : region.front())
+        if (op.getName().getStringRef() != "hlcf.yield")
+          return true;
+      return false;
+    };
+    Region &thenRegion = op->getRegion(0);
+    if (hasBody(thenRegion)) {
+      Value thenCond =
+          condition ? comb::AndOp::create(builder, loc, condition, cond) : cond;
+      if (failed(emitBlock(thenRegion.front(), thenCond, returnValue)))
+        return failure();
+    }
+    Region &elseRegion = op->getRegion(1);
+    if (hasBody(elseRegion)) {
+      Value notCond = bitNot(cond);
+      Value elseCond = condition
+                           ? comb::AndOp::create(builder, loc, condition, notCond)
+                           : notCond;
+      if (failed(emitBlock(elseRegion.front(), elseCond, returnValue)))
+        return failure();
+    }
+    return success();
+  }
 
   if (name == "hlcf.return") {
     if (op->getNumOperands() == 1)
@@ -1025,8 +1081,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
             returnValue = source;
           } else if (auto field = fieldPtrs.find(op->getOperand(1));
                      field != fieldPtrs.end()) {
-            Value reg = getOrCreateReg(field->second, source.getType());
-            reg.getDefiningOp()->setOperand(0, source);
+            storeField(field->second, source, condition);
           } else {
             values[op->getOperand(1)] = source;
           }
@@ -1046,7 +1101,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
 
     Value operand = op->getNumOperands() == 1 ? getValue(op->getOperand(0))
                                               : Value();
-    if (callee.contains("::__bool__")) {
+    if (callee.contains("::__bool__") || callee.contains("__mlir_bool__")) {
       if (!operand)
         return op->emitError() << "HDL lowering: __bool__ operand not lowered";
       values[op->getResult(0)] = operand;
@@ -1141,8 +1196,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
       return op->emitError() << "HDL lowering: stored value was not lowered";
     auto field = fieldPtrs.find(op->getOperand(1));
     if (field != fieldPtrs.end()) {
-      auto reg = getOrCreateReg(field->second, stored.getType());
-      reg.getDefiningOp()->setOperand(0, stored);
+      storeField(field->second, stored, condition);
       return success();
     }
     values[op->getOperand(1)] = stored;
@@ -1180,8 +1234,13 @@ LogicalResult CirctModuleEmitter::emitOps(Operation *fn, Value &returnValue) {
   if (!func || func.getFunctionBody().empty())
     return fn->emitError() << "HDL lowering: method has no body";
   Block &entry = func.getFunctionBody().front();
-  for (Operation &op : entry.getOperations())
-    if (failed(emitOp(&op, returnValue)))
+  return emitBlock(entry, /*condition=*/Value(), returnValue);
+}
+
+LogicalResult CirctModuleEmitter::emitBlock(Block &block, Value condition,
+                                            Value &returnValue) {
+  for (Operation &op : block.getOperations())
+    if (failed(emitOp(&op, condition, returnValue)))
       return failure();
   return success();
 }
