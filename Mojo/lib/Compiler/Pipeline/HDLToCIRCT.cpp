@@ -408,6 +408,7 @@ private:
 
   LogicalResult collectPorts();
   LogicalResult collectFieldWidths();
+  LogicalResult collectResetValues();
   LogicalResult findMethods();
   LogicalResult emitOps(Operation *fn, Value &returnValue);
   LogicalResult emitOp(Operation *op, Value &returnValue);
@@ -427,10 +428,12 @@ private:
   DenseMap<Value, llvm::APInt> intConstants;
   DenseMap<Value, unsigned> fieldPtrs;
   DenseMap<unsigned, Value> fieldRegs;
+  DenseMap<unsigned, llvm::APInt> resetValues;
   SmallVector<unsigned> fieldWidths;
   Value selfPtr;
   Value resultPtr;
   Value clk;
+  Value resetSignal;
   bool hasState = false;
   Value trueConstant;
   Value falseConstant;
@@ -519,6 +522,92 @@ LogicalResult CirctModuleEmitter::collectPorts() {
         return failure();
       }
       ports.push_back({name, width, /*isInput=*/false});
+    }
+  }
+  return success();
+}
+
+LogicalResult CirctModuleEmitter::collectResetValues() {
+  std::string initPrefix = (structName + "::__init__(").str();
+  std::string defaultName = (structName + "::__init__()").str();
+  SmallVector<Operation *> constructors;
+  for (Operation &op : source.getBody()->getOperations()) {
+    auto symbol = op.getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName());
+    if (!symbol)
+      continue;
+    // Prefer the default constructor; it is the one an instance starts from.
+    if (symbol.getValue() == defaultName) {
+      constructors.clear();
+      constructors.push_back(&op);
+      break;
+    }
+    if (symbol.getValue().starts_with(initPrefix) &&
+        !symbol.getValue().contains("::__init__(move:"))
+      constructors.push_back(&op);
+  }
+
+  for (Operation *constructor : constructors) {
+    auto func = dyn_cast<FunctionOpInterface>(constructor);
+    if (!func || func.getFunctionBody().empty())
+      continue;
+    Block &entry = func.getFunctionBody().front();
+    if (entry.getNumArguments() == 0)
+      continue;
+    Value self = entry.getArgument(0);
+
+    DenseMap<Value, unsigned> fieldIndexes;
+    DenseMap<Value, llvm::APInt> constants;
+    for (Operation &op : entry.getOperations()) {
+      StringRef name = op.getName().getStringRef();
+      if (name == "kgen.struct.gep") {
+        auto index = op.getAttrOfType<IntegerAttr>("index");
+        if (index && op.getNumOperands() == 1 && op.getOperand(0) == self)
+          fieldIndexes[op.getResult(0)] = index.getInt();
+        continue;
+      }
+      if (name == "kgen.param.constant" || name == "pop.constant") {
+        if (auto value = getConstantInt(&op))
+          constants[op.getResult(0)] = *value;
+        continue;
+      }
+      if (name == "pop.store") {
+        auto field = fieldIndexes.find(op.getOperand(1));
+        if (field == fieldIndexes.end())
+          continue;
+        Operation *valueOp = op.getOperand(0).getDefiningOp();
+        if (auto value = valueOp ? getConstantInt(valueOp) : std::nullopt)
+          resetValues[field->second] = *value;
+        continue;
+      }
+      if (name != "kgen.call")
+        continue;
+
+      StringRef callee = callCalleeName(&op);
+      if (!callee.contains("Bits::__init__"))
+        continue;
+      // A direct `Bits[W](constant)` assignment can initialize the field
+      // through the field pointer without a temporary.
+      if (op.getNumOperands() == 2 && !callee.contains("__init__(move:")) {
+        auto field = fieldIndexes.find(op.getOperand(1));
+        if (field == fieldIndexes.end())
+          continue;
+        Operation *valueOp = op.getOperand(0).getDefiningOp();
+        auto value = constants.find(op.getOperand(0));
+        std::optional<llvm::APInt> result;
+        if (value != constants.end())
+          result = value->second;
+        else if (valueOp)
+          result = getConstantInt(valueOp);
+        if (result)
+          resetValues[field->second] = *result;
+        continue;
+      }
+      // Zero-argument `Bits[W]()` leaves the field zero-initialized.
+      if (op.getNumOperands() == 1) {
+        auto field = fieldIndexes.find(op.getOperand(0));
+        if (field != fieldIndexes.end())
+          resetValues[field->second] = llvm::APInt(1, 0);
+      }
     }
   }
   return success();
@@ -626,8 +715,14 @@ Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
   auto found = fieldRegs.find(fieldIndex);
   if (found != fieldRegs.end())
     return found->second;
+  unsigned width = type.getIntOrFloatBitWidth();
+  llvm::APInt resetValue(width, 0);
+  if (auto value = resetValues.find(fieldIndex); value != resetValues.end())
+    resetValue = value->second.zextOrTrunc(width);
   auto zero = hw::ConstantOp::create(builder, loc, type, 0);
-  auto reg = seq::CompRegOp::create(builder, loc, zero, clk);
+  auto resetConstant = hw::ConstantOp::create(builder, loc, resetValue);
+  auto reg = seq::CompRegOp::create(builder, loc, zero, clk, resetSignal,
+                                    resetConstant);
   fieldRegs[fieldIndex] = reg;
   return reg;
 }
@@ -910,7 +1005,7 @@ LogicalResult CirctModuleEmitter::emitOps(Operation *fn, Value &returnValue) {
 
 LogicalResult CirctModuleEmitter::build() {
   if (failed(findMethods()) || failed(collectFieldWidths()) ||
-      failed(collectPorts()))
+      failed(collectResetValues()) || failed(collectPorts()))
     return failure();
 
   loc = source.getLoc();
@@ -940,6 +1035,14 @@ LogicalResult CirctModuleEmitter::build() {
     info.dir = hw::ModulePort::Direction::Input;
     info.argNum = inputs.size();
     inputs.push_back(info);
+
+    // Ambient, active-high reset for every register in the module.
+    hw::PortInfo resetInfo;
+    resetInfo.name = StringAttr::get(ctx, "rst");
+    resetInfo.type = IntegerType::get(ctx, 1);
+    resetInfo.dir = hw::ModulePort::Direction::Input;
+    resetInfo.argNum = inputs.size();
+    inputs.push_back(resetInfo);
   }
 
   // Use the struct's unqualified name as the module name.
@@ -970,8 +1073,10 @@ LogicalResult CirctModuleEmitter::build() {
       }
       values[arg] = body->getArgument(portIndex++);
     }
-    if (hasState)
-      clk = body->getArgument(portIndex);
+    if (hasState) {
+      clk = body->getArgument(portIndex++);
+      resetSignal = body->getArgument(portIndex++);
+    }
 
     Value returnValue;
     // The module builder created an `hw.output` terminator; emit before it.
