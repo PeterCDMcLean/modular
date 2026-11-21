@@ -545,7 +545,7 @@ private:
   Value getOrCreateReg(unsigned fieldIndex, Type type);
   SmallVector<Value> &getOrCreateMemory(unsigned fieldIndex);
   Value createRegister(unsigned id, Type type, llvm::APInt resetValue,
-                        llvm::APInt initialValue);
+                        llvm::APInt initialValue, int style);
 
   ModuleOp source;
   StringRef structName;
@@ -586,6 +586,7 @@ private:
   SmallVector<bool> fieldIsMemory;
   SmallVector<unsigned> fieldMemWidths;
   SmallVector<unsigned> fieldMemDepths;
+  SmallVector<int> fieldResetStyle;
   DenseMap<unsigned, SmallVector<Value>> memoryRegs;
   int resetStyle = 0;
   std::optional<llvm::APInt> powerOnValue;
@@ -820,7 +821,8 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
 
       StringRef callee = callCalleeName(&op);
       if (!callee.contains("Bits::__init__") &&
-          !callee.contains("Logic::__init__"))
+          !callee.contains("Logic::__init__") &&
+          !callee.contains("Resettable::__init__"))
         continue;
       // A direct `Bits[W](constant)` assignment can initialize the field
       // through the field pointer without a temporary.
@@ -887,6 +889,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     fieldIsMemory.push_back(isMemory);
     fieldMemWidths.push_back(0);
     fieldMemDepths.push_back(0);
+    fieldResetStyle.push_back(resetStyle);
     if (isConfig) {
       if (auto value = getDslTypeBinding(fieldType, &bindings)) {
         if (isPowerOn)
@@ -895,6 +898,20 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
           resetStyle = static_cast<int>(value->getZExtValue());
       }
       fieldWidths.push_back(0);
+      fieldIsInstance.push_back(false);
+      fieldIsLogic.push_back(false);
+      fieldModuleNames.push_back({});
+      continue;
+    }
+
+    if (!isMemory && StringRef(typeName).contains("Resettable")) {
+      auto params = getDslTypeBindings(fieldType, &bindings);
+      if (params.size() >= 2) {
+        fieldWidths.push_back(params[0].getZExtValue());
+        fieldResetStyle.back() = params[1].getZExtValue();
+      } else {
+        fieldWidths.push_back(0);
+      }
       fieldIsInstance.push_back(false);
       fieldIsLogic.push_back(false);
       fieldModuleNames.push_back({});
@@ -1056,8 +1073,13 @@ CirctModuleEmitter::getOrCreateLogicReg(unsigned fieldIndex, unsigned width) {
   llvm::APInt initialValue = resetValue;
   if (powerOnValue)
     initialValue = powerOnValue->zextOrTrunc(width);
-  Value valReg = createRegister(fieldIndex * 2, type, resetValue, initialValue);
-  Value xzReg = createRegister(fieldIndex * 2 + 1, type, zeroValue, zeroValue);
+  int style =
+      fieldIndex < fieldResetStyle.size() ? fieldResetStyle[fieldIndex]
+                                          : resetStyle;
+  Value valReg =
+      createRegister(fieldIndex * 2, type, resetValue, initialValue, style);
+  Value xzReg =
+      createRegister(fieldIndex * 2 + 1, type, zeroValue, zeroValue, style);
   LogicValue regs{valReg, xzReg};
   logicRegs[fieldIndex] = regs;
   logicNext[fieldIndex] = regs;
@@ -1109,12 +1131,12 @@ Value CirctModuleEmitter::getConstant(bool value) {
 
 Value CirctModuleEmitter::createRegister(unsigned id, Type type,
                                          llvm::APInt resetValue,
-                                         llvm::APInt initialValue) {
+                                         llvm::APInt initialValue, int style) {
   auto zero = hw::ConstantOp::create(builder, loc, type, 0);
   auto resetConstant = hw::ConstantOp::create(builder, loc, resetValue);
-  bool activeLow = (resetStyle & 1) != 0;
+  bool activeLow = (style & 1) != 0;
   Value reset = activeLow ? bitNot(resetSignal) : resetSignal;
-  bool async = resetStyle >= 2;
+  bool async = style >= 2;
   if (async) {
     auto name =
         StringAttr::get(builder.getContext(), "reg_" + std::to_string(id));
@@ -1142,7 +1164,10 @@ Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
   llvm::APInt initialValue = resetValue;
   if (powerOnValue)
     initialValue = powerOnValue->zextOrTrunc(width);
-  Value reg = createRegister(fieldIndex, type, resetValue, initialValue);
+  int style =
+      fieldIndex < fieldResetStyle.size() ? fieldResetStyle[fieldIndex]
+                                          : resetStyle;
+  Value reg = createRegister(fieldIndex, type, resetValue, initialValue, style);
   fieldRegs[fieldIndex] = reg;
   fieldNext[fieldIndex] = reg;
   return reg;
@@ -1595,6 +1620,67 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       }
 
       return op->emitError() << "HDL lowering: unsupported Logic call '"
+                             << callee << "'";
+    }
+
+    // `Resettable[W, style]` is a Bits value with a register-level reset
+    // style; its operations lower exactly like the corresponding Bits ones.
+    if (callee.contains("Resettable::")) {
+      if (callee.contains("::__deinit__") || callee.contains("::__del__"))
+        return success();
+      if (callee.contains("::__init__") &&
+          !callee.contains("__init__(move:")) {
+        unsigned width = getCallParamWidth(op, &bindings);
+        Operation *valueOp = op->getOperand(0).getDefiningOp();
+        auto value =
+            valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
+        if (!width || !value)
+          return op->emitError()
+                 << "HDL lowering: unsupported Resettable constructor";
+        Value constant = hw::ConstantOp::create(
+            builder, loc, value->zextOrTrunc(width));
+        values[op->getOperand(1)] = constant;
+        if (op->getOperand(1) == resultPtr)
+          returnValue = constant;
+        return success();
+      }
+      if (op->getNumOperands() == 3 && callee.contains("::__add__")) {
+        Value lhs = getValue(op->getOperand(0));
+        Value rhs = getValue(op->getOperand(1));
+        if (!lhs || !rhs)
+          return op->emitError()
+                 << "HDL lowering: Resettable operand was not lowered";
+        Value result = comb::AddOp::create(builder, loc, lhs, rhs);
+        values[op->getOperand(2)] = result;
+        if (op->getOperand(2) == resultPtr)
+          returnValue = result;
+        return success();
+      }
+      if (op->getNumOperands() == 2) {
+        Value source = getValue(op->getOperand(0));
+        if (!source)
+          return op->emitError()
+                 << "HDL lowering: Resettable operand was not lowered";
+        if (callee.contains("::__init__")) {
+          if (op->getOperand(1) == resultPtr) {
+            returnValue = source;
+          } else if (auto field = fieldPtrs.find(op->getOperand(1));
+                     field != fieldPtrs.end()) {
+            return storeField(field->second, source, condition);
+          } else {
+            values[op->getOperand(1)] = source;
+          }
+          return success();
+        }
+        if (callee.contains("::get") || callee.contains("::copy")) {
+          Value dest = op->getOperand(1);
+          values[dest] = source;
+          if (dest == resultPtr)
+            returnValue = source;
+          return success();
+        }
+      }
+      return op->emitError() << "HDL lowering: unsupported Resettable call '"
                              << callee << "'";
     }
 

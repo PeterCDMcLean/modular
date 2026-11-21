@@ -9,6 +9,7 @@ comptime Sig[T: AnyType] = T
 from .bits import Bits, mux
 from .logic import Logic, XMode, bit, logic, mux_logic
 from .mem import Mem
+from .resettable import Resettable
 
 
 struct ResetStyle[style: Int = 0](Copyable, Movable):
