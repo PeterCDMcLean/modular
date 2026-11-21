@@ -761,7 +761,7 @@ private:
   Value bitNot(Value value);
   Value getConstant(bool value);
   Value getOrCreateReg(unsigned fieldIndex, Type type);
-  SmallVector<Value> &getOrCreateMemory(unsigned fieldIndex);
+  SmallVector<Value> &getOrCreateArrayStorage(unsigned fieldIndex);
   Value createRegister(unsigned id, Type type, llvm::APInt resetValue,
                         llvm::APInt initialValue, int style);
 
@@ -801,20 +801,25 @@ private:
   SmallVector<bool> fieldIsInstance;
   SmallVector<bool> fieldIsLogic;
   SmallVector<bool> fieldIsConfig;
-  SmallVector<bool> fieldIsMemory;
+  SmallVector<bool> fieldIsArrayStorage;
   SmallVector<bool> fieldIsWire;
-  SmallVector<unsigned> fieldMemWidths;
-  SmallVector<unsigned> fieldMemDepths;
+  SmallVector<unsigned> fieldArrayWidths;
+  SmallVector<unsigned> fieldArrayDepths;
   SmallVector<int> fieldResetStyle;
-  DenseMap<unsigned, SmallVector<Value>> memoryRegs;
-  DenseMap<unsigned, SmallVector<Value>> memoryNext;
-  DenseMap<unsigned, SmallVector<Value>> memoryXzRegs;
-  DenseMap<unsigned, SmallVector<Value>> memoryXzNext;
-  DenseMap<unsigned, SmallVector<Value>> memoryEnable;
-  DenseMap<unsigned, SmallVector<bool>> memoryWritten;
-  DenseMap<unsigned, bool> memoryIsLogic;
+  DenseMap<unsigned, SmallVector<Value>> arrayRegs;
+  DenseMap<unsigned, SmallVector<Value>> arrayNext;
+  DenseMap<unsigned, SmallVector<Value>> arrayXzRegs;
+  DenseMap<unsigned, SmallVector<Value>> arrayXzNext;
+  DenseMap<unsigned, SmallVector<Value>> arrayEnable;
+  DenseMap<unsigned, SmallVector<bool>> arrayWritten;
+  DenseMap<unsigned, bool> arrayIsLogic;
   DenseMap<unsigned, Value> wireValues;
-  DenseMap<unsigned, SmallVector<llvm::APInt>> memoryResetSequences;
+  struct ArrayElementAccess {
+    unsigned field;
+    Value index;
+  };
+  DenseMap<Value, ArrayElementAccess> arrayElements;
+  DenseMap<unsigned, SmallVector<llvm::APInt>> arrayResetSequences;
   int resetStyle = 0;
   int clockDivisor = 1;
   std::optional<llvm::APInt> powerOnValue;
@@ -1116,7 +1121,7 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
             values.clear();
         }
         if (!values.empty()) {
-          memoryResetSequences[field->second] = values;
+          arrayResetSequences[field->second] = values;
           continue;
         }
         // A single-value fill falls through to the generic constant path.
@@ -1148,6 +1153,35 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
     }
   }
   return success();
+}
+
+/// Recognize array-storage fields: `Mem[T, N]` and `Array[Reg[T], N]`.
+/// Returns the payload type and depth. A plain `Array[T, N]` of payloads is a
+/// packed value (use `Packed`), not storage.
+static bool getArrayStorageInfo(Type type, const ParamBindings *bindings,
+                                Type &payload, unsigned &depth) {
+  StringRef name = getDslTypeName(type);
+  if (name.empty())
+    return false;
+  Type first = getDslTypeParam(type, 0);
+  auto depthValue = getDslTypeIntParam(type, 1, bindings);
+  if (!first || !depthValue)
+    return false;
+  if (name.ends_with("Mem")) {
+    payload = first;
+    depth = depthValue->getZExtValue();
+    return true;
+  }
+  if (name.ends_with("Array")) {
+    if (!getDslTypeName(first).contains("Reg"))
+      return false;
+    payload = getDslTypeParam(first, 0);
+    if (!payload)
+      return false;
+    depth = depthValue->getZExtValue();
+    return true;
+  }
+  return false;
 }
 
 LogicalResult CirctModuleEmitter::collectFieldWidths() {
@@ -1183,16 +1217,20 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     bool isClockDivider = StringRef(typeName).contains("ClockDivider");
     bool isConfig = StringRef(typeName).contains("ResetStyle") ||
                     isPowerOn || isClockDivider;
-    bool isMemory = !isConfig && StringRef(typeName).ends_with("Mem");
-    bool isWire = !isConfig && !isMemory &&
+    Type arrayPayload;
+    unsigned arrayDepth = 0;
+    bool isArrayStorage =
+        !isConfig && getArrayStorageInfo(fieldType, &bindings, arrayPayload,
+                                         arrayDepth);
+    bool isWire = !isConfig && !isArrayStorage &&
                   StringRef(typeName).ends_with("Wire");
-    bool isReg = !isConfig && !isMemory && !isWire &&
+    bool isReg = !isConfig && !isArrayStorage && !isWire &&
                  StringRef(typeName).ends_with("Reg");
     fieldIsConfig.push_back(isConfig);
-    fieldIsMemory.push_back(isMemory);
+    fieldIsArrayStorage.push_back(isArrayStorage);
     fieldIsWire.push_back(isWire);
-    fieldMemWidths.push_back(0);
-    fieldMemDepths.push_back(0);
+    fieldArrayWidths.push_back(0);
+    fieldArrayDepths.push_back(0);
     fieldResetStyle.push_back(resetStyle);
     if (isConfig) {
       if (auto value = getDslTypeBinding(fieldType, &bindings)) {
@@ -1231,19 +1269,24 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
       continue;
     }
 
-    if (isMemory) {
-      Type element = getDslTypeParam(fieldType, 0);
-      fieldMemWidths.back() = element ? getHdlWidth(element, &bindings) : 0;
-      if (auto depth = getDslTypeIntParam(fieldType, 1, &bindings))
-        fieldMemDepths.back() = depth->getZExtValue();
+    if (isArrayStorage) {
+      fieldArrayWidths.back() = getHdlWidth(arrayPayload, &bindings);
+      fieldArrayDepths.back() = arrayDepth;
       fieldWidths.push_back(0);
       fieldIsInstance.push_back(false);
       fieldIsLogic.push_back(false);
       fieldModuleNames.push_back({});
-      memoryIsLogic[fieldIsMemory.size() - 1] =
-          element && getDslTypeName(element).contains("Logic");
+      arrayIsLogic[fieldIsArrayStorage.size() - 1] =
+          getDslTypeName(arrayPayload).contains("Logic");
       continue;
     }
+
+    if (!isConfig && StringRef(typeName).ends_with("Array"))
+      return source.emitError()
+             << "HDL lowering: unsupported array field '"
+             << fieldNames.back()
+             << "'; use Array[Reg[T], N] for state or Packed[T, N] for a "
+                "packed value";
 
     fieldWidths.push_back(getHdlWidth(fieldType, &bindings));
     bool isInstance = false;
@@ -1291,24 +1334,24 @@ LogicalResult CirctModuleEmitter::findMethods() {
 }
 
 SmallVector<Value> &
-CirctModuleEmitter::getOrCreateMemory(unsigned fieldIndex) {
-  auto found = memoryRegs.find(fieldIndex);
-  if (found != memoryRegs.end())
+CirctModuleEmitter::getOrCreateArrayStorage(unsigned fieldIndex) {
+  auto found = arrayRegs.find(fieldIndex);
+  if (found != arrayRegs.end())
     return found->second;
-  auto &regs = memoryRegs[fieldIndex];
-  unsigned width = fieldMemWidths[fieldIndex];
-  unsigned depth = fieldMemDepths[fieldIndex];
-  bool isLogic = memoryIsLogic.lookup(fieldIndex);
+  auto &regs = arrayRegs[fieldIndex];
+  unsigned width = fieldArrayWidths[fieldIndex];
+  unsigned depth = fieldArrayDepths[fieldIndex];
+  bool isLogic = arrayIsLogic.lookup(fieldIndex);
   auto type = IntegerType::get(builder.getContext(), width);
   auto zero = hw::ConstantOp::create(builder, loc, type, 0);
   auto ceZero =
       hw::ConstantOp::create(builder, loc, builder.getIntegerType(1), 0);
   Value reset = (resetStyle & 1) ? bitNot(resetSignal) : resetSignal;
   bool async = resetStyle >= 2;
-  auto sequence = memoryResetSequences.find(fieldIndex);
+  auto sequence = arrayResetSequences.find(fieldIndex);
   for (unsigned k = 0; k < depth; ++k) {
     llvm::APInt resetBits(width, 0);
-    if (sequence != memoryResetSequences.end() &&
+    if (sequence != arrayResetSequences.end() &&
         k < sequence->second.size())
       resetBits = sequence->second[k].zextOrTrunc(width);
     else if (auto value = resetValues.find(fieldIndex);
@@ -1335,7 +1378,7 @@ CirctModuleEmitter::getOrCreateMemory(unsigned fieldIndex) {
     }
 
     if (isLogic) {
-      auto &xzRegs = memoryXzRegs[fieldIndex];
+      auto &xzRegs = arrayXzRegs[fieldIndex];
       auto xzName = StringAttr::get(
           builder.getContext(), "mem_" + std::to_string(fieldIndex) + "_" +
                                     std::to_string(k) + "_xz");
@@ -1355,11 +1398,11 @@ CirctModuleEmitter::getOrCreateMemory(unsigned fieldIndex) {
       }
     }
   }
-  memoryNext[fieldIndex] = regs;
+  arrayNext[fieldIndex] = regs;
   if (isLogic)
-    memoryXzNext[fieldIndex] = memoryXzRegs[fieldIndex];
-  memoryEnable[fieldIndex] = SmallVector<Value>(depth, ceZero);
-  memoryWritten[fieldIndex] = SmallVector<bool>(depth, false);
+    arrayXzNext[fieldIndex] = arrayXzRegs[fieldIndex];
+  arrayEnable[fieldIndex] = SmallVector<Value>(depth, ceZero);
+  arrayWritten[fieldIndex] = SmallVector<bool>(depth, false);
   return regs;
 }
 
@@ -1394,7 +1437,7 @@ Value CirctModuleEmitter::getValue(Value value) {
       return {};
     if (index < fieldIsLogic.size() && fieldIsLogic[index])
       return {};
-    if (index < fieldIsMemory.size() && fieldIsMemory[index])
+    if (index < fieldIsArrayStorage.size() && fieldIsArrayStorage[index])
       return {};
     if (index < fieldIsWire.size() && fieldIsWire[index])
       return wireValues.lookup(index);
@@ -1692,36 +1735,185 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
   if (name == "kgen.call") {
     StringRef callee = callCalleeName(op);
 
-    // A `Mem[T, N]` field is N register slots plus a read mux. `T` may be a
-    // 2-state `Bits[W]` or a 4-state `Logic[W]` (value/mask register pairs).
+    auto constantIndex = [](Value value) -> std::optional<uint64_t> {
+      if (auto constant = value.getDefiningOp<hw::ConstantOp>())
+        return constant.getValue().getZExtValue();
+      return std::nullopt;
+    };
+
+    auto arrayWrite = [&](unsigned field, Value index, Value data, Value dataXz,
+                          bool isLogic, Value enable,
+                          Value condition) -> LogicalResult {
+      auto &regs = getOrCreateArrayStorage(field);
+      if (regs.empty())
+        return op->emitError() << "HDL lowering: empty array storage";
+      auto constIdx = constantIndex(index);
+      if (constIdx && *constIdx >= regs.size())
+        return op->emitError() << "HDL lowering: array index out of range";
+      auto &nexts = arrayNext[field];
+      auto &xzNexts = arrayXzNext[field];
+      auto &enables = arrayEnable[field];
+      auto &written = arrayWritten[field];
+      auto setEntry = [&](Value reg, Value next,
+                          Value en) -> LogicalResult {
+        if (auto ceOp = reg.getDefiningOp<seq::CompRegClockEnabledOp>()) {
+          ceOp->setOperand(0, next);
+          ceOp->setOperand(2, en);
+        } else if (auto fir = reg.getDefiningOp<seq::FirRegOp>()) {
+          fir->setOperand(0, next);
+        } else {
+          return op->emitError()
+                 << "HDL lowering: unsupported array register form";
+        }
+        return success();
+      };
+
+      for (unsigned k = 0; k < regs.size(); ++k) {
+        if (constIdx && *constIdx != k)
+          continue;
+        Value ce;
+        if (constIdx) {
+          ce = enable ? enable : getConstant(true);
+        } else {
+          Value eq = comb::ICmpOp::create(
+              builder, loc, comb::ICmpPredicate::eq, index,
+              hw::ConstantOp::create(builder, loc, index.getType(),
+                                     static_cast<int64_t>(k)));
+          ce = enable ? comb::AndOp::create(builder, loc, enable, eq) : eq;
+        }
+        if (condition)
+          ce = comb::AndOp::create(builder, loc, condition, ce);
+
+        bool clockEnabled =
+            regs[k].getDefiningOp<seq::CompRegClockEnabledOp>() != nullptr;
+        Value next = data;
+        Value nextXz = isLogic ? dataXz : Value();
+        Value combinedEnable = ce;
+        if (!written[k] && clockEnabled) {
+          // The first write to a clock-enabled entry needs no input mux.
+        } else {
+          next = comb::MuxOp::create(builder, loc, ce, data, nexts[k]);
+          if (isLogic)
+            nextXz = comb::MuxOp::create(builder, loc, ce, dataXz, xzNexts[k]);
+          if (written[k])
+            combinedEnable =
+                comb::OrOp::create(builder, loc, enables[k], ce);
+        }
+        written[k] = true;
+        nexts[k] = next;
+        if (isLogic)
+          xzNexts[k] = nextXz;
+        enables[k] = combinedEnable;
+
+        if (failed(setEntry(regs[k], next, combinedEnable)))
+          return failure();
+        if (isLogic && failed(setEntry(arrayXzRegs[field][k], nextXz,
+                                       combinedEnable)))
+          return failure();
+      }
+      return success();
+    };
+
+    auto arrayRead = [&](unsigned field, Value index, bool isLogic,
+                         Value &resultXz) -> Value {
+      auto &regs = getOrCreateArrayStorage(field);
+      if (regs.empty())
+        return {};
+      auto constIdx = constantIndex(index);
+      if (constIdx) {
+        if (*constIdx >= regs.size())
+          return {};
+        if (isLogic)
+          resultXz = arrayXzRegs[field][*constIdx];
+        return regs[*constIdx];
+      }
+      Value result = regs[0];
+      if (isLogic)
+        resultXz = arrayXzRegs[field][0];
+      for (unsigned k = 1; k < regs.size(); ++k) {
+        Value eq = comb::ICmpOp::create(
+            builder, loc, comb::ICmpPredicate::eq, index,
+            hw::ConstantOp::create(builder, loc, index.getType(),
+                                   static_cast<int64_t>(k)));
+        result = comb::MuxOp::create(builder, loc, eq, regs[k], result);
+        if (isLogic)
+          resultXz = comb::MuxOp::create(
+              builder, loc, eq, arrayXzRegs[field][k], resultXz);
+      }
+      return result;
+    };
+
+    // A constant-index access lowers to `__getitem_param__`; recover the
+    // compile-time index and record the same element access.
+    if (callee.contains("Array::__getitem_param__")) {
+      if (op->getNumOperands() != 1)
+        return op->emitError()
+               << "HDL lowering: unexpected Array::__getitem_param__ form";
+      auto array = fieldPtrs.find(op->getOperand(0));
+      if (array == fieldPtrs.end() ||
+          array->second >= fieldIsArrayStorage.size() ||
+          !fieldIsArrayStorage[array->second])
+        return op->emitError()
+               << "HDL lowering: Array::__getitem_param__ on a non-array field";
+      auto indexValue = getCallIntParam(op, 2, &bindings);
+      if (!indexValue)
+        return op->emitError()
+               << "HDL lowering: array index was not resolved";
+      Value index = hw::ConstantOp::create(
+          builder, loc, builder.getI64Type(),
+          static_cast<int64_t>(indexValue->getZExtValue()));
+      arrayElements[op->getResult(0)] = {array->second, index};
+      return success();
+    }
+
+    // `Array[Reg[T], N].__getitem__` yields a pointer to one storage slot.
+    // Record it so the following `Reg` operation can lower against the slot.
+    if (callee.contains("Array::__getitem__")) {
+      if (op->getNumOperands() != 2)
+        return op->emitError()
+               << "HDL lowering: unexpected Array::__getitem__ form";
+      auto array = fieldPtrs.find(op->getOperand(0));
+      if (array == fieldPtrs.end() ||
+          array->second >= fieldIsArrayStorage.size() ||
+          !fieldIsArrayStorage[array->second])
+        return op->emitError()
+               << "HDL lowering: Array::__getitem__ on a non-array field";
+      Value index = getValue(op->getOperand(1));
+      if (!index)
+        return op->emitError()
+               << "HDL lowering: array index was not lowered";
+      arrayElements[op->getResult(0)] = {array->second, index};
+      return success();
+    }
+
+    // `Mem[T, N]` is sugar over `Array[Reg[T], N]`: both use the same array
+    // storage and address-decode helpers. `T` may be `Bits[W]` or `Logic[W]`.
     if (callee.contains("Mem::write") || callee.contains("Mem::read")) {
       if (op->getNumOperands() < 3)
         return op->emitError() << "HDL lowering: malformed memory access";
       auto mem = fieldPtrs.find(op->getOperand(0));
-      if (mem == fieldPtrs.end() || mem->second >= fieldIsMemory.size() ||
-          !fieldIsMemory[mem->second])
+      if (mem == fieldPtrs.end() ||
+          mem->second >= fieldIsArrayStorage.size() ||
+          !fieldIsArrayStorage[mem->second])
         return op->emitError()
-               << "HDL lowering: memory access on a non-memory field";
+               << "HDL lowering: memory access on a non-array field";
       unsigned field = mem->second;
-      bool isLogic = memoryIsLogic.lookup(field);
+      bool isLogic = arrayIsLogic.lookup(field);
       Value index = getValue(op->getOperand(1));
       if (!index)
-        return op->emitError() << "HDL lowering: memory index was not lowered";
-      auto &regs = getOrCreateMemory(field);
-      if (regs.empty())
-        return op->emitError() << "HDL lowering: empty memory";
+        return op->emitError()
+               << "HDL lowering: memory index was not lowered";
 
       if (callee.contains("Mem::write")) {
-        if (op->getNumOperands() < 3)
-          return op->emitError() << "HDL lowering: malformed memory write";
         Value data;
-        LogicValue logicData;
+        Value dataXz;
         if (isLogic) {
-          logicData = getLogicValue(op->getOperand(2));
-          if (!logicData)
+          LogicValue value = getLogicValue(op->getOperand(2));
+          if (!value)
             return op->emitError()
                    << "HDL lowering: memory write data was not lowered";
-          data = logicData.val;
+          data = value.val;
+          dataXz = value.xz;
         } else {
           data = getValue(op->getOperand(2));
           if (!data)
@@ -1735,78 +1927,14 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             return op->emitError()
                    << "HDL lowering: memory write enable was not lowered";
         }
-        auto &nexts = memoryNext[field];
-        auto &xzNexts = memoryXzNext[field];
-        auto &enables = memoryEnable[field];
-        auto &written = memoryWritten[field];
-        auto setEntry = [&](Value reg, Value next,
-                            Value en) -> LogicalResult {
-          if (auto ceOp = reg.getDefiningOp<seq::CompRegClockEnabledOp>()) {
-            ceOp->setOperand(0, next);
-            ceOp->setOperand(2, en);
-          } else if (auto fir = reg.getDefiningOp<seq::FirRegOp>()) {
-            fir->setOperand(0, next);
-          } else {
-            return op->emitError()
-                   << "HDL lowering: unsupported memory register form";
-          }
-          return success();
-        };
-
-        for (unsigned k = 0; k < regs.size(); ++k) {
-          Value eq = comb::ICmpOp::create(
-              builder, loc, comb::ICmpPredicate::eq, index,
-              hw::ConstantOp::create(builder, loc, index.getType(),
-                                     static_cast<int64_t>(k)));
-          Value ce = enable
-                         ? comb::AndOp::create(builder, loc, enable, eq)
-                         : eq;
-          bool clockEnabled =
-              regs[k].getDefiningOp<seq::CompRegClockEnabledOp>() != nullptr;
-          Value next = data;
-          Value nextXz = isLogic ? logicData.xz : Value();
-          Value combinedEnable = ce;
-          if (!written[k] && clockEnabled) {
-            // The first write to a clock-enabled entry needs no input mux.
-          } else {
-            // A later write call has priority over earlier ones on a
-            // conflicting address. Firreg entries always need the mux
-            // because they have no clock enable.
-            next = comb::MuxOp::create(builder, loc, ce, data, nexts[k]);
-            if (isLogic)
-              nextXz = comb::MuxOp::create(builder, loc, ce, logicData.xz,
-                                           xzNexts[k]);
-            if (written[k])
-              combinedEnable =
-                  comb::OrOp::create(builder, loc, enables[k], ce);
-          }
-          written[k] = true;
-          nexts[k] = next;
-          if (isLogic)
-            xzNexts[k] = nextXz;
-          enables[k] = combinedEnable;
-
-          if (failed(setEntry(regs[k], next, combinedEnable)))
-            return failure();
-          if (isLogic && failed(setEntry(memoryXzRegs[field][k], nextXz,
-                                         combinedEnable)))
-            return failure();
-        }
-        return success();
+        return arrayWrite(field, index, data, dataXz, isLogic, enable,
+                          condition);
       }
 
-      Value result = regs[0];
-      Value resultXz = isLogic ? memoryXzRegs[field][0] : Value();
-      for (unsigned k = 1; k < regs.size(); ++k) {
-        Value eq = comb::ICmpOp::create(
-            builder, loc, comb::ICmpPredicate::eq, index,
-            hw::ConstantOp::create(builder, loc, index.getType(),
-                                   static_cast<int64_t>(k)));
-        result = comb::MuxOp::create(builder, loc, eq, regs[k], result);
-        if (isLogic)
-          resultXz = comb::MuxOp::create(
-              builder, loc, eq, memoryXzRegs[field][k], resultXz);
-      }
+      Value resultXz;
+      Value result = arrayRead(field, index, isLogic, resultXz);
+      if (!result)
+        return op->emitError() << "HDL lowering: empty memory";
       Value dest = op->getOperand(2);
       if (isLogic) {
         logicValues[dest] = {result, resultXz};
@@ -2111,6 +2239,93 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         }
         return success();
       };
+
+      auto arrayElement = [&](Value ptr) -> ArrayElementAccess * {
+        auto it = arrayElements.find(ptr);
+        return it == arrayElements.end() ? nullptr : &it->second;
+      };
+      auto storeElement = [&](ArrayElementAccess &elem, Value data,
+                              Value dataXz,
+                              bool isLogic) -> LogicalResult {
+        return arrayWrite(elem.field, elem.index, data, dataXz, isLogic,
+                          Value(), condition);
+      };
+      auto loadElement = [&](ArrayElementAccess &elem,
+                             Value dest) -> LogicalResult {
+        bool isLogic = arrayIsLogic.lookup(elem.field);
+        Value xz;
+        Value value = arrayRead(elem.field, elem.index, isLogic, xz);
+        if (!value)
+          return op->emitError() << "HDL lowering: empty array storage";
+        if (isLogic)
+          return storeLogicResult(dest, {value, xz});
+        values[dest] = value;
+        if (dest == resultPtr)
+          returnValue = value;
+        return success();
+      };
+
+      // A `Reg` call whose receiver is an array element: `mem[i].next(v)` or
+      // `mem[i].get()`. The element pointer was recorded by
+      // `Array::__getitem__`; lower it against the array's storage slots.
+      if (auto *elem = arrayElement(op->getOperand(0))) {
+        bool isLogic = arrayIsLogic.lookup(elem->field);
+        if (callee.contains("::next") && op->getNumOperands() == 2) {
+          if (isLogic) {
+            LogicValue value = getLogicValue(op->getOperand(1));
+            if (!value)
+              return op->emitError()
+                     << "HDL lowering: array element operand was not lowered";
+            return storeElement(*elem, value.val, value.xz, true);
+          }
+          Value value = getValue(op->getOperand(1));
+          if (!value)
+            return op->emitError()
+                   << "HDL lowering: array element operand was not lowered";
+          return storeElement(*elem, value, Value(), false);
+        }
+        if (op->getNumOperands() == 2)
+          return loadElement(*elem, op->getOperand(1));
+      }
+
+      // A `Reg` construction/move whose destination is an array element:
+      // `mem[i] = Reg(...)`.
+      if (op->getNumOperands() == 2) {
+        if (auto *elem = arrayElement(op->getOperand(1))) {
+          bool isLogic = arrayIsLogic.lookup(elem->field);
+          if (callee.contains("__init__") &&
+              callee.contains("::SIMD") &&
+              !callee.contains("__init__(move:")) {
+            unsigned width = fieldArrayWidths[elem->field];
+            Operation *valueOp = op->getOperand(0).getDefiningOp();
+            auto value =
+                valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
+            if (!width || !value)
+              return op->emitError()
+                     << "HDL lowering: unsupported array element constructor";
+            Value constant = hw::ConstantOp::create(
+                builder, loc, value->zextOrTrunc(width));
+            if (isLogic) {
+              Value xz = hw::ConstantOp::create(
+                  builder, loc, llvm::APInt(width, 0));
+              return storeElement(*elem, constant, xz, true);
+            }
+            return storeElement(*elem, constant, Value(), false);
+          }
+          if (isLogic) {
+            LogicValue value = getLogicValue(op->getOperand(0));
+            if (!value)
+              return op->emitError()
+                     << "HDL lowering: array element operand was not lowered";
+            return storeElement(*elem, value.val, value.xz, true);
+          }
+          Value value = getValue(op->getOperand(0));
+          if (!value)
+            return op->emitError()
+                   << "HDL lowering: array element operand was not lowered";
+          return storeElement(*elem, value, Value(), false);
+        }
+      }
 
       if (callee.contains("__init__") && callee.contains("::SIMD") &&
           !callee.contains("__init__(move:")) {
