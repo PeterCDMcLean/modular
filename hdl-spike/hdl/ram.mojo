@@ -10,7 +10,7 @@ from .hdl_type import HdlType
 from .mem import Mem
 
 
-struct Ram[T: HdlType & Deinitable, N: Int = 4](
+struct Ram[T: HdlType & Deinitable & Defaultable, N: Int = 4](
     Copyable, Defaultable, Movable
 ):
     """A synchronous memory that lowers through `seq.hlmem`."""

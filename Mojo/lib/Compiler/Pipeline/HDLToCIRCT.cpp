@@ -825,6 +825,13 @@ private:
     Value index;
   };
   DenseMap<Value, ArrayElementAccess> arrayElements;
+  struct DelayedNext {
+    unsigned field;
+    unsigned delay;
+  };
+  DenseMap<Value, DelayedNext> delayedTargets;
+  DenseMap<unsigned, SmallVector<Value>> delayedNextRegs;
+  DenseMap<unsigned, std::map<unsigned, SmallVector<Value>>> pastChains;
   DenseMap<unsigned, SmallVector<llvm::APInt>> arrayResetSequences;
   int resetStyle = 0;
   int clockDivisor = 1;
@@ -1586,6 +1593,9 @@ Value CirctModuleEmitter::createRegister(unsigned id, Type type,
 }
 
 Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
+  if (auto delayed = delayedNextRegs.find(fieldIndex);
+      delayed != delayedNextRegs.end() && !delayed->second.empty())
+    return delayed->second.back();
   auto found = fieldRegs.find(fieldIndex);
   if (found != fieldRegs.end())
     return found->second;
@@ -1623,6 +1633,10 @@ void CirctModuleEmitter::convertCEToPlain(unsigned fieldIndex) {
 
 LogicalResult CirctModuleEmitter::storeField(unsigned fieldIndex, Value value,
                                              Value condition) {
+  if (delayedNextRegs.count(fieldIndex))
+    return source.emitError()
+           << "HDL lowering: cannot mix immediate and delayed next on field '"
+           << fieldNames[fieldIndex] << "'";
   if (auto writer = fieldWriter.find(fieldIndex);
       writer != fieldWriter.end() && writer->second != currentMethod)
     return source.emitError()
@@ -1870,6 +1884,87 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
               builder, loc, eq, arrayXzRegs[field][k], resultXz);
       }
       return result;
+    };
+
+    auto setRegisterNext = [&](Value reg,
+                               Value next) -> LogicalResult {
+      if (auto cr = reg.getDefiningOp<seq::CompRegOp>())
+        cr->setOperand(0, next);
+      else if (auto ce = reg.getDefiningOp<seq::CompRegClockEnabledOp>())
+        ce->setOperand(0, next);
+      else if (auto fr = reg.getDefiningOp<seq::FirRegOp>())
+        fr->setOperand(0, next);
+      else
+        return op->emitError()
+               << "HDL lowering: unsupported delay register form";
+      return success();
+    };
+
+    auto delayedWrite = [&](unsigned field, unsigned delay, Value value,
+                            Value condition) -> LogicalResult {
+      if (delay <= 1)
+        return storeField(field, value, condition);
+      if (auto writer = fieldWriter.find(field);
+          writer != fieldWriter.end() && writer->second != currentMethod)
+        return op->emitError()
+               << "HDL lowering: field '" << fieldNames[field]
+               << "' is driven from multiple processes";
+      fieldWriter[field] = currentMethod;
+      if (delayedNextRegs.count(field))
+        return op->emitError()
+               << "HDL lowering: multiple delayed next on field '"
+               << fieldNames[field] << "'";
+
+      unsigned width = fieldWidths[field];
+      auto type = IntegerType::get(builder.getContext(), width);
+      llvm::APInt resetBits(width, 0);
+      if (auto value = resetValues.find(field); value != resetValues.end())
+        resetBits = value->second.zextOrTrunc(width);
+      llvm::APInt initialBits = resetBits;
+      if (powerOnValue)
+        initialBits = powerOnValue->zextOrTrunc(width);
+      int style = field < fieldResetStyle.size() ? fieldResetStyle[field]
+                                                 : resetStyle;
+      auto &chain = delayedNextRegs[field];
+      for (unsigned stage = 0; stage < delay; ++stage) {
+        unsigned id = 100000 + field * 100 + stage;
+        Value reg = createRegister(id, type, resetBits, initialBits, style);
+        Value next = stage == 0 ? value : chain[stage - 1];
+        if (stage == 0 && condition)
+          next = comb::MuxOp::create(builder, loc, condition, next, reg);
+        if (failed(setRegisterNext(reg, next)))
+          return failure();
+        chain.push_back(reg);
+      }
+      return success();
+    };
+
+    auto pastValue = [&](unsigned field, unsigned delay) -> Value {
+      unsigned width = fieldWidths[field];
+      auto type = IntegerType::get(builder.getContext(), width);
+      Value current = getOrCreateReg(field, type);
+      if (!current || delay == 0)
+        return current;
+      auto &chain = pastChains[field][delay];
+      if (!chain.empty())
+        return chain.back();
+      llvm::APInt resetBits(width, 0);
+      if (auto value = resetValues.find(field); value != resetValues.end())
+        resetBits = value->second.zextOrTrunc(width);
+      llvm::APInt initialBits = resetBits;
+      if (powerOnValue)
+        initialBits = powerOnValue->zextOrTrunc(width);
+      int style = field < fieldResetStyle.size() ? fieldResetStyle[field]
+                                                 : resetStyle;
+      for (unsigned stage = 0; stage < delay; ++stage) {
+        unsigned id = 200000 + field * 1000 + delay * 10 + stage;
+        Value reg = createRegister(id, type, resetBits, initialBits, style);
+        Value next = stage == 0 ? current : chain[stage - 1];
+        if (failed(setRegisterNext(reg, next)))
+          return {};
+        chain.push_back(reg);
+      }
+      return chain.back();
     };
 
     // A constant-index access lowers to `__getitem_param__`; recover the
@@ -2296,12 +2391,73 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                              << callee << "'";
     }
 
+    // `q.next(n) <= v`: the `Reg::next` delay overload recorded a target;
+    // `NextTarget::__le__` performs the delayed update.
+    if (callee.contains("NextTarget::__le__")) {
+      if (op->getNumOperands() != 2)
+        return op->emitError()
+               << "HDL lowering: unexpected NextTarget assignment";
+      auto target = delayedTargets.find(op->getOperand(0));
+      if (target == delayedTargets.end())
+        return op->emitError()
+               << "HDL lowering: unknown delayed-next target";
+      Value value = getValue(op->getOperand(1));
+      if (!value)
+        return op->emitError()
+               << "HDL lowering: delayed-next value was not lowered";
+      return delayedWrite(target->second.field, target->second.delay, value,
+                          condition);
+    }
+
     // `Reg[T, style]` is a typed state field. `.next` is the clocked update
     // and `.get` reads the current value; `T` may be 2-state `Bits[W]` or
     // 4-state `Logic[W]`.
     if (callee.contains("Reg::")) {
       if (callee.contains("::__deinit__") || callee.contains("::__del__"))
         return success();
+
+      // Record the delayed-update target returned by `q.next(n)`.
+      if (callee.contains("::next") && op->getNumOperands() == 3 &&
+          callee.contains("::SIMD")) {
+        auto field = fieldPtrs.find(op->getOperand(0));
+        if (field == fieldPtrs.end())
+          return op->emitError()
+                 << "HDL lowering: delayed next on a non-field value";
+        auto delay = getConstantInt(op->getOperand(1).getDefiningOp(),
+                                    &bindings);
+        if (!delay)
+          return op->emitError()
+                 << "HDL lowering: delayed next requires a constant delay";
+        delayedTargets[op->getOperand(2)] = {
+            field->second, static_cast<unsigned>(delay->getZExtValue())};
+        return success();
+      }
+
+      // `q.past(n)`: a read-only delay chain fed by the field's current value.
+      if (callee.contains("::past") && op->getNumOperands() == 3) {
+        auto field = fieldPtrs.find(op->getOperand(0));
+        if (field == fieldPtrs.end())
+          return op->emitError()
+                 << "HDL lowering: past() on a non-field value";
+        if (fieldIsLogic[field->second])
+          return op->emitError()
+                 << "HDL lowering: past() on Logic state is not supported yet";
+        auto delay = getConstantInt(op->getOperand(1).getDefiningOp(),
+                                    &bindings);
+        if (!delay)
+          return op->emitError()
+                 << "HDL lowering: past() requires a constant delay";
+        Value result = pastValue(
+            field->second, static_cast<unsigned>(delay->getZExtValue()));
+        if (!result)
+          return op->emitError()
+                 << "HDL lowering: unsupported past() state";
+        Value dest = op->getOperand(2);
+        values[dest] = result;
+        if (dest == resultPtr)
+          returnValue = result;
+        return success();
+      }
 
       auto storeLogicResult = [&](Value dest,
                                   LogicValue value) -> LogicalResult {

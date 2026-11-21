@@ -17,7 +17,7 @@ from .hdl_type import HdlType
 from .reg import Reg
 
 
-struct Mem[T: HdlType & Deinitable, N: Int = 4](
+struct Mem[T: HdlType & Deinitable & Defaultable, N: Int = 4](
     Copyable, Defaultable, Movable
 ):
     """A synchronous-write, combinational-read memory over `Array[Reg[T], N]`."""
