@@ -731,6 +731,9 @@ private:
   SmallVector<unsigned> fieldMemDepths;
   SmallVector<int> fieldResetStyle;
   DenseMap<unsigned, SmallVector<Value>> memoryRegs;
+  DenseMap<unsigned, SmallVector<Value>> memoryNext;
+  DenseMap<unsigned, SmallVector<Value>> memoryEnable;
+  DenseMap<unsigned, SmallVector<bool>> memoryWritten;
   DenseMap<unsigned, SmallVector<llvm::APInt>> memoryResetSequences;
   int resetStyle = 0;
   std::optional<llvm::APInt> powerOnValue;
@@ -1188,6 +1191,9 @@ CirctModuleEmitter::getOrCreateMemory(unsigned fieldIndex) {
           builder, loc, zero, clk, ceZero, reset, resetValue, name, initial));
     }
   }
+  memoryNext[fieldIndex] = regs;
+  memoryEnable[fieldIndex] = SmallVector<Value>(depth, ceZero);
+  memoryWritten[fieldIndex] = SmallVector<bool>(depth, false);
   return regs;
 }
 
@@ -1549,6 +1555,9 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             return op->emitError()
                    << "HDL lowering: memory write enable was not lowered";
         }
+        auto &nexts = memoryNext[field];
+        auto &enables = memoryEnable[field];
+        auto &written = memoryWritten[field];
         for (unsigned k = 0; k < regs.size(); ++k) {
           Value eq = comb::ICmpOp::create(
               builder, loc, comb::ICmpPredicate::eq, index,
@@ -1557,12 +1566,30 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           Value ce = enable
                          ? comb::AndOp::create(builder, loc, enable, eq)
                          : eq;
+          bool clockEnabled =
+              regs[k].getDefiningOp<seq::CompRegClockEnabledOp>() != nullptr;
+          Value next = data;
+          Value combinedEnable = ce;
+          if (!written[k] && clockEnabled) {
+            // The first write to a clock-enabled entry needs no input mux.
+          } else {
+            // A later write call has priority over earlier ones on a
+            // conflicting address. Firreg entries always need the mux
+            // because they have no clock enable.
+            next = comb::MuxOp::create(builder, loc, ce, data, nexts[k]);
+            if (written[k])
+              combinedEnable =
+                  comb::OrOp::create(builder, loc, enables[k], ce);
+          }
+          written[k] = true;
+          nexts[k] = next;
+          enables[k] = combinedEnable;
+
           if (auto ceOp =
                   regs[k].getDefiningOp<seq::CompRegClockEnabledOp>()) {
-            ceOp->setOperand(0, data);
-            ceOp->setOperand(2, ce);
+            ceOp->setOperand(0, next);
+            ceOp->setOperand(2, combinedEnable);
           } else if (auto fir = regs[k].getDefiningOp<seq::FirRegOp>()) {
-            Value next = comb::MuxOp::create(builder, loc, ce, data, regs[k]);
             fir->setOperand(0, next);
           } else {
             return op->emitError()
