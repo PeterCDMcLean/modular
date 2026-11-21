@@ -29,7 +29,7 @@ comptime RawBits[W: Int] = BitInteger[W, WordFor[W]]
 """The bitlib leaf with a fixed word policy (default `Typical`)."""
 
 
-struct Bits[W: Int = 1](Copyable, Movable, HdlType):
+struct Bits[W: Int = 1](Copyable, Defaultable, Movable, HdlType):
     """A two-state, any-width bit vector.
 
     The value is bitlib's `BitInteger[W]`; arithmetic wraps at `W` bits. The

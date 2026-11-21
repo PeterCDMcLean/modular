@@ -25,7 +25,7 @@ comptime logic[W: Int = 1] = Logic[W]
 
 
 struct Logic[W: Int = 1, xmode: XMode = XMode.taint](
-    Copyable, Movable, HdlType
+    Copyable, Defaultable, Movable, HdlType
 ):
     """A 4-state bit vector: value plus an X/Z mask."""
 

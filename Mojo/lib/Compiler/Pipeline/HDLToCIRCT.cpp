@@ -542,6 +542,16 @@ static unsigned getHdlWidth(Type type,
         if (auto width = getTypedAttrInt(params.front(), bindings))
           return static_cast<unsigned>(width->getZExtValue());
     }
+    if (ref && name.contains("Packed")) {
+      auto params = ref.getParamValues();
+      if (params.size() >= 2) {
+        auto elemRef = KGEN::getTypeRefForTypeValueIfResolved(params[0]);
+        Type elem = elemRef ? KGEN::TypeValueType::get(elemRef) : Type();
+        auto depth = getTypedAttrInt(params[1], bindings);
+        if (elem && depth)
+          return getHdlWidth(elem, bindings) * depth->getZExtValue();
+      }
+    }
     return 0;
   }
   return getBitWidth(type);
@@ -620,6 +630,29 @@ static Type getCallTypeParam(Operation *op, unsigned index) {
     return {};
   auto resolved = KGEN::getTypeRefForTypeValueIfResolved(params[index]);
   return resolved ? KGEN::TypeValueType::get(resolved) : Type();
+}
+
+/// Return the integer bound to the method symbol's parameter `index`.
+static std::optional<llvm::APInt>
+getCallIntParam(Operation *op, unsigned index,
+                const ParamBindings *bindings = nullptr) {
+  auto symbol = KGEN::FuncSymbolGenerator::dynCast(op->getAttr("callee"));
+  if (!symbol)
+    return std::nullopt;
+  auto params = symbol.getParamValues();
+  if (index >= params.size())
+    return std::nullopt;
+  return getTypedAttrInt(params[index], bindings);
+}
+
+/// Return the total width of a `Packed[T, N]` method binding.
+static unsigned getCallPackedWidth(Operation *op,
+                                   const ParamBindings *bindings = nullptr) {
+  Type elem = getCallTypeParam(op, 0);
+  auto depth = getCallIntParam(op, 1, bindings);
+  if (!elem || !depth)
+    return 0;
+  return getHdlWidth(elem, bindings) * depth->getZExtValue();
 }
 
 /// Return the generator type carrier of a `kgen.func` / `kgen.generator`.
@@ -2013,6 +2046,44 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       }
 
       return op->emitError() << "HDL lowering: unsupported Logic call '"
+                             << callee << "'";
+    }
+
+    // `Packed[T, N]` is a single flattened payload value. Copies and moves
+    // are identities at the CIRCT boundary; an integer constructor becomes a
+    // packed constant.
+    if (callee.contains("Packed::")) {
+      if (callee.contains("::__deinit__") || callee.contains("::__del__"))
+        return success();
+      if (callee.contains("__init__") && callee.contains("::SIMD") &&
+          !callee.contains("__init__(move:")) {
+        unsigned width = getCallPackedWidth(op, &bindings);
+        Operation *valueOp = op->getOperand(0).getDefiningOp();
+        auto value =
+            valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
+        if (!width || !value)
+          return op->emitError()
+                 << "HDL lowering: unsupported Packed constructor";
+        Value constant = hw::ConstantOp::create(
+            builder, loc, value->zextOrTrunc(width));
+        Value dest = op->getOperand(1);
+        values[dest] = constant;
+        if (dest == resultPtr)
+          returnValue = constant;
+        return success();
+      }
+      if (op->getNumOperands() == 2) {
+        Value source = getValue(op->getOperand(0));
+        if (!source)
+          return op->emitError()
+                 << "HDL lowering: Packed operand was not lowered";
+        Value dest = op->getOperand(1);
+        values[dest] = source;
+        if (dest == resultPtr)
+          returnValue = source;
+        return success();
+      }
+      return op->emitError() << "HDL lowering: unsupported Packed call '"
                              << callee << "'";
     }
 
