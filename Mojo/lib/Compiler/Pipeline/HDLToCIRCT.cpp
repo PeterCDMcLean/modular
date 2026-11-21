@@ -983,9 +983,6 @@ CirctModuleEmitter::getOrCreateMemory(unsigned fieldIndex) {
   if (found != memoryRegs.end())
     return found->second;
   auto &regs = memoryRegs[fieldIndex];
-  // Async-style memories would need firreg plus an input mux.
-  if (resetStyle >= 2)
-    return regs;
   unsigned width = fieldMemWidths[fieldIndex];
   unsigned depth = fieldMemDepths[fieldIndex];
   auto type = IntegerType::get(builder.getContext(), width);
@@ -1000,14 +997,24 @@ CirctModuleEmitter::getOrCreateMemory(unsigned fieldIndex) {
   auto ceZero =
       hw::ConstantOp::create(builder, loc, builder.getIntegerType(1), 0);
   Value reset = (resetStyle & 1) ? bitNot(resetSignal) : resetSignal;
-  auto initial = seq::createConstantInitialValue(
-      builder, loc, IntegerAttr::get(type, initialBits));
+  bool async = resetStyle >= 2;
+  Value initial;
+  if (!async)
+    initial = seq::createConstantInitialValue(
+        builder, loc, IntegerAttr::get(type, initialBits));
   for (unsigned k = 0; k < depth; ++k) {
     auto name = StringAttr::get(
         builder.getContext(),
         "mem_" + std::to_string(fieldIndex) + "_" + std::to_string(k));
-    regs.push_back(seq::CompRegClockEnabledOp::create(
-        builder, loc, zero, clk, ceZero, reset, resetValue, name, initial));
+    if (async) {
+      regs.push_back(seq::FirRegOp::create(
+          builder, loc, zero, clk, name, reset, resetValue,
+          hw::InnerSymAttr(), /*isAsync=*/true,
+          /*preset=*/IntegerAttr::get(type, initialBits)));
+    } else {
+      regs.push_back(seq::CompRegClockEnabledOp::create(
+          builder, loc, zero, clk, ceZero, reset, resetValue, name, initial));
+    }
   }
   return regs;
 }
@@ -1354,8 +1361,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         return op->emitError() << "HDL lowering: memory index was not lowered";
       auto &regs = getOrCreateMemory(field);
       if (regs.empty())
-        return op->emitError()
-               << "HDL lowering: async-style memories are not supported yet";
+        return op->emitError() << "HDL lowering: empty memory";
 
       if (callee.contains("Mem::write")) {
         if (op->getNumOperands() < 3)
@@ -1379,12 +1385,17 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           Value ce = enable
                          ? comb::AndOp::create(builder, loc, enable, eq)
                          : eq;
-          auto ceOp = regs[k].getDefiningOp<seq::CompRegClockEnabledOp>();
-          if (!ceOp)
+          if (auto ceOp =
+                  regs[k].getDefiningOp<seq::CompRegClockEnabledOp>()) {
+            ceOp->setOperand(0, data);
+            ceOp->setOperand(2, ce);
+          } else if (auto fir = regs[k].getDefiningOp<seq::FirRegOp>()) {
+            Value next = comb::MuxOp::create(builder, loc, ce, data, regs[k]);
+            fir->setOperand(0, next);
+          } else {
             return op->emitError()
                    << "HDL lowering: unsupported memory register form";
-          ceOp->setOperand(0, data);
-          ceOp->setOperand(2, ce);
+          }
         }
         return success();
       }
