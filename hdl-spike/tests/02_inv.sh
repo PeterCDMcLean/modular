@@ -12,18 +12,19 @@ MOJO="${MOJO:-$root/bazel-bin/Mojo/tools/mojo/mojo}"
 KGEN="${KGEN:-$root/bazel-bin/Mojo/tools/kgen/kgen}"
 CIRCT_OPT="${CIRCT_OPT:-$HOME/circt/build/bin/circt-opt}"
 out="$root/hdl-spike/build"
-path="$root/bazel-bin/Mojo/stdlib/std,$root/hdl-spike"
 
 mkdir -p "$out"
 
 # 1. The CIRCT module.
 "$MOJO" build --emit=circt -o "$out/01_inv.mlir" \
-    -mojo-search-paths "$path" "$root/hdl-spike/designs/01_inv.mojo"
+    -I "$root/bazel-bin/Mojo/stdlib/std" -I "$root/hdl-spike" \
+    "$root/hdl-spike/designs/01_inv.mojo"
 diff -u "$root/hdl-spike/expected/01_inv.mlir" "$out/01_inv.mlir"
 
 # 2. SystemVerilog, exported in-process by CIRCT's ExportVerilog.
 "$MOJO" build --emit=sv -o "$out/01_inv.raw.sv" \
-    -mojo-search-paths "$path" "$root/hdl-spike/designs/01_inv.mojo"
+    -I "$root/bazel-bin/Mojo/stdlib/std" -I "$root/hdl-spike" \
+    "$root/hdl-spike/designs/01_inv.mojo"
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' "$out/01_inv.raw.sv" \
     | grep -v '^$' > "$out/01_inv.sv"
 diff -u "$root/hdl-spike/expected/01_inv.sv" "$out/01_inv.sv"

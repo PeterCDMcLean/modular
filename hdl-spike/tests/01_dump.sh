@@ -8,13 +8,12 @@ MOJO="${MOJO:-$root/bazel-bin/Mojo/tools/mojo/mojo}"
 KGEN="${KGEN:-$root/bazel-bin/Mojo/tools/kgen/kgen}"
 out="$root/hdl-spike/build"
 # The source build has no installed Mojo config: point at the freshly built
-# stdlib and at the hdl-spike DSL package explicitly.
-path="$root/bazel-bin/Mojo/stdlib/std,$root/hdl-spike"
+# stdlib package and at the hdl-spike DSL package explicitly.
 
 mkdir -p "$out"
 
 MOJO_HDL_DUMP_IR=1 "$MOJO" build --emit=circt -o "$out/01_inv.dump.mlir" \
-    -mojo-search-paths "$path" \
+    -I "$root/bazel-bin/Mojo/stdlib/std" -I "$root/hdl-spike" \
     "$root/hdl-spike/designs/01_inv.mojo"
 
 # The dump is KGEN IR: method symbol present, no lowered hw.module yet.

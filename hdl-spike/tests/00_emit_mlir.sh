@@ -6,14 +6,13 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MOJO="${MOJO:-$root/bazel-bin/Mojo/tools/mojo/mojo}"
 out="$root/hdl-spike/build"
 # The source build has no installed Mojo config: point at the freshly built
-# stdlib explicitly.
-path="$root/bazel-bin/Mojo/stdlib/std,$root/hdl-spike"
+# stdlib package and at the hdl-spike DSL package explicitly.
 
 mkdir -p "$out"
 
 # A trivial Mojo program: the printed module must be the compiler's own KGEN IR.
 "$MOJO" build --emit=mlir -o "$out/00_hello.mlir" \
-    -mojo-search-paths "$path" \
+    -I "$root/bazel-bin/Mojo/stdlib/std" -I "$root/hdl-spike" \
     "$root/hdl-spike/designs/00_hello.mojo"
 
 grep -q 'kgen.func' "$out/00_hello.mlir"

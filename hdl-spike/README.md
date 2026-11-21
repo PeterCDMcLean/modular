@@ -43,10 +43,10 @@ stdlib and DSL package on the import path:
 ```bash
 MOJO=bazel-bin/Mojo/tools/mojo/mojo
 KGEN=bazel-bin/Mojo/tools/kgen/kgen
-PATHSPEC=bazel-bin/Mojo/stdlib/std,hdl-spike
 
 # Stage 0: the compiler's own MLIR.
-$MOJO build --emit=mlir -o - -mojo-search-paths $PATHSPEC \
+$MOJO build --emit=mlir -o - \
+    -I bazel-bin/Mojo/stdlib/std -I hdl-spike \
     hdl-spike/designs/00_hello.mojo
 
 # Stage 1: the KGEN IR the HDL pass consumes.
@@ -55,14 +55,17 @@ $KGEN --emit=circt --hdl-dump-ir \
     hdl-spike/designs/01_inv.mojo
 
 # or, through `mojo build`:
-MOJO_HDL_DUMP_IR=1 $MOJO build --emit=circt -o - -mojo-search-paths $PATHSPEC \
+MOJO_HDL_DUMP_IR=1 $MOJO build --emit=circt -o - \
+    -I bazel-bin/Mojo/stdlib/std -I hdl-spike \
     hdl-spike/designs/01_inv.mojo
 
 # Stage 2: lower Inv and export SystemVerilog, entirely in-process.
 $MOJO build --emit=circt -o hdl-spike/build/01_inv.mlir \
-    -mojo-search-paths $PATHSPEC hdl-spike/designs/01_inv.mojo
+    -I bazel-bin/Mojo/stdlib/std -I hdl-spike \
+    hdl-spike/designs/01_inv.mojo
 $MOJO build --emit=sv -o hdl-spike/build/01_inv.sv \
-    -mojo-search-paths $PATHSPEC hdl-spike/designs/01_inv.mojo
+    -I bazel-bin/Mojo/stdlib/std -I hdl-spike \
+    hdl-spike/designs/01_inv.mojo
 ```
 
 `mojo build` writes to a file by default (`<input>.mlir`); `-o -` writes the

@@ -1,6 +1,28 @@
 # Spike status
 
-Last updated: 2026-11-03 (first run: Stages 0–2).
+Last updated: 2026-11-21 (rebase onto current Mojo/CIRCT/LLVM pins).
+
+## 2026-11-21 rebase (current)
+
+| Component | Pin |
+| --- | --- |
+| Mojo | `4224c14a82` (`origin/main`, 2026-11-21) |
+| LLVM | `eaabd239f5` (2026-11-13) |
+| CIRCT upstream | `d6143d5f3` (2026-11-20) |
+| CIRCT overlay | `8aa3e1913` (`bazel-overlay`, rebased onto `d6143d5f3`) |
+| Mojo submodule | `third_party/circt` at `8aa3e1913` |
+
+Build and test record:
+
+* CIRCT subset (`HW`, `Comb`, `Seq`, `SV`, `ExportVerilog`, `SeqToSV`):
+  **green**, 354.7 s, 2,026 actions, against LLVM `eaabd239f5`.
+* Mojo (`//Mojo/tools/kgen:kgen`, `//Mojo/tools/mojo:mojo`, `-c dbg`,
+  `--jobs=3`): **green**, 1,179.2 s, 8,590 actions.
+* `hdl-spike/tests/run_all.sh`: **green** (00, 00b, 01, 02).
+  `--emit=circt` and `--emit=sv` run in-process.
+* Verilator lint: skipped (not installed).
+* CLI adaptation: the current compiler uses `-I <dir>`; the tests were updated
+  from `-mojo-search-paths`.
 
 ## Stage table
 

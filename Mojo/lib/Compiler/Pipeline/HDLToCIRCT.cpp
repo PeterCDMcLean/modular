@@ -344,7 +344,6 @@ LogicalResult CirctModuleEmitter::collectPorts() {
     if (!funcType)
       continue;
     auto body = funcType.getBody();
-    auto argNames = body.getArgListAttrs();
 
     ArrayAttr returnNames;
     if (auto dict = source->getAttrOfType<DictionaryAttr>(kHdlReturnNamesAttr)) {
