@@ -244,6 +244,21 @@ public:
 
   std::string emissionOptions;
 
+  // --- Prototype fork: HDL/CIRCT lowering -------------------------------
+  /// When true, the KGEN pipeline stops after generator elaboration and runs
+  /// the HDL-to-CIRCT pass instead of the normal post-elaboration optimization
+  /// pipeline. Set only by `--emit=circt`.
+  bool hdlEmit = false;
+  /// When true (with `--emit=sv`), the HDL pass exports SystemVerilog directly
+  /// through CIRCT's ExportVerilog instead of printing MLIR.
+  bool hdlEmitSV = false;
+  /// Where the HDL-to-CIRCT pass writes its textual CIRCT module. When null,
+  /// the pass writes to stdout.
+  llvm::raw_ostream *hdlOutput = nullptr;
+  /// Debug aid: print the post-elaboration KGEN IR the HDL pass consumed,
+  /// instead of lowering it (`--hdl-dump-ir`, only valid with `--emit=circt`).
+  bool hdlDumpSourceIR = false;
+
   /// Extra options forwarded from `kgen.compile_offload`'s
   /// `emission_link_option` attribute.
   /// A string directly passed to linker if compile offload

@@ -15,6 +15,7 @@
 #include "../Common/Compilation.h"
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "AsyncRT/CompilerSupport/Context.h"
 #include "Cache/CachedTransform.h"
@@ -217,6 +218,30 @@ static std::optional<int> compileModuleToArchive(
     effectiveOptions.offloadOutputKind = emitAs;
   }
 
+  // Prototype fork: `--emit=mlir` / `--emit=circt` are compiler-internal
+  // products; open the destination before the compiler is created so the HDL
+  // pass can write into it. `-o -` writes to stdout, matching the other
+  // textual IR products.
+  std::unique_ptr<llvm::ToolOutputFile> irOutFile;
+  const bool irToStdout = args.getLastArgValue(options::OPT_o) == "-";
+  if (emitAs == EmitAs::MLIR || emitAs == EmitAs::CIRCT ||
+      emitAs == EmitAs::SV) {
+    if (!irToStdout) {
+      irOutFile = createOutputFile(state, args, /*hasBinaryOutput=*/false,
+                                   emitAs == EmitAs::SV ? ".sv" : ".mlir");
+      if (!irOutFile)
+        return EXIT_FAILURE;
+    }
+    if (emitAs == EmitAs::CIRCT || emitAs == EmitAs::SV) {
+      effectiveOptions.hdlEmit = true;
+      effectiveOptions.hdlEmitSV = emitAs == EmitAs::SV;
+      effectiveOptions.hdlOutput =
+          irToStdout ? &llvm::outs() : &irOutFile->os();
+      effectiveOptions.hdlDumpSourceIR =
+          ::getenv("MOJO_HDL_DUMP_IR") != nullptr;
+    }
+  }
+
   KGENCompiler compiler(context, effectiveOptions, pmOptions);
 
   // Compile the moduleOp down to the post-elaboration phase, because before
@@ -230,6 +255,23 @@ static std::optional<int> compileModuleToArchive(
 
   if (ErrorOrSuccess err = compiler.runKGENPipeline(*module, target))
     return state.reportError(err.getError());
+
+  // Prototype fork: textual IR products stop here; the module is already in
+  // its final form (MLIR: the compiler's own post-elaboration module; CIRCT:
+  // the HDL pass wrote it to `irOutFile`).
+  if (emitAs == EmitAs::MLIR) {
+    llvm::raw_ostream &os = irToStdout ? llvm::outs() : irOutFile->os();
+    module->print(os);
+    os << "\n";
+    if (irOutFile)
+      irOutFile->keep();
+    return EXIT_SUCCESS;
+  }
+  if (emitAs == EmitAs::CIRCT || emitAs == EmitAs::SV) {
+    if (irOutFile)
+      irOutFile->keep();
+    return EXIT_SUCCESS;
+  }
 
   std::unique_ptr<ObjectCompiler> objectCompiler = objectCompilerOr.takeValue();
 

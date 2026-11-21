@@ -33,6 +33,7 @@
 #include "Mojo/TransformUtils/SlicingUtils.h"
 #include "ObjectCompiler/KGENToLLVMPipeline.h"
 #include "Pipeline/Pipeline.h"
+#include "Pipeline/HDLToCIRCT.h"
 #include "Support/ADT/DenseStringMap.h"
 #include "Support/Compiler/BytecodeReaderWriter.h"
 #include "Support/Compiler/TimeProfilerTimingManager.h"
@@ -441,6 +442,12 @@ static ErrorOr<StringAttr> compileStandaloneKernel(
     if (ErrorOrSuccess err = compiler->emitSharedObject(std::move(module), os))
       return err.takeError();
     break;
+
+  case EmitAs::MLIR:
+  case EmitAs::CIRCT:
+  case EmitAs::SV:
+    // Prototype fork: host-module products, not valid for offload kernels.
+    return Error("emission kind is not supported for offload kernels");
   }
 
   return StringAttr::get(buf, StringType::get(func.getContext()));
@@ -1022,6 +1029,33 @@ void KGEN::populateElaborateModulePasses(mlir::PassManager &pm,
 }
 
 //===----------------------------------------------------------------------===//
+// populateHDLEmitPasses (prototype fork)
+//===----------------------------------------------------------------------===//
+
+void KGEN::populateHDLEmitPasses(
+    mlir::PassManager &pm, TargetInfoAttr target,
+    const CompilationOptions &options,
+    mlir::OwningOpRef<mlir::ModuleOp> &builtModule) {
+  // Snapshot source names before LowerLIT erases them.
+  pm.addPass(createHDLCaptureNamesPass());
+  // Lower LIT without DCE/inlining: the design has no entry point, and the
+  // module structure is exactly what the HDL pass consumes. Elaboration is
+  // skipped too: it elaborates every generator in the imported stdlib (which
+  // fails on unrelated GPU plugin code), and the DSL's module generators carry
+  // all the information the pass needs. Parameters stay symbolic, which is the
+  // form Stage 8 wants anyway.
+  buildHDLLowerLITPipeline(pm, options);
+  // Stop here: the normal post-elaboration optimization pipeline would remove
+  // the struct/method structure and forwards the names the HDL pass needs.
+  HDLEmitOptions hdlOptions;
+  hdlOptions.output = options.hdlOutput;
+  hdlOptions.dumpSourceIR = options.hdlDumpSourceIR;
+  hdlOptions.emitSV = options.hdlEmitSV;
+  hdlOptions.builtModule = options.hdlEmitSV ? &builtModule : nullptr;
+  pm.addPass(createHDLToCIRCTPass(hdlOptions));
+}
+
+//===----------------------------------------------------------------------===//
 // Default JIT Configuration
 //===----------------------------------------------------------------------===//
 
@@ -1110,8 +1144,38 @@ KGENCompiler::runKGENPipeline(ModuleOp theModule, TargetInfoAttr target,
     return configPM.takeError();
 
   // Populate the passes.
-  buildGenerateLibraryPipeline(pm, options);
-  populateElaborateModulePasses(pm, target, options);
+  mlir::OwningOpRef<mlir::ModuleOp> hdlBuiltModule;
+  if (options.hdlEmit) {
+    // Prototype fork: stop after elaboration and run the HDL-to-CIRCT pass.
+    populateHDLEmitPasses(pm, target, options, hdlBuiltModule);
+  } else {
+    buildGenerateLibraryPipeline(pm, options);
+    populateElaborateModulePasses(pm, target, options);
+  }
+
+  // Prototype fork: the HDL pass prints as a side effect, so it cannot run
+  // through the transform cache (a cache hit would skip the pass and produce no
+  // output). Run the pass manager directly.
+  if (options.hdlEmit) {
+    if (failed(pm.run(theModule)))
+      return Error("HDL emission pipeline failed");
+    // The HDL pass leaves the built module in `hdlBuiltModule` for SV. Run
+    // CIRCT's seq-to-sv and exporter here: after `pm.run`, so there is no
+    // pass-manager execution context and no nested PassManager assertion.
+    if (options.hdlEmitSV) {
+      if (!hdlBuiltModule)
+        return Error("HDL lowering produced no module");
+      mlir::PassManager circtPM(&context);
+      circtPM.addPass(createHDLSeqToSVPass());
+      if (failed(circtPM.run(*hdlBuiltModule)))
+        return Error("HDL seq-to-sv lowering failed");
+      llvm::raw_ostream &os =
+          options.hdlOutput ? *options.hdlOutput : llvm::outs();
+      if (failed(exportHDLSystemVerilog(*hdlBuiltModule, os)))
+        return Error("HDL SystemVerilog export failed");
+    }
+    return success();
+  }
 
   // Run the passes as a cached transform.
   AsyncRT::AnyAsyncValueRef ready = Cache::cachedTransform(

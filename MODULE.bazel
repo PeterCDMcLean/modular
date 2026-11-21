@@ -23,6 +23,14 @@ crate.from_cargo(
 )
 use_repo(crate, "crates")
 
+local_repository = use_repo_rule("@bazel_tools//tools/build_defs/repo:local.bzl", "local_repository")
+
+# Prototype fork: CIRCT's Bazel overlay (git submodule). Declaring it as a
+# repository makes CIRCT's own repository-relative labels (//include, //lib,
+# //bazel) resolve inside @circt while @llvm-project still resolves through this
+# module's mapping.
+local_repository(name = "circt", path = "third_party/circt")
+
 mojo_aliases = use_repo_rule("//bazel:mojo_aliases.bzl", "mojo_aliases")
 
 mojo_aliases(name = "mojo")

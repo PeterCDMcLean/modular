@@ -325,6 +325,12 @@ def EmitAs : I32EnumAttr<"EmitAs", "compile_assembly emission kind", [
   I32EnumAttrCase<"OBJECT", 3, "object">,
   I32EnumAttrCase<"LLVM_BITCODE", 4, "llvm-bitcode">,
   I32EnumAttrCase<"LLVM_OPT_BITCODE", 5, "llvm-opt-bitcode">,
+  // Prototype fork: print the compiler's own (post-elaboration) MLIR module.
+  I32EnumAttrCase<"MLIR", 6, "mlir">,
+  // Prototype fork: lower the HDL DSL (`@module` structs) to CIRCT hw/comb/seq.
+  I32EnumAttrCase<"CIRCT", 7, "circt">,
+  // Prototype fork: export SystemVerilog in-process from the CIRCT module.
+  I32EnumAttrCase<"SV", 8, "sv">,
 ]> {
   let cppNamespace = "M::KGEN";
   let genSpecializedAttr = 0;

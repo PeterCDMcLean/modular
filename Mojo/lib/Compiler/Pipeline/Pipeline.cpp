@@ -50,6 +50,11 @@ static void buildLowerLITPipeline(mlir::PassManager &pm,
     pm.addPass(createVerifyParameters());
 }
 
+void KGEN::buildHDLLowerLITPipeline(mlir::PassManager &pm,
+                                    const CompilationOptions &options) {
+  buildLowerLITPipeline(pm, options);
+}
+
 void KGEN::buildGenerateLibraryPipeline(mlir::PassManager &pm,
                                         const CompilationOptions &options) {
   // If the compilation options aren't for full debug, strip the extra info

@@ -3609,6 +3609,13 @@ static LogicalResult processStructSignatureDecorator(ExprNode *decorator,
                        "@align requires exactly one argument");
       return success();
     }
+    // Prototype fork: `@module` marks a struct as a hardware module for the
+    // HDL-to-CIRCT lowering. It is a marker only; the marker is stamped on the
+    // struct declaration so the HDL name-capture pass can record it.
+    if (declRef->spelling == "module") {
+      structOp->setAttr("hdl_module", UnitAttr::get(structOp.getContext()));
+      return success();
+    }
     // We don't process @explicit_destroy here, we do it in resolveSignature.
   }
 

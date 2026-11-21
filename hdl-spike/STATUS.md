@@ -1,0 +1,289 @@
+# Spike status
+
+Last updated: 2026-11-03 (first run: Stages 0–2).
+
+## Stage table
+
+| Stage | Status | Designs | Notes |
+| --- | --- | --- | --- |
+| 0. Build + `--emit=mlir` | **green** | `designs/00_hello.mojo` | `mojo build --emit=mlir` prints the compiler's own KGEN module. Hand-written CIRCT (a custom-syntax `hw.module` and a generic-syntax constant/xor fixture) parses through the compiler's own printer and re-parses with `circt-opt`. |
+| 1. LIT/early-KGEN hook | **green** | `designs/01_inv.mojo`, `designs/02_stateful_dump.mojo` | Hook is after `LowerLIT`, **before** `ElaborateGenerators` (see "Insertion point"); `--emit=circt --hdl-dump-ir` prints the IR the pass consumes. |
+| 2. Lower `Inv` → `hw`/`comb` | **green** | `designs/01_inv.mojo` | Emitted MLIR is byte-identical to `expected/01_inv.mlir`; the operations are real CIRCT `hw`/`comb` ops built in-process. `--emit=sv` exports SystemVerilog **in-process** through CIRCT's ExportVerilog (no `circt-opt` subprocess), matching `expected/01_inv.sv` after comment/blank-line normalization. |
+| 3. Widths and arithmetic | not started | — | — |
+| 4. Registers/reset | not started | — | — |
+| 5–10 | not started | — | — |
+
+`tests/run_all.sh` runs the whole flow: 00, 00b, 01 and 02 all pass.
+
+**Second phase (combined CIRCT/LLVM lowering).** The compiler now builds *real*
+CIRCT ops. CIRCT is a **git submodule** at `third_party/circt` pointing at the
+local fork `~/circt-fork.git`, branch `bazel-overlay`, commit `506341bcb`
+(upstream `76eec00fe` + the standalone Bazel overlay + the `MapVector` fix,
+with its `llvm` gitlink set to `6941494e`). The overlay is a normal Bazel repo
+with per-package BUILD files (`Support`, `Emit`, `HW`, `Comb`, `Seq`, `SV`,
+`LTL`, `Debug`, `OM`, `Verif`, `ExportVerilog`, `SeqToSV`), not a copied tree.
+It is declared in `MODULE.bazel` as
+
+```python
+local_repository(name = "circt", path = "third_party/circt")
+```
+
+so CIRCT's own repository-relative labels (`//include/...`, `//lib/...`,
+`//bazel/...`) resolve inside `@circt`, while `@llvm-project` resolves through
+Mojo's mapping. `Mojo/BUILD.bazel` depends on
+`@circt//lib/Dialect/{Comb,HW}:circt_{comb,hw}`. The integration build took
+**739 s** (338 actions, 10,249 cache hits) and all four spike tests pass.
+`@circt//lib/Conversion/ExportVerilog:circt_export_verilog` and
+`@circt//lib/Conversion/SeqToSV:circt_seq_to_sv` are linked, and `--emit=sv`
+runs CIRCT's `LowerSeqToSV` and `ExportVerilog` in-process. The nested-pass
+problem is fixed structurally: the HDL pass builds into a scratch module and
+leaves it in `HDLEmitOptions::builtModule`; after the KGEN pass manager returns,
+`runKGENPipeline` runs `LowerSeqToSV` in a fresh pass manager and then calls
+`exportVerilog`. That is outside any pass-manager execution context, so the
+`appendDialectRegistry` assertion cannot fire, and it will work unchanged when
+Stage 4 introduces `seq.compreg`. `--emit=circt` keeps printing the scratch
+module with CIRCT's custom assembly (printing an op attached to the KGEN module
+falls back to generic form). The HDL pass
+creates `hw::HWModuleOp`, `hw::ConstantOp`, `hw::OutputOp` and `comb::XorOp`;
+CIRCT's own assembly printers produce the output. The expected MLIR was updated
+to CIRCT's canonical spacing (`in %a : i1`). Dependencies added:
+`//third_party/circt:circt_comb` to `//Mojo:Pipeline` and
+`//Mojo:ToolCommon`, and `circt::hw::HWDialect` / `circt::comb::CombDialect` to
+`registerAllKGENDialects`/`preloadAllKGENDialects`.
+
+The pin fix (`using mlir::MapVector;` in `include/circt/Support/LLVM.h`) is
+committed in the fork. To populate the submodule after a fresh checkout:
+
+```bash
+git submodule update --init third_party/circt
+```
+
+To repoint at a GitHub fork later, change the `url` in `.gitmodules` (currently
+the local path `/home/pmclean/circt-fork.git`, chosen to avoid a public fork)
+and run `git submodule sync`. The overlay's own docs are in
+`third_party/circt/docs/bazel.md`, with status in
+`third_party/circt/OVERLAY-STATUS.md`.
+
+## Build record
+
+* Compiler targets: `//Mojo/tools/kgen:kgen` and `//Mojo/tools/mojo:mojo`.
+* Stdlib target needed at run time: `//Mojo/stdlib/std` (41 s, produces
+  `bazel-bin/Mojo/stdlib/std/std.mojoc`).
+* Command:
+  `./bazelw build -c dbg //Mojo/tools/kgen:kgen //Mojo/tools/mojo:mojo --jobs=3`
+* Wall time to the first working binaries:
+  * cold build: **7,237 s** (failed at 10,288/10,398 on a stale `hdrs` glob —
+    `HDLToCIRCT.h` was created after analysis had run);
+  * incremental recovery: 333 s + 12 s + 188 s + 192 s;
+  * **total ≈ 7,962 s (2 h 13 min)** on 4 cores / 7 GB with `--jobs=3`.
+* Subsequent edit/rebuild cycles: 20–35 s each (one 190 s relink). The
+  pipeline iteration after the first link is cheap.
+* Third phase (in-process SV): the `EmitAs::SV` change rebuilt the KGEN
+  pipeline and the CIRCT ExportVerilog library; a full `kgen`/`mojo` rebuild
+  took ~13 min, and the stdlib `.mojoc` must be rebuilt whenever the compiler
+  binary changes.
+* Second phase (vendored CIRCT + combined lowering):
+  * first `//third_party/circt:circt_comb` build: 880 s (includes TableGen and
+    the CIRCT `Support`/`HW`/`Comb` libraries), then a 94 s relink of `kgen`
+    and ~60 s to relink `mojo`;
+  * disk after the combined lowering: 72 GB free.
+* Disk before build (`/`): 107,575,136,256 bytes free.
+* Disk after Stages 0–2 green: 79,316,934,656 bytes free.
+  **≈ 28.3 GB consumed** (Bazel output base + external LLVM + sysroot).
+* RAM peak stayed under ~5 GB; no OOM.
+
+### Tool versions
+
+| Tool | Version / location |
+| --- | --- |
+| CIRCT | `~/circt` at `76eec00fe23f39e66a41894e266d0acfb886d925` (2026-11-02) |
+| `circt-opt` | `~/circt/build/bin/circt-opt`, reports `CIRCT 9d329a394`, `LLVM 22.0.0git` (optimized with assertions) |
+| `circt-translate` | present, but **has no `--export-verilog`** in this build |
+| `firtool` | present (comparison only) |
+| Mojo | built from this checkout at `cb987e0e4f` |
+| Mojo LLVM pin | `6941494e2ae550d753728ba13454311b344d82cf` |
+| Verilator | **not installed** (`command -v verilator` is empty); SV verification is `circt-opt` + textual diff |
+
+### CIRCT binary date vs source
+
+The prompt warns that the binary may predate the loop-generate commit
+`d568cd165`. The binary reports `CIRCT 9d329a394`, while the checkout is at
+`76eec00fe` (2026-11-02), so the binary is older than the source. This does not
+affect Stages 0–2 (`hw.module`, `comb.xor`, `hw.output`, `hw.constant` parse
+and export fine). Stage 8 (`sv.generate.for`) must rebuild CIRCT first.
+
+Concretely, in `~/circt`:
+
+| Object | Value / date |
+| --- | --- |
+| Source checkout `HEAD` | `76eec00fe` (2026-11-02) |
+| `HEAD`'s `llvm` gitlink | `a17069fe` (2026-10-08) |
+| `circt-opt` binary version | `9d329a394` (2025-11-19) |
+| LLVM the binary was built with | `c2ddaaa4` (2025-11-17), the commit checked out in `~/circt/llvm` |
+| `sv.generate.for` commit | `d568cd165` (2026-05-07), absent from the binary |
+| Mojo LLVM pin | `6941494e` (2026-10-15) |
+
+**Is there a CIRCT sha pinning Mojo's exact LLVM revision?** No. All 295 commits
+that touch the `llvm` gitlink (across every ref in `~/circt`, merges included)
+were searched. They introduce 265 distinct LLVM pins; none equals `6941494e`,
+and none is a descendant of it (so no CIRCT ref pins an LLVM at or after
+Mojo's). The newest pin is `a17069fe` (2026-10-08), introduced 2026-10-11.
+Mojo's `6941494e` is 7 days newer, and `a17069fe` is an ancestor of
+`6941494e`, so CIRCT HEAD is only one week of LLVM changes behind the Mojo
+pin. When linking is attempted, the two viable alignments are:
+
+1. bump CIRCT's `llvm` submodule to `6941494e` and build CIRCT HEAD against
+   Mojo's LLVM (7-day delta, may need minor CIRCT fixes), or
+2. downgrade Mojo's LLVM pin to `a17069fe` (Mojo's public patches may need
+   adjusting).
+
+A third option is to wait for CIRCT's next monthly `llvm` bump and take the
+sha that pins an LLVM at or after `6941494e`.
+
+Either way the local `circt-opt` binary must be rebuilt: it is 9d329a394
+(2025-11-19), over a year behind the source checkout.
+
+## Insertion point (Stage 1)
+
+The hook is **after `LowerLIT`, before `ElaborateGenerators`**, not after
+elaboration. This is a deliberate deviation forced by the compiler's structure;
+see "Ambiguities" item 3 for why. The source structure and names are what the
+pass needs, and elaboration for a design with no entry point is not available
+without also elaborating the whole imported stdlib.
+
+* Pass classes, in `Mojo/lib/Compiler/Pipeline/HDLToCIRCT.cpp`:
+  * `M::KGEN::HDLCaptureNamesPass` (`hdl-capture-names`) — runs first, on LIT
+    IR, before `LowerLIT`. Snapshots `@module` struct names, method argument
+    names (`hdl_arg_names`), and returned-local names (`hdl_return_names`) into
+    module attributes. Argument and local names exist only at LIT level.
+  * `M::KGEN::HDLToCIRCTPass` (`hdl-to-circt`) — runs last, after `LowerLIT`,
+    and emits the textual CIRCT module.
+* Pipeline wiring: `M::KGEN::populateHDLEmitPasses` in
+  `Mojo/lib/Compiler/KGENCompiler.cpp`, called from
+  `KGENCompiler::runKGENPipeline` when `CompilationOptions::hdlEmit` is set.
+  The pipeline is `capture → buildHDLLowerLITPipeline → HDLToCIRCT`, and is run
+  directly (`pm.run`) rather than through the transform cache because the pass
+  prints as a side effect.
+* Driver wiring:
+  * `Mojo/tools/mojo/Build/mojo-build.cpp`: `--emit=mlir`, `--emit=circt`
+    (`-o -` writes to stdout).
+  * `Mojo/tools/kgen/kgen.cpp`: same kinds; `--hdl-dump-ir` prints the
+    pre-lowering KGEN IR.
+  * `MOJO_HDL_DUMP_IR=1` is the equivalent switch for `mojo build`.
+* Struct marker: `@module` is accepted by the fork and stamps `hdl_module` on
+  the `lit.struct.decl`; `HDLCaptureNamesPass` reads it.
+
+### Files touched
+
+```text
+Mojo/include/Mojo/KGENDialect/KGENEnums.td          EmitAs::MLIR, EmitAs::CIRCT
+Mojo/include/Mojo/ToolCommon/CompilationOptions.h   hdlEmit/hdlOutput/hdlDumpSourceIR
+Mojo/lib/Target/TargetTraits.cpp                    mlir/circt emission kinds + ext
+Mojo/lib/Compiler/KGENCompiler.cpp                  populateHDLEmitPasses, branch, offload cases
+Mojo/lib/Compiler/Pipeline/Pipeline.{h,cpp}         buildHDLLowerLITPipeline
+Mojo/lib/Compiler/Pipeline/HDLToCIRCT.{h,cpp}       new: capture + lowering passes
+Mojo/lib/MojoParser/DeclResolution.cpp              accept @module (marker only)
+Mojo/BUILD.bazel                                    Pipeline deps
+Mojo/tools/mojo/Build/mojo-build.cpp                emit plumbing
+Mojo/tools/kgen/kgen.cpp                            emit plumbing + --hdl-dump-ir
+```
+
+## Combined CIRCT/LLVM build (in progress)
+
+`~/circt/llvm` was checked out at `6941494e` and a fresh `RelWithDebInfo`
+LLVM+MLIR build is running in `~/circt/llvm/build`; when it finishes,
+`circt-opt`/`firtool` are rebuilt in `~/circt/build` against the same LLVM.
+Until then the end-to-end SV checks use the old `circt-opt.9d329a` binary, which
+parses the new canonical IR unchanged.
+
+## Results
+
+```bash
+MOJO=bazel-bin/Mojo/tools/mojo/mojo
+PATHSPEC=bazel-bin/Mojo/stdlib/std,hdl-spike
+
+$MOJO build --emit=circt -o hdl-spike/build/01_inv.mlir \
+    -mojo-search-paths $PATHSPEC hdl-spike/designs/01_inv.mojo
+```
+
+`hdl-spike/build/01_inv.mlir`:
+
+```mlir
+hw.module @Inv(in %a: i1, out y: i1) {
+  %true = hw.constant true
+  %0 = comb.xor %a, %true : i1
+  hw.output %0 : i1
+}
+```
+
+After `circt-opt --lower-seq-to-sv` and `--export-verilog` (comments and blank
+lines normalized by the test):
+
+```systemverilog
+module Inv(
+  input  a,
+  output y
+);
+  assign y = ~a;
+endmodule
+```
+
+The pass lowers `not a` from its post-`LowerLIT` form
+`Bool::__invert__(Bool::__bool__(a))` (`kgen.call` × 2) directly to
+`hw.constant true` + `comb.xor`, without inlining the stdlib.
+
+## Ambiguities / findings in the reference docs
+
+These were found while implementing Stages 0–2. The docs were **not** edited.
+Each has a documented workaround so the stages could proceed.
+
+1. **`let` and `fn` are not in this compiler's syntax.** `TokenKinds.def` has
+   `kw_var` but no `kw_let`, `fn` reports "'fn' has been removed; use 'def'
+   instead", and parametric aliases are `comptime Sig[T: AnyType] = T` (plain
+   `alias` with parameters is rejected). The stage snippets use `let`/`fn`, so
+   the designs use `var`/`def` and the DSL stub uses `comptime`. This also
+   matters for naming: `var` produces `lit.var.decl "<name>"`, so a returned
+   local's name is capturable; a `let` would be an unnamed SSA value.
+2. **Custom decorators do not exist** ("Mojo doesn't support custom
+   decorators"), so `@module` cannot come from a library. The fork accepts it on
+   struct declarations and stamps a marker attribute (`hdl_module`). This is the
+   only parser change and it does not alter existing programs.
+3. **The requested "after elaboration" hook is not usable as stated.** In this
+   compiler `LowerLIT` runs before `ElaborateGenerators`, so `lit.var.decl` is
+   already gone at the post-elaboration point. Worse, with symbol DCE skipped
+   (necessary because the design has no entry point), `ElaborateGenerators`
+   elaborates the entire imported stdlib and fails in unrelated GPU plugin code
+   (`hip/hip_hostcall.mojo`). The fork therefore hooks after `LowerLIT` and
+   before elaboration, and captures names in a pre-`LowerLIT` pass. Parameters
+   stay symbolic, which is also the form Stage 8 needs. Stage 4+ will need a
+   scoped elaboration strategy (elaborate only the design's generators or give
+   the design an exported entry point).
+4. **Symbols are qualified by the imported file module**: `@Inv` becomes
+   `01_inv::Inv`, and methods become `01_inv::Inv::run(01_inv::Inv,::Bool)`.
+   Names captured at LIT level are stored keyed by the *qualified* source
+   prefix (`01_inv::Inv::run`), and the emitted `hw.module` name drops the
+   qualifier (`Inv`).
+5. **Argument names are only in LIT IR.** The KGEN `sourceParamList` is empty
+   for these methods (`#kgen.pog_list<[]>`), and `sourceFuncTypeGenerator` also
+   has an empty argument POG list. The capture pass reads the `lit.fn` POG list
+   instead and stores `hdl_arg_names`.
+6. **`self` is a memory pointer, not a struct value.**
+   `run`'s elaborated signature is
+   `(!kgen.pointer<struct<() memoryOnly>> imm_mem, !kgen.scalar<bool>) -> !kgen.scalar<bool>`.
+   The pass skips argument 0 for every method and maps `!kgen.scalar<bool>` to
+   `i1`.
+7. **`--emit=mlir` on a design with no entry point prints an empty module.**
+   The normal pipeline DCEs an unexported `@module` struct. `--emit=mlir` on
+   `00_hello.mojo` is the Stage 0 check; the `@module` IR is inspected with
+   `--emit=circt --hdl-dump-ir`, which runs the non-DCE HDL pipeline.
+8. **`circt-opt --export-verilog` ignores `-o` in this build.** The pass emits
+   Verilog to stdout while `-o` receives the pass-manager module; the test
+   redirects stdout. `circt-opt` also attaches `file:line:col` locations to
+   every parsed op and `ExportVerilog` prints them as trailing `//` comments;
+   the test strips comments/blank lines before diffing. `circt-translate` in
+   this build has no `--export-verilog` option.
+9. **A source build needs explicit import paths.** There is no installed Mojo
+   config, so every invocation passes
+   `-mojo-search-paths bazel-bin/Mojo/stdlib/std,hdl-spike`. `mojo run` also
+   needs a compiler-rt path that this environment does not provide; the normal
+   pipeline was verified with `--emit=llvm` instead.

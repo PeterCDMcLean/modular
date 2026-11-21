@@ -17,6 +17,7 @@
 #include "Mojo/Compiler/Pipeline.h"
 #include "Mojo/ToolCommon/KGENPasses.h"
 #include "Support/LLVMForwardDecls.h"
+#include "mlir/IR/OwningOpRef.h"
 
 namespace M {
 namespace KGEN {
@@ -41,6 +42,17 @@ void buildGenerateLibraryPipeline(mlir::PassManager &pm,
                                   const CompilationOptions &options);
 
 //===----------------------------------------------------------------------===//
+// HDLLowerLITPipeline
+//===----------------------------------------------------------------------===//
+
+/// Prototype fork: the minimal pre-elaboration pipeline. Unlike
+/// `buildGenerateLibraryPipeline` it does not run symbol DCE, inlining, or the
+/// optimization passes, so a design that has no entry point keeps its module
+/// structs and method generators until the HDL pass sees them.
+void buildHDLLowerLITPipeline(mlir::PassManager &pm,
+                              const CompilationOptions &options);
+
+//===----------------------------------------------------------------------===//
 // ElaborateModulePipeline
 //===----------------------------------------------------------------------===//
 
@@ -61,6 +73,19 @@ void buildElaborateModulePipeline(mlir::PassManager &pm, TargetInfoAttr target,
 void populateElaborateModulePasses(mlir::PassManager &pm, TargetInfoAttr target,
                                    const CompilationOptions &options);
 
+//===----------------------------------------------------------------------===//
+// HDLEmitPipeline
+//===----------------------------------------------------------------------===//
+
+/// Prototype fork: populate the pipeline used by `--emit=circt`. It lowers LIT,
+/// elaborates generators (making parameters concrete), and then runs the
+/// HDL-to-CIRCT pass. Unlike the normal path it stops after elaboration, so the
+/// struct/method/field structure and the source names captured by the HDL name
+/// pass are still available.
+void populateHDLEmitPasses(
+    mlir::PassManager &pm, TargetInfoAttr target,
+    const CompilationOptions &options,
+    mlir::OwningOpRef<mlir::ModuleOp> &builtModule);
 } // namespace KGEN
 } // namespace M
 

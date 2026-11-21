@@ -144,6 +144,9 @@ bool EmitAsAttr::classof(Attribute attr) {
                  EmitAs::OBJECT,
                  EmitAs::LLVM_BITCODE,
                  EmitAs::LLVM_OPT_BITCODE,
+                 EmitAs::MLIR,
+                 EmitAs::CIRCT,
+                 EmitAs::SV,
              },
              [&](EmitAs kind) { return (int)kind == intAttr.getInt(); });
 #else
@@ -156,6 +159,9 @@ bool EmitAsAttr::classof(Attribute attr) {
                  EmitAs::OBJECT,
                  EmitAs::LLVM_BITCODE,
                  EmitAs::LLVM_OPT_BITCODE,
+                 EmitAs::MLIR,
+                 EmitAs::CIRCT,
+                 EmitAs::SV,
              },
              [&](EmitAs kind) { return (int)kind == intAttr.getInt(); });
 #endif

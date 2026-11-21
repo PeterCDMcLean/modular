@@ -108,6 +108,12 @@ def save_temps : Flag<["--", "-"], "save-temps">,
            "`--temps-dir`, which defaults to the output directory.">,
   MarshallingInfoFlag<KGENOpts<"saveTemps">>;
 
+def hdl_dump_ir : Flag<["--", "-"], "hdl-dump-ir">,
+  Group<OutputOptionGroup>,
+  HelpText<"With --emit=circt, prints the pre-lowering KGEN IR instead of "
+           "lowering it.">,
+  MarshallingInfoFlag<KGENOpts<"hdlDumpIR">>;
+
 defm temps_dir : CommandOption<["--", "-"], "temps-dir", OutputOptionGroup,
   MetaVarName<"PATH">,
   HelpText<"Sets the directory for the intermediate files that `--save-temps` "

@@ -59,6 +59,12 @@ llvm::ArrayRef<TargetTraits::EmissionKind> TargetTraits::commonEmissionKinds() {
       {"asm", EmitAs::ASM,
        "target assembly; GPU targets also emit one sidecar file per "
        "kernel"},
+      {"mlir", EmitAs::MLIR,
+       "the compiler's own post-elaboration MLIR module (prototype fork)"},
+      {"circt", EmitAs::CIRCT,
+       "CIRCT hw/comb/seq IR lowered from the HDL DSL (prototype fork)"},
+      {"sv", EmitAs::SV,
+       "SystemVerilog exported in-process from the HDL lowering (prototype fork)"},
   };
   return kinds;
 }
@@ -121,6 +127,11 @@ llvm::StringRef TargetTraits::extensionFor(EmitAs kind) const {
     return getBitcodeExtension();
   case EmitAs::OBJECT:
     return getObjectExtension();
+  case EmitAs::MLIR:
+  case EmitAs::CIRCT:
+    return ".mlir";
+  case EmitAs::SV:
+    return ".sv";
   }
   llvm_unreachable("unhandled EmitAs");
 }

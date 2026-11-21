@@ -93,7 +93,8 @@ private:
 /// and target-declared kinds canonicalize onto them.
 static constexpr EmitAs kEmitAsKinds[] = {
     EmitAs::OBJECT, EmitAs::LLVM,     EmitAs::LLVM_BITCODE,
-    EmitAs::ASM,    EmitAs::LLVM_OPT, EmitAs::LLVM_OPT_BITCODE};
+    EmitAs::ASM,    EmitAs::LLVM_OPT, EmitAs::LLVM_OPT_BITCODE,
+    EmitAs::MLIR,   EmitAs::CIRCT,  EmitAs::SV};
 
 /// kgen products with no EmitAs identity, named only here.
 static constexpr llvm::StringRef kAsmVerboseKind = "asm-verbose";
@@ -125,6 +126,9 @@ struct CLOptions : public CommonOptions {
   DriverOptions driverOptions;
   std::string dependencyFilename;
   bool emitTextualAsm = false;
+  /// Prototype fork: with `--emit=circt`, print the post-elaboration KGEN IR
+  /// the HDL pass consumed instead of lowering it.
+  bool hdlDumpIR = false;
   bool ignoreFailures = false;
   /// The `--namespace` that `--precompile` builds the package under, outermost
   /// component first.
@@ -334,6 +338,12 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
   registerAllKGENDialects(registry);
   registerKGENToLLVMTranslation(registry);
 
+  // Prototype fork: `--emit=circt` on a hand-written `.mlir` file round-trips
+  // the input (used to prove that CIRCT ops survive the compiler's own
+  // parser/printer before the lowering exists).
+  if (isEmitCmd(clOptions.cmd, EmitAs::CIRCT))
+    ctx->allowUnregisteredDialects();
+
   // Create our context, with a cpuDevice; this should not fail.
   if (isMLIRThreadingDisabled())
     clOptions.cpuDeviceOptions.withSingleThreaded();
@@ -351,6 +361,12 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
   if (clOptions.saveTemps)
     options.saveTempsPrefix = clOptions.tempsDir;
   options.verboseOutput = isEmitCmd(clOptions.cmd, kAsmVerboseKind);
+  // Prototype fork: `--emit=circt` stops after elaboration and runs the HDL
+  // pass; `--hdl-dump-ir` is its Stage-1 no-op mode.
+  options.hdlEmit = isEmitCmd(clOptions.cmd, EmitAs::CIRCT) ||
+                    isEmitCmd(clOptions.cmd, EmitAs::SV);
+  options.hdlEmitSV = isEmitCmd(clOptions.cmd, EmitAs::SV);
+  options.hdlDumpSourceIR = clOptions.hdlDumpIR;
   options.cacheBaseExtra = "kgen";
 
   OwningOpRef<ModuleOp> theModule;
@@ -468,6 +484,16 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
   if (!theModule)
     return failure(clOptions.reportError("could not parse the module"));
 
+  // Prototype fork: round-trip a hand-written CIRCT module unchanged. This is
+  // the Stage 0 proof that CIRCT ops survive the compiler's printer; the
+  // `.mojo` path uses the HDL-to-CIRCT pass instead.
+  if (!inputFileName.ends_with(".mojo") &&
+      isEmitCmd(clOptions.cmd, EmitAs::CIRCT)) {
+    theModule->print(llvm::outs());
+    llvm::outs() << "\n";
+    return mlir::success();
+  }
+
   // Tag the module with the environment parsed from the defines.
   ctx->loadDialect<KGENDialect>();
 
@@ -524,6 +550,13 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
       clOptions.cmd == "elaborate=use-parametric-interpreter" ||
       clOptions.cmd == "elaborate=no-use-parametric-interpreter")
     return emitModuleIR(*theModule, clOptions);
+
+  // Prototype fork: print the compiler's own module / the CIRCT lowering.
+  if (isEmitCmd(clOptions.cmd, EmitAs::MLIR))
+    return emitModuleIR(*theModule, clOptions);
+  if (isEmitCmd(clOptions.cmd, EmitAs::CIRCT) ||
+      isEmitCmd(clOptions.cmd, EmitAs::SV))
+    return mlir::success(); // The HDL pass already wrote to stdout.
 
   // Construct the symbol table and the export map.
   SymbolTable symtab(*theModule);
