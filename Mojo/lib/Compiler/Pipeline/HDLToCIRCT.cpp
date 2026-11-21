@@ -727,6 +727,7 @@ private:
   SmallVector<bool> fieldIsLogic;
   SmallVector<bool> fieldIsConfig;
   SmallVector<bool> fieldIsMemory;
+  SmallVector<bool> fieldIsWire;
   SmallVector<unsigned> fieldMemWidths;
   SmallVector<unsigned> fieldMemDepths;
   SmallVector<int> fieldResetStyle;
@@ -734,6 +735,7 @@ private:
   DenseMap<unsigned, SmallVector<Value>> memoryNext;
   DenseMap<unsigned, SmallVector<Value>> memoryEnable;
   DenseMap<unsigned, SmallVector<bool>> memoryWritten;
+  DenseMap<unsigned, Value> wireValues;
   DenseMap<unsigned, SmallVector<llvm::APInt>> memoryResetSequences;
   int resetStyle = 0;
   int clockDivisor = 1;
@@ -893,6 +895,8 @@ LogicalResult CirctModuleEmitter::collectMethodDomains() {
       if (field >= fieldIsInstance.size())
         return;
       if (field < fieldIsConfig.size() && fieldIsConfig[field])
+        return;
+      if (field < fieldIsWire.size() && fieldIsWire[field])
         return;
       if (!fieldIsInstance[field]) {
         stateful = true;
@@ -1103,8 +1107,11 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     bool isConfig = StringRef(typeName).contains("ResetStyle") ||
                     isPowerOn || isClockDivider;
     bool isMemory = !isConfig && StringRef(typeName).ends_with("Mem");
+    bool isWire = !isConfig && !isMemory &&
+                  StringRef(typeName).ends_with("Wire");
     fieldIsConfig.push_back(isConfig);
     fieldIsMemory.push_back(isMemory);
+    fieldIsWire.push_back(isWire);
     fieldMemWidths.push_back(0);
     fieldMemDepths.push_back(0);
     fieldResetStyle.push_back(resetStyle);
@@ -1118,6 +1125,15 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
           resetStyle = static_cast<int>(value->getZExtValue());
       }
       fieldWidths.push_back(0);
+      fieldIsInstance.push_back(false);
+      fieldIsLogic.push_back(false);
+      fieldModuleNames.push_back({});
+      continue;
+    }
+
+    if (isWire) {
+      auto params = getDslTypeBindings(fieldType, &bindings);
+      fieldWidths.push_back(params.empty() ? 0 : params[0].getZExtValue());
       fieldIsInstance.push_back(false);
       fieldIsLogic.push_back(false);
       fieldModuleNames.push_back({});
@@ -1292,6 +1308,8 @@ Value CirctModuleEmitter::getValue(Value value) {
       return {};
     if (index < fieldIsMemory.size() && fieldIsMemory[index])
       return {};
+    if (index < fieldIsWire.size() && fieldIsWire[index])
+      return wireValues.lookup(index);
     fieldReaders[index].insert(currentMethod);
     auto type = IntegerType::get(value.getContext(), fieldWidths[index]);
     return getOrCreateReg(index, type);
@@ -1978,6 +1996,54 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         }
       }
       return op->emitError() << "HDL lowering: unsupported Resettable call '"
+                             << callee << "'";
+    }
+
+    // A `Wire[W]` field is a combinational SSA net: assignments update the
+    // field's current definition and reads copy it out.
+    if (callee.contains("Wire::")) {
+      if (callee.contains("::__deinit__") || callee.contains("::__del__"))
+        return success();
+      if (callee.contains("__init__") && callee.contains("::SIMD")) {
+        unsigned width = getCallParamWidth(op, &bindings);
+        Operation *valueOp = op->getOperand(0).getDefiningOp();
+        auto value =
+            valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
+        if (!width || !value)
+          return op->emitError()
+                 << "HDL lowering: unsupported Wire constructor";
+        Value constant = hw::ConstantOp::create(
+            builder, loc, value->zextOrTrunc(width));
+        Value dest = op->getOperand(1);
+        if (auto field = fieldPtrs.find(dest);
+            field != fieldPtrs.end() &&
+            field->second < fieldIsWire.size() &&
+            fieldIsWire[field->second])
+          wireValues[field->second] = constant;
+        else
+          values[dest] = constant;
+        if (dest == resultPtr)
+          returnValue = constant;
+        return success();
+      }
+      if (op->getNumOperands() == 2) {
+        Value source = getValue(op->getOperand(0));
+        if (!source)
+          return op->emitError()
+                 << "HDL lowering: Wire operand was not lowered";
+        Value dest = op->getOperand(1);
+        if (auto field = fieldPtrs.find(dest);
+            field != fieldPtrs.end() &&
+            field->second < fieldIsWire.size() &&
+            fieldIsWire[field->second])
+          wireValues[field->second] = source;
+        else
+          values[dest] = source;
+        if (dest == resultPtr)
+          returnValue = source;
+        return success();
+      }
+      return op->emitError() << "HDL lowering: unsupported Wire call '"
                              << callee << "'";
     }
 
