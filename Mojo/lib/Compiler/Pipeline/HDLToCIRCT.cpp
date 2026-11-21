@@ -543,6 +543,7 @@ private:
   Value bitNot(Value value);
   Value getConstant(bool value);
   Value getOrCreateReg(unsigned fieldIndex, Type type);
+  SmallVector<Value> &getOrCreateMemory(unsigned fieldIndex);
   Value createRegister(unsigned id, Type type, llvm::APInt resetValue,
                         llvm::APInt initialValue);
 
@@ -582,6 +583,10 @@ private:
   SmallVector<bool> fieldIsInstance;
   SmallVector<bool> fieldIsLogic;
   SmallVector<bool> fieldIsConfig;
+  SmallVector<bool> fieldIsMemory;
+  SmallVector<unsigned> fieldMemWidths;
+  SmallVector<unsigned> fieldMemDepths;
+  DenseMap<unsigned, SmallVector<Value>> memoryRegs;
   int resetStyle = 0;
   std::optional<llvm::APInt> powerOnValue;
   Value selfPtr;
@@ -877,13 +882,30 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     bool isPowerOn = StringRef(typeName).contains("PowerOn");
     bool isConfig =
         StringRef(typeName).contains("ResetStyle") || isPowerOn;
+    bool isMemory = !isConfig && StringRef(typeName).ends_with("Mem");
     fieldIsConfig.push_back(isConfig);
+    fieldIsMemory.push_back(isMemory);
+    fieldMemWidths.push_back(0);
+    fieldMemDepths.push_back(0);
     if (isConfig) {
       if (auto value = getDslTypeBinding(fieldType, &bindings)) {
         if (isPowerOn)
           powerOnValue = *value;
         else
           resetStyle = static_cast<int>(value->getZExtValue());
+      }
+      fieldWidths.push_back(0);
+      fieldIsInstance.push_back(false);
+      fieldIsLogic.push_back(false);
+      fieldModuleNames.push_back({});
+      continue;
+    }
+
+    if (isMemory) {
+      auto params = getDslTypeBindings(fieldType, &bindings);
+      if (params.size() >= 2) {
+        fieldMemWidths.back() = params[0].getZExtValue();
+        fieldMemDepths.back() = params[1].getZExtValue();
       }
       fieldWidths.push_back(0);
       fieldIsInstance.push_back(false);
@@ -937,6 +959,35 @@ LogicalResult CirctModuleEmitter::findMethods() {
   return success();
 }
 
+SmallVector<Value> &
+CirctModuleEmitter::getOrCreateMemory(unsigned fieldIndex) {
+  auto found = memoryRegs.find(fieldIndex);
+  if (found != memoryRegs.end())
+    return found->second;
+  auto &regs = memoryRegs[fieldIndex];
+  // Async-style memories would need firreg plus an input mux.
+  if (resetStyle >= 2)
+    return regs;
+  unsigned width = fieldMemWidths[fieldIndex];
+  unsigned depth = fieldMemDepths[fieldIndex];
+  auto type = IntegerType::get(builder.getContext(), width);
+  auto zero = hw::ConstantOp::create(builder, loc, type, 0);
+  auto resetValue = hw::ConstantOp::create(builder, loc, type, 0);
+  auto ceZero =
+      hw::ConstantOp::create(builder, loc, builder.getIntegerType(1), 0);
+  Value reset = (resetStyle & 1) ? bitNot(resetSignal) : resetSignal;
+  auto initial = seq::createConstantInitialValue(
+      builder, loc, IntegerAttr::get(type, llvm::APInt(width, 0)));
+  for (unsigned k = 0; k < depth; ++k) {
+    auto name = StringAttr::get(
+        builder.getContext(),
+        "mem_" + std::to_string(fieldIndex) + "_" + std::to_string(k));
+    regs.push_back(seq::CompRegClockEnabledOp::create(
+        builder, loc, zero, clk, ceZero, reset, resetValue, name, initial));
+  }
+  return regs;
+}
+
 Operation *CirctModuleEmitter::findBuiltModule(StringRef name) {
   StringRef displayName = name.contains("::") ? name.rsplit("::").second : name;
   for (Operation &op : scratch.getBody()->getOperations())
@@ -967,6 +1018,8 @@ Value CirctModuleEmitter::getValue(Value value) {
     if (index >= fieldWidths.size() || !fieldWidths[index])
       return {};
     if (index < fieldIsLogic.size() && fieldIsLogic[index])
+      return {};
+    if (index < fieldIsMemory.size() && fieldIsMemory[index])
       return {};
     fieldReaders[index].insert(currentMethod);
     auto type = IntegerType::get(value.getContext(), fieldWidths[index]);
@@ -1253,6 +1306,71 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
 
   if (name == "kgen.call") {
     StringRef callee = callCalleeName(op);
+
+    // A `Mem[W, N]` field becomes N clock-enabled registers plus a read mux.
+    if (callee.contains("Mem::write") || callee.contains("Mem::read")) {
+      if (op->getNumOperands() < 3)
+        return op->emitError() << "HDL lowering: malformed memory access";
+      auto mem = fieldPtrs.find(op->getOperand(0));
+      if (mem == fieldPtrs.end() || mem->second >= fieldIsMemory.size() ||
+          !fieldIsMemory[mem->second])
+        return op->emitError()
+               << "HDL lowering: memory access on a non-memory field";
+      unsigned field = mem->second;
+      Value index = getValue(op->getOperand(1));
+      if (!index)
+        return op->emitError() << "HDL lowering: memory index was not lowered";
+      auto &regs = getOrCreateMemory(field);
+      if (regs.empty())
+        return op->emitError()
+               << "HDL lowering: async-style memories are not supported yet";
+
+      if (callee.contains("Mem::write")) {
+        if (op->getNumOperands() < 3)
+          return op->emitError() << "HDL lowering: malformed memory write";
+        Value data = getValue(op->getOperand(2));
+        if (!data)
+          return op->emitError()
+                 << "HDL lowering: memory write data was not lowered";
+        Value enable;
+        if (op->getNumOperands() > 3) {
+          enable = getValue(op->getOperand(3));
+          if (!enable)
+            return op->emitError()
+                   << "HDL lowering: memory write enable was not lowered";
+        }
+        for (unsigned k = 0; k < regs.size(); ++k) {
+          Value eq = comb::ICmpOp::create(
+              builder, loc, comb::ICmpPredicate::eq, index,
+              hw::ConstantOp::create(builder, loc, index.getType(),
+                                     static_cast<int64_t>(k)));
+          Value ce = enable
+                         ? comb::AndOp::create(builder, loc, enable, eq)
+                         : eq;
+          auto ceOp = regs[k].getDefiningOp<seq::CompRegClockEnabledOp>();
+          if (!ceOp)
+            return op->emitError()
+                   << "HDL lowering: unsupported memory register form";
+          ceOp->setOperand(0, data);
+          ceOp->setOperand(2, ce);
+        }
+        return success();
+      }
+
+      Value result = regs[0];
+      for (unsigned k = 1; k < regs.size(); ++k) {
+        Value eq = comb::ICmpOp::create(
+            builder, loc, comb::ICmpPredicate::eq, index,
+            hw::ConstantOp::create(builder, loc, index.getType(),
+                                   static_cast<int64_t>(k)));
+        result = comb::MuxOp::create(builder, loc, eq, regs[k], result);
+      }
+      Value dest = op->getOperand(2);
+      values[dest] = result;
+      if (dest == resultPtr)
+        returnValue = result;
+      return success();
+    }
 
     // A call through a field of another `@module` struct becomes an
     // `hw.instance`: the callee's user inputs are wired from the call
