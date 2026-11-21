@@ -63,7 +63,9 @@
 #include "mlir/Pass/PassManager.h"
 
 #include <functional>
+#include <map>
 #include <memory>
+#include <set>
 #include <optional>
 #include <string>
 
@@ -77,6 +79,8 @@ constexpr llvm::StringLiteral kHdlModulesAttr = "hdl_modules";
 constexpr llvm::StringLiteral kHdlReturnNamesAttr = "hdl_return_names";
 constexpr llvm::StringLiteral kHdlArgNamesAttr = "hdl_arg_names";
 constexpr llvm::StringLiteral kHdlModuleMarker = "hdl_module";
+
+using ParamBindings = llvm::StringMap<llvm::APInt>;
 
 //===----------------------------------------------------------------------===//
 // HDLCaptureNames
@@ -274,13 +278,32 @@ static Type getHwType(Type type) {
   return IntegerType::get(type.getContext(), width);
 }
 
-/// Decode an integer from a typed parameter attribute.
-static std::optional<llvm::APInt> getTypedAttrInt(TypedAttr attr) {
+/// Decode an integer from a typed parameter attribute, resolving parameter
+/// declarations through `bindings` when this is a specialization.
+static std::optional<llvm::APInt>
+getTypedAttrInt(TypedAttr attr, const ParamBindings *bindings = nullptr) {
+  if (!attr)
+    return std::nullopt;
   if (auto intAttr = dyn_cast<IntegerAttr>(attr))
     return intAttr.getValue();
   if (auto simd = dyn_cast<KGEN::SIMDAttr>(attr)) {
     if (simd.getValues().size() == 1)
       return simd.getValues()[0].getIntVal();
+  }
+  if (auto declRef = dyn_cast<KGEN::ParamDeclRefAttr>(attr)) {
+    if (bindings) {
+      auto found = bindings->find(declRef.getName().getValue());
+      if (found != bindings->end())
+        return found->second;
+    }
+  }
+  if (auto indexRef = dyn_cast<KGEN::ParamIndexRefAttr>(attr)) {
+    if (bindings && indexRef.getDepth() == 0) {
+      auto found =
+          bindings->find("#" + std::to_string(indexRef.getIndex()));
+      if (found != bindings->end())
+        return found->second;
+    }
   }
   return std::nullopt;
 }
@@ -312,14 +335,15 @@ static Type getTypeFromAttr(TypedAttr attr) {
 
 /// Return the first callee type parameter as a bit width, if present. Filled
 /// by a `Bits[W]` method, this is `W`.
-static unsigned getCallParamWidth(Operation *op) {
+static unsigned getCallParamWidth(Operation *op,
+                                  const ParamBindings *bindings = nullptr) {
   auto symbol = KGEN::FuncSymbolGenerator::dynCast(op->getAttr("callee"));
   if (!symbol)
     return 0;
   auto params = symbol.getParamValues();
   if (params.empty())
     return 0;
-  if (auto width = getTypedAttrInt(params.front()))
+  if (auto width = getTypedAttrInt(params.front(), bindings))
     return static_cast<unsigned>(width->getZExtValue());
   return 0;
 }
@@ -345,7 +369,8 @@ static bool isLogicType(Type type) {
 /// Return the HDL bit width of a DSL port type. `Bits[W]`/`Logic[W]` source
 /// types carry `W` as a type parameter; anything else is resolved from its
 /// lowered representation.
-static unsigned getHdlWidth(Type type) {
+static unsigned getHdlWidth(Type type,
+                            const ParamBindings *bindings = nullptr) {
   if (auto ptr = dyn_cast<KGEN::PointerType>(type))
     type = ptr.getElementType();
   if (auto typeValue = dyn_cast<KGEN::TypeValueType>(type)) {
@@ -354,12 +379,27 @@ static unsigned getHdlWidth(Type type) {
     if (ref && (name.contains("Bits") || name.contains("Logic"))) {
       auto params = ref.getParamValues();
       if (!params.empty())
-        if (auto width = getTypedAttrInt(params.front()))
+        if (auto width = getTypedAttrInt(params.front(), bindings))
           return static_cast<unsigned>(width->getZExtValue());
     }
     return 0;
   }
   return getBitWidth(type);
+}
+
+/// Return the first type parameter of a DSL reference (for example the `W` of
+/// `Bits[W]` or `Counter[W]`), resolving declarations through `bindings`.
+static std::optional<llvm::APInt>
+getDslTypeBinding(Type type, const ParamBindings *bindings = nullptr) {
+  if (auto ptr = dyn_cast<KGEN::PointerType>(type))
+    type = ptr.getElementType();
+  auto typeValue = dyn_cast<KGEN::TypeValueType>(type);
+  if (!typeValue)
+    return std::nullopt;
+  auto ref = dyn_cast<KGEN::TypeGeneratorRefAttr>(typeValue.getTypeValue());
+  if (!ref || ref.getParamValues().empty())
+    return std::nullopt;
+  return getTypedAttrInt(ref.getParamValues().front(), bindings);
 }
 
 /// Return the generator type carrier of a `kgen.func` / `kgen.generator`.
@@ -420,11 +460,12 @@ static std::optional<bool> getConstantBool(Operation *op) {
 /// Emits one `hw.module` per `@module` struct by building real CIRCT ops.
 class CirctModuleEmitter {
 public:
-  CirctModuleEmitter(ModuleOp source, StringRef structName, ModuleOp scratch,
+  CirctModuleEmitter(ModuleOp source, StringRef structName, StringRef moduleName,
+                     const ParamBindings &bindings, ModuleOp scratch,
                      ArrayAttr hdlModules)
-      : source(source), structName(structName), scratch(scratch),
-        hdlModules(hdlModules), builder(scratch.getContext()),
-        loc(scratch.getLoc()) {}
+      : source(source), structName(structName), moduleName(moduleName),
+        bindings(bindings), scratch(scratch), hdlModules(hdlModules),
+        builder(scratch.getContext()), loc(scratch.getLoc()) {}
 
   LogicalResult build();
   hw::HWModuleOp getModule() const { return builtModule; }
@@ -461,6 +502,8 @@ private:
 
   ModuleOp source;
   StringRef structName;
+  std::string moduleName;
+  ParamBindings bindings;
   ModuleOp scratch;
   ArrayAttr hdlModules;
   OpBuilder builder;
@@ -482,6 +525,7 @@ private:
   SmallVector<std::string> methodNames;
   SmallVector<std::string> fieldNames;
   SmallVector<std::string> fieldStructNames;
+  SmallVector<std::string> fieldModuleNames;
   SmallVector<bool> fieldIsInstance;
   Value selfPtr;
   Value resultPtr;
@@ -531,9 +575,9 @@ LogicalResult CirctModuleEmitter::collectPorts() {
                       sourceFunc.getArgConvention(index) ==
                           ArgConvention::ByRefResult;
       Type sourceType = sourceFunc ? sourceFunc.getArgument(index) : argType;
-      unsigned width = getHdlWidth(sourceType);
+      unsigned width = getHdlWidth(sourceType, &bindings);
       if (!width)
-        width = getHdlWidth(argType);
+        width = getHdlWidth(argType, &bindings);
       if (!width) {
         fn->emitError() << "HDL lowering: unsupported port type " << sourceType;
         return failure();
@@ -581,7 +625,7 @@ LogicalResult CirctModuleEmitter::collectPorts() {
     for (Type resType : body.getResults()) {
       if (isa<KGEN::NoneType>(resType))
         continue;
-      unsigned width = getHdlWidth(resType);
+      unsigned width = getHdlWidth(resType, &bindings);
       if (!width) {
         fn->emitError() << "HDL lowering: unsupported port type " << resType;
         return failure();
@@ -641,7 +685,7 @@ LogicalResult CirctModuleEmitter::collectMethodDomains() {
         stateful = true;
         return;
       }
-      Operation *childOp = findBuiltModule(fieldStructNames[field]);
+      Operation *childOp = findBuiltModule(fieldModuleNames[field]);
       if (!childOp)
         return;
       for (hw::PortInfo port : cast<hw::HWModuleOp>(childOp).getPortList())
@@ -768,7 +812,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     fieldNames.push_back(field.getName().getValue().str());
     std::string typeName = getDslTypeName(fieldType).str();
     fieldStructNames.push_back(typeName);
-    fieldWidths.push_back(getHdlWidth(fieldType));
+    fieldWidths.push_back(getHdlWidth(fieldType, &bindings));
     bool isInstance = false;
     if (!typeName.empty())
       for (Attribute module : hdlModules)
@@ -777,6 +821,14 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
           break;
         }
     fieldIsInstance.push_back(isInstance);
+    if (isInstance) {
+      std::string display = StringRef(typeName).rsplit("::").second.str();
+      if (auto binding = getDslTypeBinding(fieldType, &bindings))
+        display += "_" + std::to_string(binding->getZExtValue());
+      fieldModuleNames.push_back(display);
+    } else {
+      fieldModuleNames.push_back({});
+    }
   }
   return success();
 }
@@ -805,7 +857,7 @@ LogicalResult CirctModuleEmitter::findMethods() {
 }
 
 Operation *CirctModuleEmitter::findBuiltModule(StringRef name) {
-  StringRef displayName = name.rsplit("::").second;
+  StringRef displayName = name.contains("::") ? name.rsplit("::").second : name;
   for (Operation &op : scratch.getBody()->getOperations())
     if (auto module = dyn_cast<hw::HWModuleOp>(&op))
       if (module.getModuleName() == displayName)
@@ -979,10 +1031,10 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       if (auto instance = instancePtrs.find(op->getOperand(0));
           instance != instancePtrs.end()) {
         unsigned fieldIndex = instance->second;
-        Operation *childOp = findBuiltModule(fieldStructNames[fieldIndex]);
+        Operation *childOp = findBuiltModule(fieldModuleNames[fieldIndex]);
         if (!childOp)
           return op->emitError() << "HDL lowering: instance module '"
-                                 << fieldStructNames[fieldIndex]
+                                 << fieldModuleNames[fieldIndex]
                                  << "' was not built";
         auto child = cast<hw::HWModuleOp>(childOp);
         MLIRContext *ctx = source.getContext();
@@ -1132,6 +1184,9 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     // `Bits[W]` methods lower directly to `comb` ops. The DSL returns values
     // through a stack slot, so a binary call is `(lhs, rhs, out-ptr)`.
     if (callee.contains("Bits::")) {
+      // Destructor bookkeeping has no hardware effect.
+      if (callee.contains("::__deinit__") || callee.contains("::__del__"))
+        return success();
       if (op->getNumOperands() == 3) {
         Value lhs = getValue(op->getOperand(0));
         Value rhs = getValue(op->getOperand(1));
@@ -1174,7 +1229,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         // constant of the callee's declared width.
         if (callee.contains("Bits::__init__") &&
             !callee.contains("__init__(move:")) {
-          unsigned width = getCallParamWidth(op);
+          unsigned width = getCallParamWidth(op, &bindings);
           Operation *valueOp = op->getOperand(0).getDefiningOp();
           auto value = valueOp ? getConstantInt(valueOp) : std::nullopt;
           if (!width || !value)
@@ -1457,12 +1512,9 @@ LogicalResult CirctModuleEmitter::build() {
     inputs.push_back(resetInfo);
   }
 
-  // Use the struct's unqualified name as the module name.
-  StringRef displayName = StringRef(structName).rsplit("::").second;
-
   builder.setInsertionPointToEnd(scratch.getBody());
   builtModule = hw::HWModuleOp::create(
-      builder, loc, StringAttr::get(ctx, displayName),
+      builder, loc, StringAttr::get(ctx, moduleName),
       hw::ModulePortInfo(inputs, outputs));
 
   Block *body = builtModule.getBodyBlock();
@@ -1550,29 +1602,112 @@ static KGEN::StructInstanceType getStructInstanceType(ModuleOp source,
   return {};
 }
 
-/// Order modules so that every instantiated child is built before its parent.
-static SmallVector<std::string> orderModulesByHierarchy(ModuleOp source,
-                                                        ArrayAttr modules) {
+struct ModuleSpec {
+  std::string structName;
+  std::string displayName;
+  ParamBindings bindings;
+};
+
+static KGEN::StructGeneratorOp findStructGenerator(ModuleOp source,
+                                                   StringRef name) {
+  for (Operation &op : source.getBody()->getOperations()) {
+    auto symbol = op.getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName());
+    if (!symbol || symbol.getValue() != name)
+      continue;
+    if (auto generator = dyn_cast<KGEN::StructGeneratorOp>(&op))
+      return generator;
+  }
+  return {};
+}
+
+/// Return the first declared parameter name, or empty if none.
+static StringRef getFirstParamName(KGEN::StructGeneratorOp generator) {
+  auto params = generator.getInputParams();
+  if (params.empty())
+    return {};
+  return params.front().getName().getValue();
+}
+
+/// Discover concrete module specializations and order them children-first.
+static SmallVector<ModuleSpec> collectModuleSpecs(ModuleOp source,
+                                                  ArrayAttr modules) {
   llvm::StringSet<> known;
   for (Attribute attr : modules)
     known.insert(cast<StringAttr>(attr).getValue());
 
-  SmallVector<std::string> order;
+  // Concrete bindings referenced by a struct field somewhere in the design.
+  std::map<std::string, std::set<int64_t>> discovered;
+  for (Attribute attr : modules) {
+    auto parentType = getStructInstanceType(source,
+                                           cast<StringAttr>(attr).getValue());
+    if (!parentType)
+      continue;
+    for (StructDefFieldAttr field : parentType.getFields()) {
+      Type fieldType = getTypeFromAttr(field.getTypeValue());
+      std::string child = getDslTypeName(fieldType).str();
+      if (!known.contains(child))
+        continue;
+      if (auto binding = getDslTypeBinding(fieldType))
+        discovered[child].insert(binding->getZExtValue());
+    }
+  }
+
+  std::map<std::string, ModuleSpec> specs;
+  for (Attribute attr : modules) {
+    std::string name = cast<StringAttr>(attr).getValue().str();
+    auto generator = findStructGenerator(source, name);
+    std::string unqualified = StringRef(name).rsplit("::").second.str();
+    if (!generator || generator.getInputParams().empty()) {
+      specs[unqualified] = ModuleSpec{name, unqualified, ParamBindings()};
+      continue;
+    }
+    StringRef paramName = getFirstParamName(generator);
+    for (int64_t value : discovered[name]) {
+      ModuleSpec spec;
+      spec.structName = name;
+      spec.displayName = unqualified + "_" + std::to_string(value);
+      spec.bindings[paramName] = llvm::APInt(64, value);
+      // The lowered body refers to struct parameters by index (for example
+      // `*(0, 0)`), so bind index zero as well.
+      spec.bindings["#0"] = llvm::APInt(64, value);
+      specs[spec.displayName] = spec;
+    }
+  }
+
+  std::map<std::string, SmallVector<std::string>> edges;
+  for (auto &[key, spec] : specs) {
+    auto type = getStructInstanceType(source, spec.structName);
+    if (!type)
+      continue;
+    for (StructDefFieldAttr field : type.getFields()) {
+      Type fieldType = getTypeFromAttr(field.getTypeValue());
+      std::string child = getDslTypeName(fieldType).str();
+      if (!known.contains(child))
+        continue;
+      std::string childDisplay = StringRef(child).rsplit("::").second.str();
+      if (auto binding = getDslTypeBinding(fieldType, &spec.bindings))
+        childDisplay += "_" + std::to_string(binding->getZExtValue());
+      if (specs.contains(childDisplay))
+        edges[key].push_back(childDisplay);
+    }
+  }
+
+  SmallVector<ModuleSpec> order;
   llvm::StringSet<> done;
-  std::function<void(StringRef)> visit = [&](StringRef name) {
-    if (!done.insert(name).second)
-      return;
-    if (auto structType = getStructInstanceType(source, name))
-      for (StructDefFieldAttr field : structType.getFields()) {
-        std::string child =
-            getDslTypeName(getTypeFromAttr(field.getTypeValue())).str();
-        if (known.contains(child))
-          visit(child);
-      }
-    order.push_back(name.str());
-  };
-  for (Attribute attr : modules)
-    visit(cast<StringAttr>(attr).getValue());
+  std::function<void(const std::string &)> visit =
+      [&](const std::string &key) {
+        if (!done.insert(key).second)
+          return;
+        auto edge = edges.find(key);
+        if (edge != edges.end())
+          for (const std::string &child : edge->second)
+            visit(child);
+        auto spec = specs.find(key);
+        if (spec != specs.end())
+          order.push_back(spec->second);
+      };
+  for (auto &[key, spec] : specs)
+    visit(key);
   return order;
 }
 
@@ -1619,8 +1754,9 @@ public:
     // generic form here). In SV mode the driver takes ownership and runs
     // seq-to-sv plus ExportVerilog after this pass manager has finished.
     OwningOpRef<ModuleOp> scratch = ModuleOp::create(module.getLoc());
-    for (const std::string &name : orderModulesByHierarchy(module, modules)) {
-      CirctModuleEmitter emitter(module, name, *scratch, modules);
+    for (const ModuleSpec &spec : collectModuleSpecs(module, modules)) {
+      CirctModuleEmitter emitter(module, spec.structName, spec.displayName,
+                                 spec.bindings, *scratch, modules);
       if (failed(emitter.build())) {
         signalPassFailure();
         return;
