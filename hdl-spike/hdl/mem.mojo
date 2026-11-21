@@ -1,47 +1,66 @@
-"""Synchronous memory surface.
+"""Synchronous memory helper.
 
-The compiler lowers `Mem` fields to an array of clock-enabled registers plus a
-combinational read mux. The native implementation below provides the matching
-simulation behavior.
+`Mem[T, N]` is a convenience wrapper over `Array[Reg[T], N]`, an array of N
+registers. It adds addressed access only:
+
+* `read(i)` selects the current value of element `i`;
+* `write(i, v, en)` drives element `i`'s clocked update under `en`.
+
+The compiler may lower the array as per-entry registers or infer a RAM where
+the access pattern is unambiguous. `Mem` itself is not a distinct hardware
+kind.
 """
 
-from std.collections import List
+from std.collections import Array
 
-from .bits import Bits
+from .hdl_type import HdlType
+from .reg import Reg
 
 
-struct Mem[W: Int = 8, N: Int = 4](Copyable, Movable):
-    """A small synchronous-write, combinational-read memory."""
+struct Mem[T: HdlType & Deinitable, N: Int = 4](
+    Copyable, Defaultable, Movable
+):
+    """A synchronous-write, combinational-read memory over `Array[Reg[T], N]`."""
 
-    var data: List[Bits[Self.W]]
-    """The stored words."""
+    var data: Array[Reg[Self.T], Self.N]
+    """The N register slots."""
 
     def __init__(out self):
-        """Constructs N zero words."""
-        self.data = List[Bits[Self.W]]()
-        for _ in range(Self.N):
-            self.data.append(Bits[Self.W]())
+        """Constructs N zeroed entries."""
+        self.data = Array[Reg[Self.T], Self.N]()
 
     def __init__(out self, fill: Int):
-        """Constructs N words initialized to `fill`."""
-        self.data = List[Bits[Self.W]]()
-        for _ in range(Self.N):
-            self.data.append(Bits[Self.W](fill))
+        """Constructs N entries initialized to `fill`."""
+        self.data = Array[Reg[Self.T], Self.N](fill=Reg[Self.T](fill))
 
     def __init__(out self, *values: Int):
-        """Constructs N words from a sequence of constants."""
-        self.data = List[Bits[Self.W]]()
+        """Constructs N entries from a sequence of constants."""
+        self.data = Array[Reg[Self.T], Self.N]()
         for i in range(Self.N):
             if i < len(values):
-                self.data.append(Bits[Self.W](values[i]))
+                self.data[i] = Reg[Self.T](values[i])
             else:
-                self.data.append(Bits[Self.W]())
+                self.data[i] = Reg[Self.T]()
 
-    def write(mut self, index: Int, value: Bits[Self.W], enable: Bool = True):
+    def __init__(out self, var data: Array[Reg[Self.T], Self.N]):
+        """Constructs from an existing register array."""
+        self.data = data^
+
+    def __copyinit__(out self, other: Self):
+        """Copies every entry."""
+        self.data = other.data.copy()
+
+    def copy(self) -> Self:
+        """Returns a copy."""
+        return Mem[Self.T, Self.N](self.data.copy())
+
+    def write(mut self, index: Int, value: Self.T, enable: Bool = True):
         """Writes `value` at `index` when `enable`."""
         if enable:
-            self.data[index] = value.copy()
+            var element = self.data[index].copy()
+            element.next(value)
+            self.data[index] = element^
 
-    def read(self, index: Int) -> Bits[Self.W]:
-        """Reads the word at `index`."""
-        return self.data[index].copy()
+    def read(self, index: Int) -> Self.T:
+        """Reads the current value at `index`."""
+        return self.data[index].get()

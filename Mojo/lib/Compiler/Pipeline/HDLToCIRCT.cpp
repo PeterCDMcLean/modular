@@ -775,8 +775,11 @@ private:
   SmallVector<int> fieldResetStyle;
   DenseMap<unsigned, SmallVector<Value>> memoryRegs;
   DenseMap<unsigned, SmallVector<Value>> memoryNext;
+  DenseMap<unsigned, SmallVector<Value>> memoryXzRegs;
+  DenseMap<unsigned, SmallVector<Value>> memoryXzNext;
   DenseMap<unsigned, SmallVector<Value>> memoryEnable;
   DenseMap<unsigned, SmallVector<bool>> memoryWritten;
+  DenseMap<unsigned, bool> memoryIsLogic;
   DenseMap<unsigned, Value> wireValues;
   DenseMap<unsigned, SmallVector<llvm::APInt>> memoryResetSequences;
   int resetStyle = 0;
@@ -1196,15 +1199,16 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     }
 
     if (isMemory) {
-      auto params = getDslTypeBindings(fieldType, &bindings);
-      if (params.size() >= 2) {
-        fieldMemWidths.back() = params[0].getZExtValue();
-        fieldMemDepths.back() = params[1].getZExtValue();
-      }
+      Type element = getDslTypeParam(fieldType, 0);
+      fieldMemWidths.back() = element ? getHdlWidth(element, &bindings) : 0;
+      if (auto depth = getDslTypeIntParam(fieldType, 1, &bindings))
+        fieldMemDepths.back() = depth->getZExtValue();
       fieldWidths.push_back(0);
       fieldIsInstance.push_back(false);
       fieldIsLogic.push_back(false);
       fieldModuleNames.push_back({});
+      memoryIsLogic[fieldIsMemory.size() - 1] =
+          element && getDslTypeName(element).contains("Logic");
       continue;
     }
 
@@ -1261,6 +1265,7 @@ CirctModuleEmitter::getOrCreateMemory(unsigned fieldIndex) {
   auto &regs = memoryRegs[fieldIndex];
   unsigned width = fieldMemWidths[fieldIndex];
   unsigned depth = fieldMemDepths[fieldIndex];
+  bool isLogic = memoryIsLogic.lookup(fieldIndex);
   auto type = IntegerType::get(builder.getContext(), width);
   auto zero = hw::ConstantOp::create(builder, loc, type, 0);
   auto ceZero =
@@ -1295,8 +1300,31 @@ CirctModuleEmitter::getOrCreateMemory(unsigned fieldIndex) {
       regs.push_back(seq::CompRegClockEnabledOp::create(
           builder, loc, zero, clk, ceZero, reset, resetValue, name, initial));
     }
+
+    if (isLogic) {
+      auto &xzRegs = memoryXzRegs[fieldIndex];
+      auto xzName = StringAttr::get(
+          builder.getContext(), "mem_" + std::to_string(fieldIndex) + "_" +
+                                    std::to_string(k) + "_xz");
+      auto xzZero = hw::ConstantOp::create(builder, loc,
+                                           llvm::APInt(width, 0));
+      if (async) {
+        xzRegs.push_back(seq::FirRegOp::create(
+            builder, loc, zero, clk, xzName, reset, xzZero,
+            hw::InnerSymAttr(), /*isAsync=*/true,
+            /*preset=*/IntegerAttr::get(type, llvm::APInt(width, 0))));
+      } else {
+        auto xzInitial = seq::createConstantInitialValue(
+            builder, loc, IntegerAttr::get(type, llvm::APInt(width, 0)));
+        xzRegs.push_back(seq::CompRegClockEnabledOp::create(
+            builder, loc, zero, clk, ceZero, reset, xzZero, xzName,
+            xzInitial));
+      }
+    }
   }
   memoryNext[fieldIndex] = regs;
+  if (isLogic)
+    memoryXzNext[fieldIndex] = memoryXzRegs[fieldIndex];
   memoryEnable[fieldIndex] = SmallVector<Value>(depth, ceZero);
   memoryWritten[fieldIndex] = SmallVector<bool>(depth, false);
   return regs;
@@ -1631,7 +1659,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
   if (name == "kgen.call") {
     StringRef callee = callCalleeName(op);
 
-    // A `Mem[W, N]` field becomes N clock-enabled registers plus a read mux.
+    // A `Mem[T, N]` field is N register slots plus a read mux. `T` may be a
+    // 2-state `Bits[W]` or a 4-state `Logic[W]` (value/mask register pairs).
     if (callee.contains("Mem::write") || callee.contains("Mem::read")) {
       if (op->getNumOperands() < 3)
         return op->emitError() << "HDL lowering: malformed memory access";
@@ -1641,6 +1670,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         return op->emitError()
                << "HDL lowering: memory access on a non-memory field";
       unsigned field = mem->second;
+      bool isLogic = memoryIsLogic.lookup(field);
       Value index = getValue(op->getOperand(1));
       if (!index)
         return op->emitError() << "HDL lowering: memory index was not lowered";
@@ -1651,10 +1681,20 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       if (callee.contains("Mem::write")) {
         if (op->getNumOperands() < 3)
           return op->emitError() << "HDL lowering: malformed memory write";
-        Value data = getValue(op->getOperand(2));
-        if (!data)
-          return op->emitError()
-                 << "HDL lowering: memory write data was not lowered";
+        Value data;
+        LogicValue logicData;
+        if (isLogic) {
+          logicData = getLogicValue(op->getOperand(2));
+          if (!logicData)
+            return op->emitError()
+                   << "HDL lowering: memory write data was not lowered";
+          data = logicData.val;
+        } else {
+          data = getValue(op->getOperand(2));
+          if (!data)
+            return op->emitError()
+                   << "HDL lowering: memory write data was not lowered";
+        }
         Value enable;
         if (op->getNumOperands() > 3) {
           enable = getValue(op->getOperand(3));
@@ -1663,8 +1703,23 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                    << "HDL lowering: memory write enable was not lowered";
         }
         auto &nexts = memoryNext[field];
+        auto &xzNexts = memoryXzNext[field];
         auto &enables = memoryEnable[field];
         auto &written = memoryWritten[field];
+        auto setEntry = [&](Value reg, Value next,
+                            Value en) -> LogicalResult {
+          if (auto ceOp = reg.getDefiningOp<seq::CompRegClockEnabledOp>()) {
+            ceOp->setOperand(0, next);
+            ceOp->setOperand(2, en);
+          } else if (auto fir = reg.getDefiningOp<seq::FirRegOp>()) {
+            fir->setOperand(0, next);
+          } else {
+            return op->emitError()
+                   << "HDL lowering: unsupported memory register form";
+          }
+          return success();
+        };
+
         for (unsigned k = 0; k < regs.size(); ++k) {
           Value eq = comb::ICmpOp::create(
               builder, loc, comb::ICmpPredicate::eq, index,
@@ -1676,6 +1731,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           bool clockEnabled =
               regs[k].getDefiningOp<seq::CompRegClockEnabledOp>() != nullptr;
           Value next = data;
+          Value nextXz = isLogic ? logicData.xz : Value();
           Value combinedEnable = ce;
           if (!written[k] && clockEnabled) {
             // The first write to a clock-enabled entry needs no input mux.
@@ -1684,40 +1740,53 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             // conflicting address. Firreg entries always need the mux
             // because they have no clock enable.
             next = comb::MuxOp::create(builder, loc, ce, data, nexts[k]);
+            if (isLogic)
+              nextXz = comb::MuxOp::create(builder, loc, ce, logicData.xz,
+                                           xzNexts[k]);
             if (written[k])
               combinedEnable =
                   comb::OrOp::create(builder, loc, enables[k], ce);
           }
           written[k] = true;
           nexts[k] = next;
+          if (isLogic)
+            xzNexts[k] = nextXz;
           enables[k] = combinedEnable;
 
-          if (auto ceOp =
-                  regs[k].getDefiningOp<seq::CompRegClockEnabledOp>()) {
-            ceOp->setOperand(0, next);
-            ceOp->setOperand(2, combinedEnable);
-          } else if (auto fir = regs[k].getDefiningOp<seq::FirRegOp>()) {
-            fir->setOperand(0, next);
-          } else {
-            return op->emitError()
-                   << "HDL lowering: unsupported memory register form";
-          }
+          if (failed(setEntry(regs[k], next, combinedEnable)))
+            return failure();
+          if (isLogic && failed(setEntry(memoryXzRegs[field][k], nextXz,
+                                         combinedEnable)))
+            return failure();
         }
         return success();
       }
 
       Value result = regs[0];
+      Value resultXz = isLogic ? memoryXzRegs[field][0] : Value();
       for (unsigned k = 1; k < regs.size(); ++k) {
         Value eq = comb::ICmpOp::create(
             builder, loc, comb::ICmpPredicate::eq, index,
             hw::ConstantOp::create(builder, loc, index.getType(),
                                    static_cast<int64_t>(k)));
         result = comb::MuxOp::create(builder, loc, eq, regs[k], result);
+        if (isLogic)
+          resultXz = comb::MuxOp::create(
+              builder, loc, eq, memoryXzRegs[field][k], resultXz);
       }
       Value dest = op->getOperand(2);
-      values[dest] = result;
-      if (dest == resultPtr)
-        returnValue = result;
+      if (isLogic) {
+        logicValues[dest] = {result, resultXz};
+        if (dest == resultPtr) {
+          returnValue = result;
+          returnXz = resultXz;
+          returnIsLogic = true;
+        }
+      } else {
+        values[dest] = result;
+        if (dest == resultPtr)
+          returnValue = result;
+      }
       return success();
     }
 

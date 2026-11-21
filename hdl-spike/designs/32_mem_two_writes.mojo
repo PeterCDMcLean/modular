@@ -5,10 +5,10 @@ from hdl import Bits, Mem
 
 @module
 struct MemTwoWrites:
-    var mem: Mem[8, 4]
+    var mem: Mem[Bits[8], 4]
 
     def __init__(out self):
-        self.mem = Mem[8, 4](1, 2, 3, 4)
+        self.mem = Mem[Bits[8], 4](1, 2, 3, 4)
 
     def run(
         mut self,

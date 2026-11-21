@@ -15,7 +15,9 @@ selects the register-level reset behavior:
 from .hdl_type import HdlType
 
 
-struct Reg[T: HdlType & Deinitable, style: Int = 0](Copyable, Movable):
+struct Reg[T: HdlType & Deinitable, style: Int = 0](
+    Copyable, Defaultable, Movable
+):
     """A typed register over `T`."""
 
     var inner: Self.T
