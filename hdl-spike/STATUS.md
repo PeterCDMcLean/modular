@@ -21,8 +21,8 @@ Build and test record:
 * Mojo (`-c opt`, same targets plus `//Mojo/stdlib/std`): **green**,
   1,188.7 s, 8,639 actions.
 * `hdl-spike/tests/run_all.sh`: **green** in both `-c dbg` and `-c opt`
-  (00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12). `--emit=circt`
-  and `--emit=sv` run in-process.
+  (00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14).
+  `--emit=circt` and `--emit=sv` run in-process.
 * Verilator lint: skipped (not installed).
 * CLI adaptation: the current compiler uses `-I <dir>`; the tests were updated
   from `-mojo-search-paths`.
@@ -38,10 +38,11 @@ Build and test record:
 | 3. Widths and arithmetic | **green (combinational)** | `designs/03_add8.mojo`, `designs/06_bits_ops.mojo`, `designs/07_bits_bit.mojo`, `designs/10_var_bit.mojo` | Primitive `UInt8` add lowers to `comb.add` (`04_add8`). The compiler now reads the *source* signature, so `Bits[W]` keeps its declared width at ports: a `Bits[12]` module lowers add/sub/and/or/xor/invert to `comb` ops (`06_bits_ops`), and `a.bit(3)` to `comb.extract` (`07_bits_bit`). A dynamic `a.bit(i)` lowers to `comb.shru` plus `comb.extract`, with the index truncated to `W` bits (`10_var_bit`). `index`/`uindex` ports map to 64-bit values. A `Bits[W]` by-ref result is recognized from the `byref_result` argument convention and written to `hw.output`. |
 | Logic[W] 4-state | **green (combinational)** | `designs/11_logic_ops.mojo` | Each `Logic[W]` port becomes a value net plus a `<name>_xz` mask net. `&`/`\|` apply dominant known-zero/known-one rules, `^` ORs the masks, `~` keeps the mask, and `mux_logic` resolves unknown selects. `Logic` fields, 4-state sequential state, and X/Z-aware comparisons remain open. |
 | 4. Registers/reset | **partial** | `designs/04_counter.mojo`, `designs/08_bits_counter.mojo`, `designs/09_preset_counter.mojo`, `designs/12_enable_counter.mojo` | A primitive struct field store/load becomes `seq.compreg` (`05_counter`). `Bits[W]` fields are decoded from the source struct definition, so a `Bits[12]` counter lowers to a 12-bit register (`08_bits_counter`). Constructor constants are decoded as reset values: `self.count = Bits[12](5)` produces `seq.compreg ... reset %rst, %c5_i12` and `if (rst) q <= 12'h5;` under an ambient `rst` port (`09_preset_counter`). The same constant is wrapped in `seq.initial` as the power-on value, exporting as `var logic [11:0] _GEN_0 = 12'h5;`. A conditional state update (`if en:`) becomes an input mux that holds the register when disabled (`assign _GEN = en ? q + 1 : q`), giving enable gating in combinational form (`12_enable_counter`). Reset polarity/style options and `seq.compreg.ce` emission are not implemented yet. |
+| Hierarchy/instances | **green (prototype)** | `designs/13_hierarchy.mojo`, `designs/14_hierarchy_state.mojo` | A struct field whose type is another `@module` becomes `hw.instance`; child inputs are wired from call operands, ambient `clk`/`rst` are forwarded to stateful children, and child outputs drive the call's result slot. Modules are built children-first. Instance names come from field names. Multi-instance/Logic-port children and parameterized instances remain open. |
 | 5–10 | not started | — | — |
 
 `tests/run_all.sh` runs 00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11,
-and 12; all pass.
+12, 13, and 14; all pass.
 
 **Second phase (combined CIRCT/LLVM lowering).** The compiler now builds *real*
 CIRCT ops. CIRCT is a **git submodule** at `third_party/circt` pointing at the

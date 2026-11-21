@@ -62,6 +62,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -413,9 +414,11 @@ static std::optional<bool> getConstantBool(Operation *op) {
 /// Emits one `hw.module` per `@module` struct by building real CIRCT ops.
 class CirctModuleEmitter {
 public:
-  CirctModuleEmitter(ModuleOp source, StringRef structName, ModuleOp scratch)
+  CirctModuleEmitter(ModuleOp source, StringRef structName, ModuleOp scratch,
+                     ArrayAttr hdlModules)
       : source(source), structName(structName), scratch(scratch),
-        builder(scratch.getContext()), loc(scratch.getLoc()) {}
+        hdlModules(hdlModules), builder(scratch.getContext()),
+        loc(scratch.getLoc()) {}
 
   LogicalResult build();
   hw::HWModuleOp getModule() const { return builtModule; }
@@ -442,6 +445,7 @@ private:
   LogicalResult emitBlock(Block &block, Value condition, Value &returnValue);
   LogicalResult emitOp(Operation *op, Value condition, Value &returnValue);
   void storeField(unsigned fieldIndex, Value value, Value condition);
+  Operation *findBuiltModule(StringRef name);
   Value getValue(Value value);
   LogicValue getLogicValue(Value value);
   Value bitNot(Value value);
@@ -451,6 +455,7 @@ private:
   ModuleOp source;
   StringRef structName;
   ModuleOp scratch;
+  ArrayAttr hdlModules;
   OpBuilder builder;
 
   SmallVector<Port> ports;
@@ -460,10 +465,14 @@ private:
   DenseMap<Value, LogicValue> logicValues;
   DenseMap<Value, llvm::APInt> intConstants;
   DenseMap<Value, unsigned> fieldPtrs;
+  DenseMap<Value, unsigned> instancePtrs;
   DenseMap<unsigned, Value> fieldRegs;
   DenseMap<unsigned, Value> fieldNext;
   DenseMap<unsigned, llvm::APInt> resetValues;
   SmallVector<unsigned> fieldWidths;
+  SmallVector<std::string> fieldNames;
+  SmallVector<std::string> fieldStructNames;
+  SmallVector<bool> fieldIsInstance;
   Value selfPtr;
   Value resultPtr;
   Value returnXz;
@@ -693,8 +702,21 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
   if (!structType)
     return success();
 
-  for (StructDefFieldAttr field : structType.getFields())
-    fieldWidths.push_back(getHdlWidth(getTypeFromAttr(field.getTypeValue())));
+  for (StructDefFieldAttr field : structType.getFields()) {
+    Type fieldType = getTypeFromAttr(field.getTypeValue());
+    fieldNames.push_back(field.getName().getValue().str());
+    std::string typeName = getDslTypeName(fieldType).str();
+    fieldStructNames.push_back(typeName);
+    fieldWidths.push_back(getHdlWidth(fieldType));
+    bool isInstance = false;
+    if (!typeName.empty())
+      for (Attribute module : hdlModules)
+        if (cast<StringAttr>(module).getValue() == typeName) {
+          isInstance = true;
+          break;
+        }
+    fieldIsInstance.push_back(isInstance);
+  }
   return success();
 }
 
@@ -717,12 +739,6 @@ LogicalResult CirctModuleEmitter::findMethods() {
                        << "' has no elaborated methods";
     return failure();
   }
-  for (Operation *method : methods) {
-    method->walk([&](Operation *op) {
-      if (op->getName().getStringRef() == "kgen.struct.gep")
-        hasState = true;
-    });
-  }
   if (methods.size() != 1) {
     source.emitError() << "HDL lowering: multiple processes per module are "
                           "not supported yet ("
@@ -730,6 +746,15 @@ LogicalResult CirctModuleEmitter::findMethods() {
     return failure();
   }
   return success();
+}
+
+Operation *CirctModuleEmitter::findBuiltModule(StringRef name) {
+  StringRef displayName = name.rsplit("::").second;
+  for (Operation &op : scratch.getBody()->getOperations())
+    if (auto module = dyn_cast<hw::HWModuleOp>(&op))
+      if (module.getModuleName() == displayName)
+        return module;
+  return nullptr;
 }
 
 Value CirctModuleEmitter::getValue(Value value) {
@@ -887,6 +912,74 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
   if (name == "kgen.call") {
     StringRef callee = callCalleeName(op);
 
+    // A call through a field of another `@module` struct becomes an
+    // `hw.instance`: the callee's user inputs are wired from the call
+    // operands, ambient clock/reset are forwarded, and the result slot is
+    // bound to the instance outputs.
+    if (op->getNumOperands() > 0) {
+      if (auto instance = instancePtrs.find(op->getOperand(0));
+          instance != instancePtrs.end()) {
+        unsigned fieldIndex = instance->second;
+        Operation *childOp = findBuiltModule(fieldStructNames[fieldIndex]);
+        if (!childOp)
+          return op->emitError() << "HDL lowering: instance module '"
+                                 << fieldStructNames[fieldIndex]
+                                 << "' was not built";
+        auto child = cast<hw::HWModuleOp>(childOp);
+        MLIRContext *ctx = source.getContext();
+        SmallVector<Value> inputs;
+        unsigned operandIndex = 1;
+        for (hw::PortInfo port : child.getPortList()) {
+          if (port.dir != hw::ModulePort::Direction::Input)
+            continue;
+          if (isa<seq::ClockType>(port.type)) {
+            if (!clk)
+              return op->emitError()
+                     << "HDL lowering: instance needs a clock";
+            inputs.push_back(clk);
+          } else if (port.name.getValue() == "rst") {
+            if (!resetSignal)
+              return op->emitError() << "HDL lowering: instance needs a reset";
+            inputs.push_back(resetSignal);
+          } else {
+            if (operandIndex + 1 >= op->getNumOperands())
+              return op->emitError()
+                     << "HDL lowering: too few instance operands";
+            Value value = getValue(op->getOperand(operandIndex++));
+            if (!value)
+              return op->emitError()
+                     << "HDL lowering: instance operand was not lowered";
+            inputs.push_back(value);
+          }
+        }
+        if (operandIndex + 1 != op->getNumOperands())
+          return op->emitError()
+                 << "HDL lowering: too many instance operands";
+        auto instanceOp = hw::InstanceOp::create(
+            builder, loc, childOp,
+            StringAttr::get(ctx, fieldNames[fieldIndex]), inputs);
+        Value dest = op->getOperand(op->getNumOperands() - 1);
+        if (instanceOp.getNumResults() == 1) {
+          values[dest] = instanceOp.getResult(0);
+          if (dest == resultPtr)
+            returnValue = instanceOp.getResult(0);
+        } else if (instanceOp.getNumResults() == 2) {
+          logicValues[dest] = {instanceOp.getResult(0),
+                               instanceOp.getResult(1)};
+          if (dest == resultPtr) {
+            returnValue = instanceOp.getResult(0);
+            returnXz = instanceOp.getResult(1);
+            returnIsLogic = true;
+          }
+        } else {
+          return op->emitError()
+                 << "HDL lowering: instance with "
+                 << instanceOp.getNumResults() << " outputs is not supported";
+        }
+        return success();
+      }
+    }
+
     // `Logic[W]` values are lowered as a (value, xz-mask) pair of `comb`
     // nets. Binary calls take `(lhs, rhs, out-ptr)`, `mux_logic` takes
     // `(cond, a, b, out-ptr)`, and `__invert__` takes `(src, out-ptr)`.
@@ -1013,6 +1106,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           return op->emitError() << "HDL lowering: unsupported Bits call '"
                                  << callee << "'";
         values[op->getOperand(2)] = result;
+        if (op->getOperand(2) == resultPtr)
+          returnValue = result;
         return success();
       }
       if (op->getNumOperands() == 2) {
@@ -1026,8 +1121,11 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           if (!width || !value)
             return op->emitError()
                    << "HDL lowering: unsupported Bits constructor argument";
-          values[op->getOperand(1)] =
-              hw::ConstantOp::create(builder, loc, value->zextOrTrunc(width));
+          Value constant = hw::ConstantOp::create(
+              builder, loc, value->zextOrTrunc(width));
+          values[op->getOperand(1)] = constant;
+          if (op->getOperand(1) == resultPtr)
+            returnValue = constant;
           return success();
         }
 
@@ -1039,8 +1137,10 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           unsigned width = source.getType().getIntOrFloatBitWidth();
           auto ones = hw::ConstantOp::create(builder, loc,
                                              llvm::APInt::getAllOnes(width));
-          values[op->getOperand(1)] =
-              comb::XorOp::create(builder, loc, source, ones);
+          Value result = comb::XorOp::create(builder, loc, source, ones);
+          values[op->getOperand(1)] = result;
+          if (op->getOperand(1) == resultPtr)
+            returnValue = result;
           return success();
         }
         if (callee.contains("Bits::bit(")) {
@@ -1186,7 +1286,11 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     if (!index || op->getNumOperands() != 1 || op->getOperand(0) != selfPtr)
       return op->emitError()
              << "HDL lowering: unsupported struct field access";
-    fieldPtrs[op->getResult(0)] = index.getInt();
+    unsigned field = index.getInt();
+    if (field < fieldIsInstance.size() && fieldIsInstance[field])
+      instancePtrs[op->getResult(0)] = field;
+    else
+      fieldPtrs[op->getResult(0)] = field;
     return success();
   }
 
@@ -1249,6 +1353,22 @@ LogicalResult CirctModuleEmitter::build() {
   if (failed(findMethods()) || failed(collectFieldWidths()) ||
       failed(collectResetValues()) || failed(collectPorts()))
     return failure();
+
+  // A module is stateful if it has a register field or instantiates a
+  // stateful child (which needs clock/reset forwarded).
+  for (unsigned i = 0; i < fieldIsInstance.size(); ++i) {
+    if (!fieldIsInstance[i]) {
+      hasState = true;
+      continue;
+    }
+    Operation *childOp = findBuiltModule(fieldStructNames[i]);
+    if (!childOp)
+      continue;
+    for (hw::PortInfo port : cast<hw::HWModuleOp>(childOp).getPortList())
+      if (port.dir == hw::ModulePort::Direction::Input &&
+          isa<seq::ClockType>(port.type))
+        hasState = true;
+  }
 
   loc = source.getLoc();
   MLIRContext *ctx = source.getContext();
@@ -1348,6 +1468,45 @@ LogicalResult CirctModuleEmitter::build() {
   return success();
 }
 
+/// Return the concretized type of a `@module` struct declaration.
+static KGEN::StructInstanceType getStructInstanceType(ModuleOp source,
+                                                      StringRef name) {
+  for (Operation &op : source.getBody()->getOperations()) {
+    auto symbol = op.getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName());
+    if (!symbol || symbol.getValue() != name)
+      continue;
+    if (auto generator = dyn_cast<KGEN::StructGeneratorOp>(&op))
+      return dyn_cast<StructInstanceType>(generator.getValueDomainType());
+  }
+  return {};
+}
+
+/// Order modules so that every instantiated child is built before its parent.
+static SmallVector<std::string> orderModulesByHierarchy(ModuleOp source,
+                                                        ArrayAttr modules) {
+  llvm::StringSet<> known;
+  for (Attribute attr : modules)
+    known.insert(cast<StringAttr>(attr).getValue());
+
+  SmallVector<std::string> order;
+  llvm::StringSet<> done;
+  std::function<void(StringRef)> visit = [&](StringRef name) {
+    if (!done.insert(name).second)
+      return;
+    if (auto structType = getStructInstanceType(source, name))
+      for (StructDefFieldAttr field : structType.getFields()) {
+        std::string child =
+            getDslTypeName(getTypeFromAttr(field.getTypeValue())).str();
+        if (known.contains(child))
+          visit(child);
+      }
+    order.push_back(name.str());
+  };
+  for (Attribute attr : modules)
+    visit(cast<StringAttr>(attr).getValue());
+  return order;
+}
+
 class HDLToCIRCTPass
     : public PassWrapper<HDLToCIRCTPass, OperationPass<ModuleOp>> {
 public:
@@ -1391,9 +1550,8 @@ public:
     // generic form here). In SV mode the driver takes ownership and runs
     // seq-to-sv plus ExportVerilog after this pass manager has finished.
     OwningOpRef<ModuleOp> scratch = ModuleOp::create(module.getLoc());
-    for (Attribute attr : modules) {
-      auto name = cast<StringAttr>(attr).getValue();
-      CirctModuleEmitter emitter(module, name, *scratch);
+    for (const std::string &name : orderModulesByHierarchy(module, modules)) {
+      CirctModuleEmitter emitter(module, name, *scratch, modules);
       if (failed(emitter.build())) {
         signalPassFailure();
         return;
