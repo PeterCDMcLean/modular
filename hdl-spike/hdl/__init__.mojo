@@ -9,9 +9,8 @@ comptime Sig[T: AnyType] = T
 from .bits import Bits, mux
 from .logic import Logic, XMode, bit, logic, mux_logic
 from .mem import Mem
-from .resettable import Resettable
-from .resettable_logic import ResettableLogic
 from .wire import Wire
+from .hdl_type import HdlType
 from .reg import Reg
 
 

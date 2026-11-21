@@ -580,6 +580,48 @@ getDslTypeBindings(Type type, const ParamBindings *bindings = nullptr) {
   return result;
 }
 
+/// Return the type bound to DSL reference parameter `index`, if it is a type.
+static Type getDslTypeParam(Type type, unsigned index) {
+  if (auto ptr = dyn_cast<KGEN::PointerType>(type))
+    type = ptr.getElementType();
+  auto typeValue = dyn_cast<KGEN::TypeValueType>(type);
+  if (!typeValue)
+    return {};
+  auto ref = dyn_cast<KGEN::TypeGeneratorRefAttr>(typeValue.getTypeValue());
+  if (!ref || index >= ref.getParamValues().size())
+    return {};
+  auto resolved =
+      KGEN::getTypeRefForTypeValueIfResolved(ref.getParamValues()[index]);
+  return resolved ? KGEN::TypeValueType::get(resolved) : Type();
+}
+
+/// Return the integer bound to DSL reference parameter `index`, if present.
+static std::optional<llvm::APInt>
+getDslTypeIntParam(Type type, unsigned index,
+                   const ParamBindings *bindings = nullptr) {
+  if (auto ptr = dyn_cast<KGEN::PointerType>(type))
+    type = ptr.getElementType();
+  auto typeValue = dyn_cast<KGEN::TypeValueType>(type);
+  if (!typeValue)
+    return std::nullopt;
+  auto ref = dyn_cast<KGEN::TypeGeneratorRefAttr>(typeValue.getTypeValue());
+  if (!ref || index >= ref.getParamValues().size())
+    return std::nullopt;
+  return getTypedAttrInt(ref.getParamValues()[index], bindings);
+}
+
+/// Return the type bound to the method symbol's parameter `index`.
+static Type getCallTypeParam(Operation *op, unsigned index) {
+  auto symbol = KGEN::FuncSymbolGenerator::dynCast(op->getAttr("callee"));
+  if (!symbol)
+    return {};
+  auto params = symbol.getParamValues();
+  if (index >= params.size())
+    return {};
+  auto resolved = KGEN::getTypeRefForTypeValueIfResolved(params[index]);
+  return resolved ? KGEN::TypeValueType::get(resolved) : Type();
+}
+
 /// Return the generator type carrier of a `kgen.func` / `kgen.generator`.
 static KGEN::FuncTypeGeneratorType getFuncTypeGenerator(Operation *op) {
   if (auto gen = dyn_cast<KGEN::GeneratorOp>(op))
@@ -976,8 +1018,6 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
       StringRef callee = callCalleeName(&op);
       if (!callee.contains("Bits::__init__") &&
           !callee.contains("Logic::__init__") &&
-          !callee.contains("Resettable::__init__") &&
-          !callee.contains("ResettableLogic::__init__") &&
           !callee.contains("Reg::__init__") &&
           !callee.contains("Mem::__init__"))
         continue;
@@ -1135,10 +1175,13 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     }
 
     if (isReg) {
-      auto params = getDslTypeBindings(fieldType, &bindings);
-      fieldWidths.push_back(params.empty() ? 0 : params[0].getZExtValue());
+      Type element = getDslTypeParam(fieldType, 0);
+      fieldWidths.push_back(element ? getHdlWidth(element, &bindings) : 0);
+      if (auto style = getDslTypeIntParam(fieldType, 1, &bindings))
+        fieldResetStyle.back() = style->getZExtValue();
       fieldIsInstance.push_back(false);
-      fieldIsLogic.push_back(false);
+      fieldIsLogic.push_back(element &&
+                             getDslTypeName(element).contains("Logic"));
       fieldModuleNames.push_back({});
       continue;
     }
@@ -1146,34 +1189,6 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     if (isWire) {
       auto params = getDslTypeBindings(fieldType, &bindings);
       fieldWidths.push_back(params.empty() ? 0 : params[0].getZExtValue());
-      fieldIsInstance.push_back(false);
-      fieldIsLogic.push_back(false);
-      fieldModuleNames.push_back({});
-      continue;
-    }
-
-    if (!isMemory && StringRef(typeName).contains("ResettableLogic")) {
-      auto params = getDslTypeBindings(fieldType, &bindings);
-      if (params.size() >= 2) {
-        fieldWidths.push_back(params[0].getZExtValue());
-        fieldResetStyle.back() = params[1].getZExtValue();
-      } else {
-        fieldWidths.push_back(0);
-      }
-      fieldIsInstance.push_back(false);
-      fieldIsLogic.push_back(true);
-      fieldModuleNames.push_back({});
-      continue;
-    }
-
-    if (!isMemory && StringRef(typeName).contains("Resettable")) {
-      auto params = getDslTypeBindings(fieldType, &bindings);
-      if (params.size() >= 2) {
-        fieldWidths.push_back(params[0].getZExtValue());
-        fieldResetStyle.back() = params[1].getZExtValue();
-      } else {
-        fieldWidths.push_back(0);
-      }
       fieldIsInstance.push_back(false);
       fieldIsLogic.push_back(false);
       fieldModuleNames.push_back({});
@@ -1833,23 +1848,6 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         return success();
       };
 
-      if (callee.contains("ResettableLogic::") &&
-          callee.contains("__init__") &&
-          !callee.contains("__init__(move:")) {
-        unsigned width = getCallParamWidth(op, &bindings);
-        Operation *valueOp = op->getOperand(0).getDefiningOp();
-        auto value =
-            valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
-        if (!width || !value)
-          return op->emitError()
-                 << "HDL lowering: unsupported ResettableLogic constructor";
-        Value val = hw::ConstantOp::create(builder, loc,
-                                           value->zextOrTrunc(width));
-        Value xz = hw::ConstantOp::create(builder, loc,
-                                          llvm::APInt(width, 0));
-        return storeResult(op->getOperand(1), {val, xz});
-      }
-
       if (callee.contains("mux_logic")) {
         if (op->getNumOperands() != 4)
           return op->emitError() << "HDL lowering: unexpected mux_logic form";
@@ -1941,8 +1939,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           return storeResult(op->getOperand(1),
                              {bitNot(source.val), source.xz});
         if (callee.contains("Logic::copy") ||
-            callee.contains("Logic::__init__") ||
-            callee.contains("ResettableLogic::get"))
+            callee.contains("Logic::__init__"))
           return storeResult(op->getOperand(1), source);
       }
 
@@ -1950,74 +1947,42 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                              << callee << "'";
     }
 
-    // `Resettable[W, style]` is a Bits value with a register-level reset
-    // style; its operations lower exactly like the corresponding Bits ones.
-    if (callee.contains("Resettable::")) {
-      if (callee.contains("::__deinit__") || callee.contains("::__del__"))
-        return success();
-      if (callee.contains("::__init__") &&
-          !callee.contains("__init__(move:")) {
-        unsigned width = getCallParamWidth(op, &bindings);
-        Operation *valueOp = op->getOperand(0).getDefiningOp();
-        auto value =
-            valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
-        if (!width || !value)
-          return op->emitError()
-                 << "HDL lowering: unsupported Resettable constructor";
-        Value constant = hw::ConstantOp::create(
-            builder, loc, value->zextOrTrunc(width));
-        values[op->getOperand(1)] = constant;
-        if (op->getOperand(1) == resultPtr)
-          returnValue = constant;
-        return success();
-      }
-      if (op->getNumOperands() == 3 && callee.contains("::__add__")) {
-        Value lhs = getValue(op->getOperand(0));
-        Value rhs = getValue(op->getOperand(1));
-        if (!lhs || !rhs)
-          return op->emitError()
-                 << "HDL lowering: Resettable operand was not lowered";
-        Value result = comb::AddOp::create(builder, loc, lhs, rhs);
-        values[op->getOperand(2)] = result;
-        if (op->getOperand(2) == resultPtr)
-          returnValue = result;
-        return success();
-      }
-      if (op->getNumOperands() == 2) {
-        Value source = getValue(op->getOperand(0));
-        if (!source)
-          return op->emitError()
-                 << "HDL lowering: Resettable operand was not lowered";
-        if (callee.contains("::__init__")) {
-          if (op->getOperand(1) == resultPtr) {
-            returnValue = source;
-          } else if (auto field = fieldPtrs.find(op->getOperand(1));
-                     field != fieldPtrs.end()) {
-            return storeField(field->second, source, condition);
-          } else {
-            values[op->getOperand(1)] = source;
-          }
-          return success();
-        }
-        if (callee.contains("::get") || callee.contains("::copy")) {
-          Value dest = op->getOperand(1);
-          values[dest] = source;
-          if (dest == resultPtr)
-            returnValue = source;
-          return success();
-        }
-      }
-      return op->emitError() << "HDL lowering: unsupported Resettable call '"
-                             << callee << "'";
-    }
-
-    // `Reg[W]` is a typed state field. `.next` is the clocked update and
-    // `.get` reads the current value.
+    // `Reg[T, style]` is a typed state field. `.next` is the clocked update
+    // and `.get` reads the current value; `T` may be 2-state `Bits[W]` or
+    // 4-state `Logic[W]`.
     if (callee.contains("Reg::")) {
       if (callee.contains("::__deinit__") || callee.contains("::__del__"))
         return success();
-      if (callee.contains("__init__") && callee.contains("::SIMD")) {
-        unsigned width = getCallParamWidth(op, &bindings);
+
+      auto storeLogicResult = [&](Value dest,
+                                  LogicValue value) -> LogicalResult {
+        if (!value)
+          return failure();
+        if (auto field = fieldPtrs.find(dest);
+            field != fieldPtrs.end() &&
+            field->second < fieldIsLogic.size() &&
+            fieldIsLogic[field->second])
+          return storeLogicField(field->second, value, condition);
+        logicValues[dest] = value;
+        if (dest == resultPtr) {
+          returnValue = value.val;
+          returnXz = value.xz;
+          returnIsLogic = true;
+        }
+        return success();
+      };
+
+      if (callee.contains("__init__") && callee.contains("::SIMD") &&
+          !callee.contains("__init__(move:")) {
+        Value dest = op->getOperand(1);
+        auto field = fieldPtrs.find(dest);
+        bool isLogic = field != fieldPtrs.end() &&
+                       field->second < fieldIsLogic.size() &&
+                       fieldIsLogic[field->second];
+        unsigned width = field != fieldPtrs.end() ? fieldWidths[field->second]
+                                                  : getHdlWidth(
+                                                        getCallTypeParam(op, 0),
+                                                        &bindings);
         Operation *valueOp = op->getOperand(0).getDefiningOp();
         auto value =
             valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
@@ -2026,27 +1991,47 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                  << "HDL lowering: unsupported Reg constructor";
         Value constant = hw::ConstantOp::create(
             builder, loc, value->zextOrTrunc(width));
-        Value dest = op->getOperand(1);
-        if (auto field = fieldPtrs.find(dest); field != fieldPtrs.end())
-          resetValues[field->second] = *value;
+        if (isLogic) {
+          Value xz = hw::ConstantOp::create(
+              builder, loc, llvm::APInt(width, 0));
+          return storeLogicResult(dest, {constant, xz});
+        }
+        if (auto fieldPtr = fieldPtrs.find(dest);
+            fieldPtr != fieldPtrs.end())
+          resetValues[fieldPtr->second] = *value;
         else
           values[dest] = constant;
         return success();
       }
-      if (op->getNumOperands() == 2) {
-        if (callee.contains("::next")) {
-          auto field = fieldPtrs.find(op->getOperand(0));
-          Value value = getValue(op->getOperand(1));
-          if (field == fieldPtrs.end() || !value)
+
+      if (callee.contains("::next") && op->getNumOperands() == 2) {
+        auto field = fieldPtrs.find(op->getOperand(0));
+        if (field == fieldPtrs.end())
+          return op->emitError()
+                 << "HDL lowering: Reg::next on a non-field value";
+        if (field->second < fieldIsLogic.size() &&
+            fieldIsLogic[field->second]) {
+          LogicValue value = getLogicValue(op->getOperand(1));
+          if (!value)
             return op->emitError()
                    << "HDL lowering: Reg::next operand was not lowered";
-          return storeField(field->second, value, condition);
+          return storeLogicField(field->second, value, condition);
         }
+        Value value = getValue(op->getOperand(1));
+        if (!value)
+          return op->emitError()
+                 << "HDL lowering: Reg::next operand was not lowered";
+        return storeField(field->second, value, condition);
+      }
+
+      if (op->getNumOperands() == 2) {
+        Value dest = op->getOperand(1);
+        if (LogicValue source = getLogicValue(op->getOperand(0)))
+          return storeLogicResult(dest, source);
         Value source = getValue(op->getOperand(0));
         if (!source)
           return op->emitError()
                  << "HDL lowering: Reg operand was not lowered";
-        Value dest = op->getOperand(1);
         if (dest == resultPtr)
           returnValue = source;
         else if (auto field = fieldPtrs.find(dest); field != fieldPtrs.end())
@@ -2055,6 +2040,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           values[dest] = source;
         return success();
       }
+
       return op->emitError() << "HDL lowering: unsupported Reg call '"
                              << callee << "'";
     }

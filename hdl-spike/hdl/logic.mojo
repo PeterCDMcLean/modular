@@ -6,6 +6,7 @@ zero-mask form.
 """
 
 from .bits import Bits
+from .hdl_type import HdlType
 
 
 # The 4-state policy: `none` is 2-state, `taint` tracks X, `ieee` also
@@ -23,8 +24,13 @@ comptime logic[W: Int = 1] = Logic[W]
 """The default 4-state specialization."""
 
 
-struct Logic[W: Int = 1, xmode: XMode = XMode.taint](Copyable, Movable):
+struct Logic[W: Int = 1, xmode: XMode = XMode.taint](
+    Copyable, Movable, HdlType
+):
     """A 4-state bit vector: value plus an X/Z mask."""
+
+    comptime WIDTH: Int = Self.W
+    """The hardware width of the value."""
 
     var val: Bits[Self.W]
     """The 0/1 value; mask bits are don't-care."""

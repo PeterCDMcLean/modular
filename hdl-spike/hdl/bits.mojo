@@ -10,6 +10,8 @@ from bitlib import BitInteger
 from std.builtin.rebind import rebind_var
 from std.sys import bit_width_of
 
+from .hdl_type import HdlType
+
 
 comptime WordFor[W: Int] = (
     DType.uint8
@@ -27,13 +29,16 @@ comptime RawBits[W: Int] = BitInteger[W, WordFor[W]]
 """The bitlib leaf with a fixed word policy (default `Typical`)."""
 
 
-struct Bits[W: Int = 1](Copyable, Movable):
+struct Bits[W: Int = 1](Copyable, Movable, HdlType):
     """A two-state, any-width bit vector.
 
     The value is bitlib's `BitInteger[W]`; arithmetic wraps at `W` bits. The
     wrapper exists to hide bitlib's policy/word parameters and to keep result
     types stable (`a + b` returns `Bits[W]`, not a policy expression).
     """
+
+    comptime WIDTH: Int = Self.W
+    """The hardware width of the value."""
 
     var raw: RawBits[Self.W]
     """The packed leaf value."""
