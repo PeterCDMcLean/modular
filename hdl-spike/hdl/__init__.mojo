@@ -10,6 +10,7 @@ from .bits import Bits, mux
 from .logic import Logic, XMode, bit, logic, mux_logic
 from .mem import Mem
 from .resettable import Resettable
+from .resettable_logic import ResettableLogic
 
 
 struct ResetStyle[style: Int = 0](Copyable, Movable):

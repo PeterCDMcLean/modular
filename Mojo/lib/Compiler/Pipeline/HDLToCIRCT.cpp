@@ -970,6 +970,7 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
       if (!callee.contains("Bits::__init__") &&
           !callee.contains("Logic::__init__") &&
           !callee.contains("Resettable::__init__") &&
+          !callee.contains("ResettableLogic::__init__") &&
           !callee.contains("Mem::__init__"))
         continue;
       // A multi-operand memory constructor carries one constant per entry.
@@ -1072,6 +1073,20 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
       fieldWidths.push_back(0);
       fieldIsInstance.push_back(false);
       fieldIsLogic.push_back(false);
+      fieldModuleNames.push_back({});
+      continue;
+    }
+
+    if (!isMemory && StringRef(typeName).contains("ResettableLogic")) {
+      auto params = getDslTypeBindings(fieldType, &bindings);
+      if (params.size() >= 2) {
+        fieldWidths.push_back(params[0].getZExtValue());
+        fieldResetStyle.back() = params[1].getZExtValue();
+      } else {
+        fieldWidths.push_back(0);
+      }
+      fieldIsInstance.push_back(false);
+      fieldIsLogic.push_back(true);
       fieldModuleNames.push_back({});
       continue;
     }
@@ -1741,6 +1756,23 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         return success();
       };
 
+      if (callee.contains("ResettableLogic::") &&
+          callee.contains("__init__") &&
+          !callee.contains("__init__(move:")) {
+        unsigned width = getCallParamWidth(op, &bindings);
+        Operation *valueOp = op->getOperand(0).getDefiningOp();
+        auto value =
+            valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
+        if (!width || !value)
+          return op->emitError()
+                 << "HDL lowering: unsupported ResettableLogic constructor";
+        Value val = hw::ConstantOp::create(builder, loc,
+                                           value->zextOrTrunc(width));
+        Value xz = hw::ConstantOp::create(builder, loc,
+                                          llvm::APInt(width, 0));
+        return storeResult(op->getOperand(1), {val, xz});
+      }
+
       if (callee.contains("mux_logic")) {
         if (op->getNumOperands() != 4)
           return op->emitError() << "HDL lowering: unexpected mux_logic form";
@@ -1832,7 +1864,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           return storeResult(op->getOperand(1),
                              {bitNot(source.val), source.xz});
         if (callee.contains("Logic::copy") ||
-            callee.contains("Logic::__init__"))
+            callee.contains("Logic::__init__") ||
+            callee.contains("ResettableLogic::get"))
           return storeResult(op->getOperand(1), source);
       }
 
