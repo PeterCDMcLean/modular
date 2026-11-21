@@ -270,6 +270,52 @@ static Type getHwType(Type type) {
   return IntegerType::get(type.getContext(), width);
 }
 
+/// Decode an integer from a typed parameter attribute.
+static std::optional<llvm::APInt> getTypedAttrInt(TypedAttr attr) {
+  if (auto intAttr = dyn_cast<IntegerAttr>(attr))
+    return intAttr.getValue();
+  if (auto simd = dyn_cast<KGEN::SIMDAttr>(attr)) {
+    if (simd.getValues().size() == 1)
+      return simd.getValues()[0].getIntVal();
+  }
+  return std::nullopt;
+}
+
+/// Return the source-level signature recorded on a method, if it is available.
+/// The lowered signature has already erased named DSL types into flat memory
+/// layouts; this one still says `Bits[8]`.
+static KGEN::FuncType getSourceFuncType(Operation *op) {
+  auto typeParam = dyn_cast_or_null<KGEN::TypeParamAttr>(
+      op->getAttr("sourceFuncTypeGenerator"));
+  if (!typeParam)
+    return {};
+  auto generator =
+      dyn_cast<KGEN::FuncTypeGeneratorType>(typeParam.getTypeValue());
+  if (!generator)
+    return {};
+  return generator.getBody();
+}
+
+/// Return the HDL bit width of a DSL port type. `Bits[W]`/`Logic[W]` source
+/// types carry `W` as a type parameter; anything else is resolved from its
+/// lowered representation.
+static unsigned getHdlWidth(Type type) {
+  if (auto ptr = dyn_cast<KGEN::PointerType>(type))
+    type = ptr.getElementType();
+  if (auto typeValue = dyn_cast<KGEN::TypeValueType>(type)) {
+    auto ref = dyn_cast<KGEN::TypeGeneratorRefAttr>(typeValue.getTypeValue());
+    auto name = ref ? ref.getSymbol().getLeafReference().getValue() : StringRef();
+    if (ref && (name.contains("Bits") || name.contains("Logic"))) {
+      auto params = ref.getParamValues();
+      if (!params.empty())
+        if (auto width = getTypedAttrInt(params.front()))
+          return static_cast<unsigned>(width->getZExtValue());
+    }
+    return 0;
+  }
+  return getBitWidth(type);
+}
+
 /// Return the generator type carrier of a `kgen.func` / `kgen.generator`.
 static KGEN::FuncTypeGeneratorType getFuncTypeGenerator(Operation *op) {
   if (auto gen = dyn_cast<KGEN::GeneratorOp>(op))
@@ -356,6 +402,7 @@ private:
   DenseMap<Value, unsigned> fieldPtrs;
   DenseMap<unsigned, Value> fieldRegs;
   Value selfPtr;
+  Value resultPtr;
   Value clk;
   bool hasState = false;
   Value trueConstant;
@@ -368,70 +415,83 @@ LogicalResult CirctModuleEmitter::collectPorts() {
   llvm::StringSet<> seen;
 
   for (Operation *fn : methods) {
-    auto func = dyn_cast<FunctionOpInterface>(fn);
-    if (!func)
-      continue;
     auto funcType = getFuncTypeGenerator(fn);
     if (!funcType)
       continue;
     auto body = funcType.getBody();
+    auto sourceFunc = getSourceFuncType(fn);
 
+    auto methodKey = symbolSourcePrefix(
+        fn->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName())
+            .getValue());
+    ArrayAttr argNames;
+    if (auto dict = source->getAttrOfType<DictionaryAttr>(kHdlArgNamesAttr))
+      argNames = dyn_cast_or_null<ArrayAttr>(dict.get(methodKey));
     ArrayAttr returnNames;
-    if (auto dict = source->getAttrOfType<DictionaryAttr>(kHdlReturnNamesAttr)) {
-      auto key = symbolSourcePrefix(
-          fn->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName())
-              .getValue());
-      returnNames = dyn_cast_or_null<ArrayAttr>(dict.get(key));
-    }
+    if (auto dict = source->getAttrOfType<DictionaryAttr>(kHdlReturnNamesAttr))
+      returnNames = dyn_cast_or_null<ArrayAttr>(dict.get(methodKey));
 
-    // Inputs: argument 0 is `self` for every method.
+    unsigned outputIndex = 0;
+
+    // Inputs and by-ref outputs, walking the source signature so that named
+    // DSL types keep their declared width.
     unsigned argIndex = 0;
     for (Type argType : body.getArguments()) {
-      unsigned signatureIndex = argIndex++;
-      if (signatureIndex == 0)
-        continue;
-      unsigned width = getBitWidth(argType);
+      unsigned index = argIndex++;
+      if (index == 0)
+        continue; // `self`
+      bool isResult = sourceFunc &&
+                      sourceFunc.getArgConvention(index) ==
+                          ArgConvention::ByRefResult;
+      Type sourceType = sourceFunc ? sourceFunc.getArgument(index) : argType;
+      unsigned width = getHdlWidth(sourceType);
+      if (!width)
+        width = getHdlWidth(argType);
       if (!width) {
-        fn->emitError() << "HDL lowering: unsupported port type " << argType;
+        fn->emitError() << "HDL lowering: unsupported port type " << sourceType;
         return failure();
       }
+
       std::string name;
-      if (auto dict = source->getAttrOfType<DictionaryAttr>(kHdlArgNamesAttr)) {
-        auto methodKey = symbolSourcePrefix(
-            fn->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName())
-                .getValue());
-        if (auto names = dyn_cast_or_null<ArrayAttr>(dict.get(methodKey)))
-          if (signatureIndex < names.size())
-            name = cast<StringAttr>(names[signatureIndex]).getValue().str();
+      if (isResult) {
+        if (returnNames && outputIndex < returnNames.size())
+          name = cast<StringAttr>(returnNames[outputIndex]).getValue().str();
+        if (name.empty())
+          name = outputIndex == 0 ? "out" : "out" + std::to_string(outputIndex);
+        ++outputIndex;
+      } else {
+        if (argNames && index < argNames.size())
+          name = cast<StringAttr>(argNames[index]).getValue().str();
+        if (name.empty() || name == "self")
+          name = "arg" + std::to_string(index);
       }
-      if (name.empty() || name == "self")
-        name = "arg" + std::to_string(signatureIndex);
       if (!seen.insert(name).second) {
         fn->emitError() << "HDL lowering: duplicate port name '" << name << "'";
         return failure();
       }
-      ports.push_back({name, width, /*isInput=*/true});
+      ports.push_back({name, width, /*isInput=*/!isResult});
     }
 
-    // Outputs.
-    unsigned outIndex = 0;
+    // By-value results (the primitive DSL path returns scalars directly).
     for (Type resType : body.getResults()) {
-      unsigned width = getBitWidth(resType);
+      if (isa<KGEN::NoneType>(resType))
+        continue;
+      unsigned width = getHdlWidth(resType);
       if (!width) {
         fn->emitError() << "HDL lowering: unsupported port type " << resType;
         return failure();
       }
       std::string name;
-      if (returnNames && outIndex < returnNames.size())
-        name = cast<StringAttr>(returnNames[outIndex]).getValue().str();
+      if (returnNames && outputIndex < returnNames.size())
+        name = cast<StringAttr>(returnNames[outputIndex]).getValue().str();
       if (name.empty())
-        name = outIndex == 0 ? "out" : "out" + std::to_string(outIndex);
+        name = outputIndex == 0 ? "out" : "out" + std::to_string(outputIndex);
+      ++outputIndex;
       if (!seen.insert(name).second) {
         fn->emitError() << "HDL lowering: duplicate port name '" << name << "'";
         return failure();
       }
       ports.push_back({name, width, /*isInput=*/false});
-      ++outIndex;
     }
   }
   return success();
@@ -502,16 +562,19 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
   StringRef name = op->getName().getStringRef();
 
   if (name == "hlcf.return") {
-    if (op->getNumOperands() != 1)
-      return op->emitError()
-             << "HDL lowering: expected exactly one return value";
-    returnValue = getValue(op->getOperand(0));
-    if (!returnValue)
-      return op->emitError() << "HDL lowering: return value was not lowered";
-    return success();
+    if (op->getNumOperands() == 1)
+      if (Value value = getValue(op->getOperand(0)))
+        returnValue = value;
+    // Memory-only results are written through the by-ref result pointer and
+    // `return` itself yields `none`.
+    if (returnValue)
+      return success();
+    return op->emitError() << "HDL lowering: return value was not lowered";
   }
 
   if (name == "kgen.param.constant" || name == "pop.constant") {
+    if (op->getAttrOfType<KGEN::NoneAttr>("value"))
+      return success();
     if (auto value = getConstantBool(op)) {
       values[op->getResult(0)] = getConstant(*value);
       return success();
@@ -527,6 +590,80 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
 
   if (name == "kgen.call") {
     StringRef callee = callCalleeName(op);
+
+    // `Bits[W]` methods lower directly to `comb` ops. The DSL returns values
+    // through a stack slot, so a binary call is `(lhs, rhs, out-ptr)`.
+    if (callee.contains("Bits::")) {
+      if (op->getNumOperands() == 3) {
+        Value lhs = getValue(op->getOperand(0));
+        Value rhs = getValue(op->getOperand(1));
+        if (!lhs || !rhs)
+          return op->emitError()
+                 << "HDL lowering: Bits operand was not lowered";
+        Value result;
+        if (callee.contains("::__add__"))
+          result = comb::AddOp::create(builder, loc, lhs, rhs);
+        else if (callee.contains("::__sub__"))
+          result = comb::SubOp::create(builder, loc, lhs, rhs);
+        else if (callee.contains("::__and__"))
+          result = comb::AndOp::create(builder, loc, lhs, rhs);
+        else if (callee.contains("::__or__"))
+          result = comb::OrOp::create(builder, loc, lhs, rhs);
+        else if (callee.contains("::__xor__"))
+          result = comb::XorOp::create(builder, loc, lhs, rhs);
+        else if (callee.contains("::__eq__"))
+          result = comb::ICmpOp::create(builder, loc, comb::ICmpPredicate::eq,
+                                        lhs, rhs);
+        else if (callee.contains("::__ne__"))
+          result = comb::ICmpOp::create(builder, loc, comb::ICmpPredicate::ne,
+                                        lhs, rhs);
+        else if (callee.contains("::__lt__"))
+          result = comb::ICmpOp::create(builder, loc, comb::ICmpPredicate::ult,
+                                        lhs, rhs);
+        else if (callee.contains("::__le__"))
+          result = comb::ICmpOp::create(builder, loc, comb::ICmpPredicate::ule,
+                                        lhs, rhs);
+        if (!result)
+          return op->emitError() << "HDL lowering: unsupported Bits call '"
+                                 << callee << "'";
+        values[op->getOperand(2)] = result;
+        return success();
+      }
+      if (op->getNumOperands() == 2) {
+        Value source = getValue(op->getOperand(0));
+        if (!source)
+          return op->emitError()
+                 << "HDL lowering: Bits operand was not lowered";
+        if (callee.contains("::__invert__")) {
+          unsigned width = source.getType().getIntOrFloatBitWidth();
+          auto ones = hw::ConstantOp::create(builder, loc,
+                                             llvm::APInt::getAllOnes(width));
+          values[op->getOperand(1)] =
+              comb::XorOp::create(builder, loc, source, ones);
+          return success();
+        }
+        if (callee.contains("Bits::bit(")) {
+          Operation *indexOp = op->getOperand(1).getDefiningOp();
+          auto index = indexOp ? getConstantInt(indexOp) : std::nullopt;
+          if (!index || !index->isIntN(32))
+            return op->emitError()
+                   << "HDL lowering: Bits::bit needs a constant index";
+          values[op->getResult(0)] = comb::ExtractOp::create(
+              builder, loc, source, static_cast<int32_t>(index->getZExtValue()),
+              /*bitWidth=*/1);
+          return success();
+        }
+        if (callee.contains("Bits::__init__")) {
+          // Move the computed value into the by-ref result slot.
+          if (op->getOperand(1) == resultPtr)
+            returnValue = source;
+          return success();
+        }
+      }
+      return op->emitError() << "HDL lowering: unsupported Bits call '" << callee
+                             << "'";
+    }
+
     Value operand = op->getNumOperands() == 1 ? getValue(op->getOperand(0))
                                               : Value();
     if (callee.contains("::__bool__")) {
@@ -712,13 +849,20 @@ LogicalResult CirctModuleEmitter::build() {
 
   Block *body = builtModule.getBodyBlock();
   size_t portIndex = 0;
-  size_t argIndex = 0;
   for (Operation *fn : methods) {
     auto func = cast<FunctionOpInterface>(fn);
+    auto sourceFunc = getSourceFuncType(fn);
     Block &entry = func.getFunctionBody().front();
+    unsigned argIndex = 0;
     for (BlockArgument arg : entry.getArguments()) {
-      if (argIndex++ == 0) {
+      unsigned index = argIndex++;
+      if (index == 0) {
         selfPtr = arg;
+        continue;
+      }
+      if (sourceFunc && sourceFunc.getArgConvention(index) ==
+                            ArgConvention::ByRefResult) {
+        resultPtr = arg;
         continue;
       }
       values[arg] = body->getArgument(portIndex++);
@@ -731,6 +875,8 @@ LogicalResult CirctModuleEmitter::build() {
     builder.setInsertionPoint(body->getTerminator());
     if (failed(emitOps(fn, returnValue)))
       return failure();
+    if (!returnValue)
+      return fn->emitError() << "HDL lowering: no value for module output";
 
     // `hw.module` was built with a terminator; fill in the outputs.
     auto output = cast<hw::OutputOp>(body->getTerminator());
