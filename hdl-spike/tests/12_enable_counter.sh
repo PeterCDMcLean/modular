@@ -28,7 +28,10 @@ fi
     "$root/hdl-spike/designs/12_enable_counter.mojo"
 diff -u "$root/hdl-spike/expected/12_enable_counter.mlir" "$out/12_enable_counter.mlir"
 grep -q 'in %en : i1' "$out/12_enable_counter.mlir"
-grep -q 'comb.mux %en' "$out/12_enable_counter.mlir"
+grep -q 'hw.module @EnableIfElse' "$out/12_enable_counter.mlir"
+grep -q 'seq.compreg.ce' "$out/12_enable_counter.mlir"
+grep -q '%clk, %en' "$out/12_enable_counter.mlir"
+[ "$(grep -c 'seq.compreg.ce' "$out/12_enable_counter.mlir")" = "1" ]
 grep -q 'seq.compreg' "$out/12_enable_counter.mlir"
 
 "$MOJO" build --emit=sv -o "$out/12_enable_counter.raw.sv" "${inc[@]}" \
@@ -36,6 +39,7 @@ grep -q 'seq.compreg' "$out/12_enable_counter.mlir"
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' "$out/12_enable_counter.raw.sv" \
     | grep -v '^$' > "$out/12_enable_counter.sv"
 diff -u "$root/hdl-spike/expected/12_enable_counter.sv" "$out/12_enable_counter.sv"
-grep -q 'en ? _GEN_0 + 12.h1 : _GEN_0' "$out/12_enable_counter.sv"
+grep -q 'else if (en)' "$out/12_enable_counter.sv"
+grep -q '~en ?' "$out/12_enable_counter.sv"
 
 echo "12_enable_counter: ok"

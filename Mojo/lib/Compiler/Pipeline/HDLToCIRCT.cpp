@@ -493,6 +493,7 @@ private:
   LogicalResult emitBlock(Block &block, Value condition, Value &returnValue);
   LogicalResult emitOp(Operation *op, Value condition, Value &returnValue);
   void storeField(unsigned fieldIndex, Value value, Value condition);
+  void convertCEToPlain(unsigned fieldIndex);
   Operation *findBuiltModule(StringRef name);
   Value getValue(Value value);
   LogicValue getLogicValue(Value value);
@@ -523,6 +524,8 @@ private:
   DenseMap<Value, unsigned> instancePtrs;
   DenseMap<unsigned, Value> fieldRegs;
   DenseMap<unsigned, Value> fieldNext;
+  DenseMap<unsigned, Value> fieldEnable;
+  DenseMap<unsigned, bool> fieldMuxed;
   DenseMap<unsigned, llvm::APInt> resetValues;
   SmallVector<unsigned> fieldWidths;
   SmallVector<unsigned> methodOutputCounts;
@@ -1016,13 +1019,75 @@ Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
   return reg;
 }
 
+void CirctModuleEmitter::convertCEToPlain(unsigned fieldIndex) {
+  Value reg = fieldRegs.lookup(fieldIndex);
+  auto ce = reg ? reg.getDefiningOp<seq::CompRegClockEnabledOp>() : nullptr;
+  if (!ce)
+    return;
+  OpBuilder::InsertionGuard guard(builder);
+  builder.setInsertionPoint(ce);
+  Value input = fieldNext.lookup(fieldIndex);
+  auto plain = seq::CompRegOp::create(builder, loc, input, clk, ce.getReset(),
+                                      ce.getResetValue(),
+                                      ce.getInitialValue());
+  ce.getResult().replaceAllUsesWith(plain.getResult());
+  ce.erase();
+  fieldRegs[fieldIndex] = plain;
+}
+
 void CirctModuleEmitter::storeField(unsigned fieldIndex, Value value,
                                     Value condition) {
   Value reg = getOrCreateReg(fieldIndex, value.getType());
+  bool logicField =
+      fieldIndex < fieldIsLogic.size() && fieldIsLogic[fieldIndex];
+  bool muxed = fieldMuxed.lookup(fieldIndex);
+
+  // Prefer a clock-enabled register when the first write is conditional and
+  // every write shares the same enable. Mixed conditions fall back to an
+  // input mux.
+  if (condition && !logicField && !muxed) {
+    if (auto ce = reg.getDefiningOp<seq::CompRegClockEnabledOp>()) {
+      Value existing = fieldEnable.lookup(fieldIndex);
+      if (existing == condition) {
+        ce->setOperand(0, value);
+        fieldNext[fieldIndex] = value;
+        return;
+      }
+      convertCEToPlain(fieldIndex);
+      reg = fieldRegs[fieldIndex];
+      muxed = true;
+      fieldMuxed[fieldIndex] = true;
+      fieldEnable.erase(fieldIndex);
+    } else if (auto plain = reg.getDefiningOp<seq::CompRegOp>()) {
+      if (value != reg) {
+        OpBuilder::InsertionGuard guard(builder);
+        builder.setInsertionPoint(plain);
+        std::string name = "reg_" + std::to_string(fieldIndex);
+        auto newReg = seq::CompRegClockEnabledOp::create(
+            builder, loc, value, clk, condition, plain.getReset(),
+            plain.getResetValue(), name, plain.getInitialValue());
+        plain.getResult().replaceAllUsesWith(newReg.getResult());
+        plain.erase();
+        fieldRegs[fieldIndex] = newReg;
+        fieldNext[fieldIndex] = value;
+        fieldEnable[fieldIndex] = condition;
+        return;
+      }
+    }
+  }
+
+  // An unconditional write disables any clock enable established earlier.
+  if (!condition) {
+    if (auto ce = reg.getDefiningOp<seq::CompRegClockEnabledOp>()) {
+      convertCEToPlain(fieldIndex);
+      fieldEnable.erase(fieldIndex);
+      fieldMuxed[fieldIndex] = true;
+      reg = fieldRegs[fieldIndex];
+    }
+  }
+
   Value hold = fieldNext.lookup(fieldIndex);
   Value next = value;
-  // A conditional write holds the previous next-state value when disabled,
-  // which is the input-mux form of a clock enable.
   if (condition && hold)
     next = comb::MuxOp::create(builder, loc, condition, value, hold);
   fieldNext[fieldIndex] = next;

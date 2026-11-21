@@ -5,15 +5,15 @@ module ChildCounter(
   output [7:0] out
 );
   wire      [7:0] _GEN;
-  var logic [7:0] _GEN_0 = 8'h0;
+  var logic [7:0] reg_0 = 8'h0;
   always @(posedge clk) begin
     if (rst)
-      _GEN_0 <= 8'h0;
-    else
-      _GEN_0 <= _GEN;
+      reg_0 <= 8'h0;
+    else if (en)
+      reg_0 <= _GEN;
   end
-  assign _GEN = en ? _GEN_0 + 8'h1 : _GEN_0;
-  assign out = _GEN_0;
+  assign _GEN = reg_0 + 8'h1;
+  assign out = reg_0;
 endmodule
 module Parent(
   input        en,
