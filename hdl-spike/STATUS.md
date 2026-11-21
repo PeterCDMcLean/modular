@@ -21,8 +21,8 @@ Build and test record:
 * Mojo (`-c opt`, same targets plus `//Mojo/stdlib/std`): **green**,
   1,188.7 s, 8,639 actions.
 * `hdl-spike/tests/run_all.sh`: **green** in both `-c dbg` and `-c opt`
-  (00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09). `--emit=circt` and `--emit=sv`
-  run in-process.
+  (00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10). `--emit=circt` and
+  `--emit=sv` run in-process.
 * Verilator lint: skipped (not installed).
 * CLI adaptation: the current compiler uses `-I <dir>`; the tests were updated
   from `-mojo-search-paths`.
@@ -35,11 +35,12 @@ Build and test record:
 | 1. LIT/early-KGEN hook | **green** | `designs/01_inv.mojo`, `designs/02_stateful_dump.mojo` | Hook is after `LowerLIT`, **before** `ElaborateGenerators` (see "Insertion point"); `--emit=circt --hdl-dump-ir` prints the IR the pass consumes. |
 | 2. Lower `Inv` → `hw`/`comb` | **green** | `designs/01_inv.mojo` | Emitted MLIR is byte-identical to `expected/01_inv.mlir`; the operations are real CIRCT `hw`/`comb` ops built in-process. `--emit=sv` exports SystemVerilog **in-process** through CIRCT's ExportVerilog (no `circt-opt` subprocess), matching `expected/01_inv.sv` after comment/blank-line normalization. |
 | Type layer | **green (prototype)** | `hdl/bits.mojo`, `hdl/logic.mojo` | `Bits[W]` wraps bitlib's `BitInteger[W]` with stable result types; `Logic[W]` adds a 4-state value+mask. Native Sim tests cover add/mux/wrap and X/Z propagation (`03_sim_types`). |
-| 3. Widths and arithmetic | **green (combinational)** | `designs/03_add8.mojo`, `designs/06_bits_ops.mojo`, `designs/07_bits_bit.mojo` | Primitive `UInt8` add lowers to `comb.add` (`04_add8`). The compiler now reads the *source* signature, so `Bits[W]` keeps its declared width at ports: a `Bits[12]` module lowers add/sub/and/or/xor/invert to `comb` ops (`06_bits_ops`), and `a.bit(3)` to `comb.extract` (`07_bits_bit`). A `Bits[W]` by-ref result is recognized from the `byref_result` argument convention and written to `hw.output`. Still missing: variable indices, `Logic[W]` (4-state) lowering, and `Bits` state. |
+| 3. Widths and arithmetic | **green (combinational)** | `designs/03_add8.mojo`, `designs/06_bits_ops.mojo`, `designs/07_bits_bit.mojo`, `designs/10_var_bit.mojo` | Primitive `UInt8` add lowers to `comb.add` (`04_add8`). The compiler now reads the *source* signature, so `Bits[W]` keeps its declared width at ports: a `Bits[12]` module lowers add/sub/and/or/xor/invert to `comb` ops (`06_bits_ops`), and `a.bit(3)` to `comb.extract` (`07_bits_bit`). A dynamic `a.bit(i)` lowers to `comb.shru` plus `comb.extract`, with the index truncated to `W` bits (`10_var_bit`). `index`/`uindex` ports map to 64-bit values. A `Bits[W]` by-ref result is recognized from the `byref_result` argument convention and written to `hw.output`. Still missing: `Logic[W]` (4-state) lowering. |
 | 4. Registers/reset | **partial** | `designs/04_counter.mojo`, `designs/08_bits_counter.mojo`, `designs/09_preset_counter.mojo` | A primitive struct field store/load becomes `seq.compreg` (`05_counter`). `Bits[W]` fields are decoded from the source struct definition, so a `Bits[12]` counter lowers to a 12-bit register (`08_bits_counter`). Constructor constants are decoded as reset values: `self.count = Bits[12](5)` produces `seq.compreg ... reset %rst, %c5_i12` and `if (rst) q <= 12'h5;` under an ambient `rst` port (`09_preset_counter`). Power-on (`initial`), reset polarity/style options, and enable gating are not implemented yet. |
 | 5–10 | not started | — | — |
 
-`tests/run_all.sh` runs 00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, and 09; all pass.
+`tests/run_all.sh` runs 00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09, and 10;
+all pass.
 
 **Second phase (combined CIRCT/LLVM lowering).** The compiler now builds *real*
 CIRCT ops. CIRCT is a **git submodule** at `third_party/circt` pointing at the

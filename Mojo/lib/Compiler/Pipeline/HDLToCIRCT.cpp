@@ -253,6 +253,9 @@ static unsigned getBitWidth(Type type) {
     // `kBool` occupies a byte in memory but is one bit on a wire.
     if (dtype->isBool())
       return static_cast<unsigned>(*size);
+    // `index`/`uindex` are pointer-sized integers; use the host width.
+    if (dtype->isIndex() || dtype->isUIndex())
+      return static_cast<unsigned>(64 * *size);
     if (!dtype->isInt() && !dtype->isFloat())
       return 0;
     return static_cast<unsigned>(dtype->getWidthInBits() * *size);
@@ -828,12 +831,33 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
         if (callee.contains("Bits::bit(")) {
           Operation *indexOp = op->getOperand(1).getDefiningOp();
           auto index = indexOp ? getConstantInt(indexOp) : std::nullopt;
-          if (!index || !index->isIntN(32))
+          if (index && index->isIntN(32)) {
+            values[op->getResult(0)] = comb::ExtractOp::create(
+                builder, loc, source,
+                static_cast<int32_t>(index->getZExtValue()),
+                /*bitWidth=*/1);
+            return success();
+          }
+          // Dynamic select: shift the requested bit down to bit zero.
+          Value indexValue = getValue(op->getOperand(1));
+          if (!indexValue)
             return op->emitError()
-                   << "HDL lowering: Bits::bit needs a constant index";
-          values[op->getResult(0)] = comb::ExtractOp::create(
-              builder, loc, source, static_cast<int32_t>(index->getZExtValue()),
-              /*bitWidth=*/1);
+                   << "HDL lowering: Bits::bit index was not lowered";
+          unsigned width = source.getType().getIntOrFloatBitWidth();
+          unsigned indexWidth = indexValue.getType().getIntOrFloatBitWidth();
+          if (indexWidth > width) {
+            indexValue =
+                comb::ExtractOp::create(builder, loc, indexValue, 0, width);
+          } else if (indexWidth < width) {
+            auto zeros = hw::ConstantOp::create(
+                builder, loc, llvm::APInt(width - indexWidth, 0));
+            indexValue = comb::ConcatOp::create(
+                builder, loc, ArrayRef<Value>{zeros, indexValue});
+          }
+          Value shifted =
+              comb::ShrUOp::create(builder, loc, source, indexValue);
+          values[op->getResult(0)] =
+              comb::ExtractOp::create(builder, loc, shifted, 0, 1);
           return success();
         }
         if (callee.contains("Bits::__init__")) {
