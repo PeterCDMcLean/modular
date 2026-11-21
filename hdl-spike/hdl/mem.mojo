@@ -22,6 +22,12 @@ struct Mem[W: Int = 8, N: Int = 4](Copyable, Movable):
         for _ in range(Self.N):
             self.data.append(Bits[Self.W]())
 
+    def __init__(out self, fill: Int):
+        """Constructs N words initialized to `fill`."""
+        self.data = List[Bits[Self.W]]()
+        for _ in range(Self.N):
+            self.data.append(Bits[Self.W](fill))
+
     def write(mut self, index: Int, value: Bits[Self.W], enable: Bool = True):
         """Writes `value` at `index` when `enable`."""
         if enable:

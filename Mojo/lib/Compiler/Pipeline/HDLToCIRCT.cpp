@@ -822,7 +822,8 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
       StringRef callee = callCalleeName(&op);
       if (!callee.contains("Bits::__init__") &&
           !callee.contains("Logic::__init__") &&
-          !callee.contains("Resettable::__init__"))
+          !callee.contains("Resettable::__init__") &&
+          !callee.contains("Mem::__init__"))
         continue;
       // A direct `Bits[W](constant)` assignment can initialize the field
       // through the field pointer without a temporary.
@@ -989,12 +990,18 @@ CirctModuleEmitter::getOrCreateMemory(unsigned fieldIndex) {
   unsigned depth = fieldMemDepths[fieldIndex];
   auto type = IntegerType::get(builder.getContext(), width);
   auto zero = hw::ConstantOp::create(builder, loc, type, 0);
-  auto resetValue = hw::ConstantOp::create(builder, loc, type, 0);
+  llvm::APInt resetBits(width, 0);
+  if (auto value = resetValues.find(fieldIndex); value != resetValues.end())
+    resetBits = value->second.zextOrTrunc(width);
+  llvm::APInt initialBits = resetBits;
+  if (powerOnValue)
+    initialBits = powerOnValue->zextOrTrunc(width);
+  auto resetValue = hw::ConstantOp::create(builder, loc, resetBits);
   auto ceZero =
       hw::ConstantOp::create(builder, loc, builder.getIntegerType(1), 0);
   Value reset = (resetStyle & 1) ? bitNot(resetSignal) : resetSignal;
   auto initial = seq::createConstantInitialValue(
-      builder, loc, IntegerAttr::get(type, llvm::APInt(width, 0)));
+      builder, loc, IntegerAttr::get(type, initialBits));
   for (unsigned k = 0; k < depth; ++k) {
     auto name = StringAttr::get(
         builder.getContext(),
