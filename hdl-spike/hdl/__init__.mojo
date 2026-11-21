@@ -25,3 +25,15 @@ struct ResetStyle[style: Int = 0](Copyable, Movable):
 
     def __init__(out self):
         pass
+
+
+struct PowerOn[value: Int = 0](Copyable, Movable):
+    """Ambient power-on value for a `@module` struct's state.
+
+    The compiler reads `value` as the initial/preset value of every state
+    register, independently of the constructor-derived reset value. The field
+    itself has no hardware representation.
+    """
+
+    def __init__(out self):
+        pass

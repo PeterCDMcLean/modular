@@ -543,7 +543,8 @@ private:
   Value bitNot(Value value);
   Value getConstant(bool value);
   Value getOrCreateReg(unsigned fieldIndex, Type type);
-  Value createRegister(unsigned id, Type type, llvm::APInt resetValue);
+  Value createRegister(unsigned id, Type type, llvm::APInt resetValue,
+                        llvm::APInt initialValue);
 
   ModuleOp source;
   StringRef structName;
@@ -582,6 +583,7 @@ private:
   SmallVector<bool> fieldIsLogic;
   SmallVector<bool> fieldIsConfig;
   int resetStyle = 0;
+  std::optional<llvm::APInt> powerOnValue;
   Value selfPtr;
   Value resultPtr;
   Value returnXz;
@@ -872,11 +874,17 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     std::string typeName = getDslTypeName(fieldType).str();
     fieldStructNames.push_back(typeName);
 
-    bool isConfig = StringRef(typeName).contains("ResetStyle");
+    bool isPowerOn = StringRef(typeName).contains("PowerOn");
+    bool isConfig =
+        StringRef(typeName).contains("ResetStyle") || isPowerOn;
     fieldIsConfig.push_back(isConfig);
     if (isConfig) {
-      if (auto style = getDslTypeBinding(fieldType, &bindings))
-        resetStyle = static_cast<int>(style->getZExtValue());
+      if (auto value = getDslTypeBinding(fieldType, &bindings)) {
+        if (isPowerOn)
+          powerOnValue = *value;
+        else
+          resetStyle = static_cast<int>(value->getZExtValue());
+      }
       fieldWidths.push_back(0);
       fieldIsInstance.push_back(false);
       fieldIsLogic.push_back(false);
@@ -992,8 +1000,11 @@ CirctModuleEmitter::getOrCreateLogicReg(unsigned fieldIndex, unsigned width) {
     resetValue = value->second.zextOrTrunc(width);
   llvm::APInt zeroValue(width, 0);
 
-  Value valReg = createRegister(fieldIndex * 2, type, resetValue);
-  Value xzReg = createRegister(fieldIndex * 2 + 1, type, zeroValue);
+  llvm::APInt initialValue = resetValue;
+  if (powerOnValue)
+    initialValue = powerOnValue->zextOrTrunc(width);
+  Value valReg = createRegister(fieldIndex * 2, type, resetValue, initialValue);
+  Value xzReg = createRegister(fieldIndex * 2 + 1, type, zeroValue, zeroValue);
   LogicValue regs{valReg, xzReg};
   logicRegs[fieldIndex] = regs;
   logicNext[fieldIndex] = regs;
@@ -1044,7 +1055,8 @@ Value CirctModuleEmitter::getConstant(bool value) {
 }
 
 Value CirctModuleEmitter::createRegister(unsigned id, Type type,
-                                         llvm::APInt resetValue) {
+                                         llvm::APInt resetValue,
+                                         llvm::APInt initialValue) {
   auto zero = hw::ConstantOp::create(builder, loc, type, 0);
   auto resetConstant = hw::ConstantOp::create(builder, loc, resetValue);
   bool activeLow = (resetStyle & 1) != 0;
@@ -1056,14 +1068,14 @@ Value CirctModuleEmitter::createRegister(unsigned id, Type type,
     return seq::FirRegOp::create(
         builder, loc, zero, clk, name, reset, resetConstant,
         hw::InnerSymAttr(), /*isAsync=*/true,
-        /*preset=*/IntegerAttr::get(type, resetValue));
+        /*preset=*/IntegerAttr::get(type, initialValue));
   }
   // Power-on value: the same constructor-derived constant, wrapped in
   // `seq.initial` so it is a true initializer rather than reset logic.
-  auto initialValue = seq::createConstantInitialValue(
-      builder, loc, IntegerAttr::get(type, resetValue));
+  auto initial = seq::createConstantInitialValue(
+      builder, loc, IntegerAttr::get(type, initialValue));
   return seq::CompRegOp::create(builder, loc, zero, clk, reset, resetConstant,
-                                initialValue);
+                                initial);
 }
 
 Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
@@ -1074,7 +1086,10 @@ Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
   llvm::APInt resetValue(width, 0);
   if (auto value = resetValues.find(fieldIndex); value != resetValues.end())
     resetValue = value->second.zextOrTrunc(width);
-  Value reg = createRegister(fieldIndex, type, resetValue);
+  llvm::APInt initialValue = resetValue;
+  if (powerOnValue)
+    initialValue = powerOnValue->zextOrTrunc(width);
+  Value reg = createRegister(fieldIndex, type, resetValue, initialValue);
   fieldRegs[fieldIndex] = reg;
   fieldNext[fieldIndex] = reg;
   return reg;
