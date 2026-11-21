@@ -296,6 +296,30 @@ static KGEN::FuncType getSourceFuncType(Operation *op) {
   return generator.getBody();
 }
 
+/// Resolve a field/parameter type attribute to the type that carries the DSL
+/// type value (`Bits[W]`, a `SIMD` scalar, ...).
+static Type getTypeFromAttr(TypedAttr attr) {
+  if (!attr)
+    return {};
+  if (auto typeParam = dyn_cast<KGEN::TypeParamAttr>(attr))
+    return typeParam.getTypeValue();
+  return attr.getType();
+}
+
+/// Return the first callee type parameter as a bit width, if present. Filled
+/// by a `Bits[W]` method, this is `W`.
+static unsigned getCallParamWidth(Operation *op) {
+  auto symbol = KGEN::FuncSymbolGenerator::dynCast(op->getAttr("callee"));
+  if (!symbol)
+    return 0;
+  auto params = symbol.getParamValues();
+  if (params.empty())
+    return 0;
+  if (auto width = getTypedAttrInt(params.front()))
+    return static_cast<unsigned>(width->getZExtValue());
+  return 0;
+}
+
 /// Return the HDL bit width of a DSL port type. `Bits[W]`/`Logic[W]` source
 /// types carry `W` as a type parameter; anything else is resolved from its
 /// lowered representation.
@@ -383,6 +407,7 @@ private:
   };
 
   LogicalResult collectPorts();
+  LogicalResult collectFieldWidths();
   LogicalResult findMethods();
   LogicalResult emitOps(Operation *fn, Value &returnValue);
   LogicalResult emitOp(Operation *op, Value &returnValue);
@@ -399,8 +424,10 @@ private:
   SmallVector<Operation *> methods;
 
   DenseMap<Value, Value> values;
+  DenseMap<Value, llvm::APInt> intConstants;
   DenseMap<Value, unsigned> fieldPtrs;
   DenseMap<unsigned, Value> fieldRegs;
+  SmallVector<unsigned> fieldWidths;
   Value selfPtr;
   Value resultPtr;
   Value clk;
@@ -497,6 +524,34 @@ LogicalResult CirctModuleEmitter::collectPorts() {
   return success();
 }
 
+LogicalResult CirctModuleEmitter::collectFieldWidths() {
+  Operation *structOp = nullptr;
+  for (Operation &op : source.getBody()->getOperations()) {
+    auto symbol = op.getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName());
+    if (!symbol || symbol.getValue() != structName)
+      continue;
+    if (isa<KGEN::StructGeneratorOp>(op) || isa<KGEN::StructInstanceOp>(op)) {
+      structOp = &op;
+      break;
+    }
+  }
+  if (!structOp)
+    return success();
+
+  Type domainType;
+  if (auto generator = dyn_cast<KGEN::StructGeneratorOp>(structOp))
+    domainType = generator.getValueDomainType();
+  else
+    domainType = cast<KGEN::StructInstanceOp>(structOp).getValueDomainType();
+  auto structType = dyn_cast<StructInstanceType>(domainType);
+  if (!structType)
+    return success();
+
+  for (StructDefFieldAttr field : structType.getFields())
+    fieldWidths.push_back(getHdlWidth(getTypeFromAttr(field.getTypeValue())));
+  return success();
+}
+
 LogicalResult CirctModuleEmitter::findMethods() {
   std::string prefixStr = (structName + "::").str();
   StringRef prefix = prefixStr;
@@ -535,6 +590,25 @@ Value CirctModuleEmitter::getValue(Value value) {
   auto it = values.find(value);
   if (it != values.end())
     return it->second;
+  // Integer constants are materialized on first use so that values consumed
+  // directly by a lowering pattern (for example a `Bits[W]` constructor
+  // argument) do not leave dead operations behind.
+  auto constant = intConstants.find(value);
+  if (constant != intConstants.end()) {
+    Value result =
+        hw::ConstantOp::create(builder, loc, constant->second);
+    values[value] = result;
+    intConstants.erase(constant);
+    return result;
+  }
+  auto field = fieldPtrs.find(value);
+  if (field != fieldPtrs.end()) {
+    unsigned index = field->second;
+    if (index >= fieldWidths.size() || !fieldWidths[index])
+      return {};
+    auto type = IntegerType::get(value.getContext(), fieldWidths[index]);
+    return getOrCreateReg(index, type);
+  }
   return {};
 }
 
@@ -580,8 +654,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
       return success();
     }
     if (auto value = getConstantInt(op)) {
-      values[op->getResult(0)] =
-          hw::ConstantOp::create(builder, loc, *value);
+      intConstants[op->getResult(0)] = *value;
       return success();
     }
     return op->emitError()
@@ -630,6 +703,21 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
         return success();
       }
       if (op->getNumOperands() == 2) {
+        // `Bits[W](value)` constructs a value from an integer; it becomes a
+        // constant of the callee's declared width.
+        if (callee.contains("Bits::__init__") &&
+            !callee.contains("__init__(move:")) {
+          unsigned width = getCallParamWidth(op);
+          Operation *valueOp = op->getOperand(0).getDefiningOp();
+          auto value = valueOp ? getConstantInt(valueOp) : std::nullopt;
+          if (!width || !value)
+            return op->emitError()
+                   << "HDL lowering: unsupported Bits constructor argument";
+          values[op->getOperand(1)] =
+              hw::ConstantOp::create(builder, loc, value->zextOrTrunc(width));
+          return success();
+        }
+
         Value source = getValue(op->getOperand(0));
         if (!source)
           return op->emitError()
@@ -654,9 +742,23 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value &returnValue) {
           return success();
         }
         if (callee.contains("Bits::__init__")) {
-          // Move the computed value into the by-ref result slot.
+          // Move the computed value into a result slot or a state field.
+          if (op->getOperand(1) == resultPtr) {
+            returnValue = source;
+          } else if (auto field = fieldPtrs.find(op->getOperand(1));
+                     field != fieldPtrs.end()) {
+            Value reg = getOrCreateReg(field->second, source.getType());
+            reg.getDefiningOp()->setOperand(0, source);
+          } else {
+            values[op->getOperand(1)] = source;
+          }
+          return success();
+        }
+        if (callee.contains("Bits::copy")) {
           if (op->getOperand(1) == resultPtr)
             returnValue = source;
+          else
+            values[op->getOperand(1)] = source;
           return success();
         }
       }
@@ -807,7 +909,8 @@ LogicalResult CirctModuleEmitter::emitOps(Operation *fn, Value &returnValue) {
 }
 
 LogicalResult CirctModuleEmitter::build() {
-  if (failed(findMethods()) || failed(collectPorts()))
+  if (failed(findMethods()) || failed(collectFieldWidths()) ||
+      failed(collectPorts()))
     return failure();
 
   loc = source.getLoc();
