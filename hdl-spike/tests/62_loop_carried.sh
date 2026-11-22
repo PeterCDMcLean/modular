@@ -53,14 +53,4 @@ diff -u "$root/hdl-spike/expected/62_loop_carried.sv" \
 [ "$(grep -c 'else if (_GEN_9)' "$out/62_loop_carried.sv")" = "4" ]
 [ "$(grep -c 'assign out = reg_0;' "$out/62_loop_carried.sv")" = "2" ]
 
-# Logic payloads are not supported as carried state yet.
-if "$MOJO" build --emit=circt -o /dev/null "${inc[@]}" \
-    "$root/hdl-spike/designs/62_bad_logic_carried.mojo" \
-    > "$out/62_bad_logic_carried.out" 2>&1; then
-  echo "FAIL: loop-carried Logic state was accepted" >&2
-  exit 1
-fi
-grep -q 'loop-carried Logic state is not supported yet' \
-    "$out/62_bad_logic_carried.out"
-
 echo "62_loop_carried: ok"

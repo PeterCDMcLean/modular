@@ -862,10 +862,14 @@ private:
   DenseMap<Value, Value> loopCarriedRegs;
   DenseMap<Value, Value> loopCarriedNext;
   DenseMap<Value, Value> loopCarriedInit;
+  DenseMap<Value, LogicValue> loopCarriedLogicRegs;
+  DenseMap<Value, LogicValue> loopCarriedLogicNext;
+  DenseMap<Value, LogicValue> loopCarriedLogicInit;
   Value loopRunning;
   SmallVector<Value> collectLoopCarriedSlots(Block &block,
                                              Value inductionSlot);
   bool storeLoopCarried(Value slot, Value value, Value condition);
+  bool storeLoopCarriedLogic(Value slot, LogicValue value, Value condition);
 
   // Direct `self.child.<field>` accesses, diagnosed after every process has
   // been seen so the owning domain is known regardless of method order.
@@ -1562,6 +1566,22 @@ CirctModuleEmitter::collectLoopCarriedSlots(Block &block,
       add(op.getOperand(0));
   }
   return result;
+}
+
+bool CirctModuleEmitter::storeLoopCarriedLogic(Value slot, LogicValue value,
+                                               Value condition) {
+  auto next = loopCarriedLogicNext.find(slot);
+  if (next == loopCarriedLogicNext.end())
+    return false;
+  if (condition) {
+    next->second.val = comb::MuxOp::create(builder, loc, condition, value.val,
+                                           next->second.val);
+    next->second.xz = comb::MuxOp::create(builder, loc, condition, value.xz,
+                                          next->second.xz);
+  } else {
+    next->second = value;
+  }
+  return true;
 }
 
 bool CirctModuleEmitter::storeLoopCarried(Value slot, Value value,
@@ -3190,6 +3210,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       auto storeResult = [&](Value dest, LogicValue value) -> LogicalResult {
         if (!value)
           return failure();
+        if (storeLoopCarriedLogic(dest, value, condition))
+          return success();
         if (auto field = fieldPtrs.find(dest);
             field != fieldPtrs.end() &&
             field->second < fieldIsLogic.size() &&
@@ -4506,10 +4528,25 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
     running = createRegister(loopRegisterId++, i1Type, zeroBit, zeroBit,
                              resetStyle);
     for (Value carriedSlot : carried) {
-      if (getLogicValue(carriedSlot))
-        return loop->emitError()
-               << "HDL lowering: loop-carried Logic state is not supported "
-                  "yet";
+      if (LogicValue initial = getLogicValue(carriedSlot)) {
+        unsigned carriedWidth =
+            initial.val.getType().getIntOrFloatBitWidth();
+        auto carriedType =
+            IntegerType::get(builder.getContext(), carriedWidth);
+        llvm::APInt zeros(carriedWidth, 0);
+        Value valReg = createRegister(loopRegisterId++, carriedType, zeros,
+                                      zeros, resetStyle);
+        Value xzReg = createRegister(loopRegisterId++, carriedType, zeros,
+                                     zeros, resetStyle);
+        values[carriedSlot] = valReg;
+        logicValues[carriedSlot] = {valReg, xzReg};
+        slotConstants.erase(carriedSlot);
+        rangeValues.erase(carriedSlot);
+        loopCarriedLogicRegs[carriedSlot] = {valReg, xzReg};
+        loopCarriedLogicNext[carriedSlot] = {valReg, xzReg};
+        loopCarriedLogicInit[carriedSlot] = initial;
+        continue;
+      }
       Value initial = getValue(carriedSlot);
       if (!initial)
         return loop->emitError()
@@ -4623,6 +4660,19 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
         return loop->emitError()
                << "HDL lowering: unsupported carried register form";
     }
+    for (auto &[carriedSlot, regs] : loopCarriedLogicRegs) {
+      LogicValue bodyNext = loopCarriedLogicNext[carriedSlot];
+      LogicValue initial = loopCarriedLogicInit[carriedSlot];
+      Value valMuxed =
+          comb::MuxOp::create(builder, loc, running, bodyNext.val,
+                              initial.val);
+      Value xzMuxed = comb::MuxOp::create(builder, loc, running, bodyNext.xz,
+                                          initial.xz);
+      if (failed(setRegNext(regs.val, valMuxed)) ||
+          failed(setRegNext(regs.xz, xzMuxed)))
+        return loop->emitError()
+               << "HDL lowering: unsupported carried register form";
+    }
     Value notLast = bitNot(last);
     Value runningNext =
         comb::MuxOp::create(builder, loc, running, notLast,
@@ -4633,6 +4683,9 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
     loopCarriedRegs.clear();
     loopCarriedNext.clear();
     loopCarriedInit.clear();
+    loopCarriedLogicRegs.clear();
+    loopCarriedLogicNext.clear();
+    loopCarriedLogicInit.clear();
     loopRunning = Value();
   }
   if (loopStack.empty() && branchPath.empty())
@@ -4752,10 +4805,25 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
     running = createRegister(loopRegisterId++, i1Type, zeroBit, zeroBit,
                              resetStyle);
     for (Value carriedSlot : carried) {
-      if (getLogicValue(carriedSlot))
-        return loop->emitError()
-               << "HDL lowering: loop-carried Logic state is not supported "
-                  "yet";
+      if (LogicValue initial = getLogicValue(carriedSlot)) {
+        unsigned carriedWidth =
+            initial.val.getType().getIntOrFloatBitWidth();
+        auto carriedType =
+            IntegerType::get(builder.getContext(), carriedWidth);
+        llvm::APInt zeros(carriedWidth, 0);
+        Value valReg = createRegister(loopRegisterId++, carriedType, zeros,
+                                      zeros, resetStyle);
+        Value xzReg = createRegister(loopRegisterId++, carriedType, zeros,
+                                     zeros, resetStyle);
+        values[carriedSlot] = valReg;
+        logicValues[carriedSlot] = {valReg, xzReg};
+        slotConstants.erase(carriedSlot);
+        rangeValues.erase(carriedSlot);
+        loopCarriedLogicRegs[carriedSlot] = {valReg, xzReg};
+        loopCarriedLogicNext[carriedSlot] = {valReg, xzReg};
+        loopCarriedLogicInit[carriedSlot] = initial;
+        continue;
+      }
       Value initial = getValue(carriedSlot);
       if (!initial)
         return loop->emitError()
@@ -4840,6 +4908,19 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
         return loop->emitError()
                << "HDL lowering: unsupported carried register form";
     }
+    for (auto &[carriedSlot, regs] : loopCarriedLogicRegs) {
+      LogicValue bodyNext = loopCarriedLogicNext[carriedSlot];
+      LogicValue initial = loopCarriedLogicInit[carriedSlot];
+      Value valMuxed =
+          comb::MuxOp::create(builder, loc, running, bodyNext.val,
+                              initial.val);
+      Value xzMuxed = comb::MuxOp::create(builder, loc, running, bodyNext.xz,
+                                          initial.xz);
+      if (failed(setRegNext(regs.val, valMuxed)) ||
+          failed(setRegNext(regs.xz, xzMuxed)))
+        return loop->emitError()
+               << "HDL lowering: unsupported carried register form";
+    }
     Value notLast = bitNot(last);
     Value runningNext =
         comb::MuxOp::create(builder, loc, running, notLast,
@@ -4850,6 +4931,9 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
     loopCarriedRegs.clear();
     loopCarriedNext.clear();
     loopCarriedInit.clear();
+    loopCarriedLogicRegs.clear();
+    loopCarriedLogicNext.clear();
+    loopCarriedLogicInit.clear();
     loopRunning = Value();
   }
   if (loopStack.empty() && branchPath.empty())
