@@ -1255,6 +1255,25 @@ LogicalResult CirctModuleEmitter::emitStructMethod(Operation *op,
     subst[body.getArgument(i)] = op->getOperand(i);
   }
 
+  // A value-returning method writes its result through the last entry
+  // argument (the hidden by-ref result slot). Route those writes through
+  // return sites and fold them into one value for the caller.
+  bool isConstructor = callee.split('(').first.ends_with("::__init__");
+  Value resultSlot;
+  if (!isConstructor && body.getNumArguments() > 0) {
+    auto mapped = subst.find(body.getArgument(body.getNumArguments() - 1));
+    if (mapped != subst.end())
+      resultSlot = mapped->second;
+  }
+  Value savedResultPtr = resultPtr;
+  Value savedReturnValue = returnValue;
+  bool savedReturnIsLogic = returnIsLogic;
+  Value savedReturnXz = returnXz;
+  auto savedSites = std::move(returnSites);
+  returnSites.clear();
+  if (resultSlot)
+    resultPtr = resultSlot;
+
   SmallVector<Operation *> scratch;
   auto cleanup = [&]() {
     // Later clones use earlier clone results, so drop them in reverse order.
@@ -1265,8 +1284,18 @@ LogicalResult CirctModuleEmitter::emitStructMethod(Operation *op,
 
   for (Operation &inner : body.getOperations()) {
     StringRef name = inner.getName().getStringRef();
-    if (name == "hlcf.return")
+    if (name == "hlcf.return") {
+      if (inner.getNumOperands() == 1) {
+        auto mapped = subst.find(inner.getOperand(0));
+        if (mapped != subst.end()) {
+          if (LogicValue logic = getLogicValue(mapped->second); logic)
+            returnSites.push_back({condition, logic.val, logic.xz});
+          else if (Value value = getValue(mapped->second))
+            returnSites.push_back({condition, value, Value()});
+        }
+      }
       break;
+    }
     if (name == "pop.stack_allocation") {
       subst[inner.getResult(0)] = inner.getResult(0);
       continue;
@@ -1349,6 +1378,34 @@ LogicalResult CirctModuleEmitter::emitStructMethod(Operation *op,
     for (unsigned i = 0; i < cloned->getNumResults(); ++i)
       subst[inner.getResult(i)] = cloned->getResult(i);
   }
+  if (resultSlot && !returnSites.empty()) {
+    Value result = returnSites.back().value;
+    Value resultXz = returnSites.back().xz;
+    for (size_t i = returnSites.size() - 1; i-- > 0;) {
+      ReturnSite &site = returnSites[i];
+      if (site.condition) {
+        result = comb::MuxOp::create(builder, loc, site.condition, site.value,
+                                     result);
+        if (resultXz)
+          resultXz = comb::MuxOp::create(builder, loc, site.condition, site.xz,
+                                         resultXz);
+      } else {
+        result = site.value;
+        resultXz = site.xz;
+      }
+    }
+    if (resultXz) {
+      logicValues[resultSlot] = {result, resultXz};
+      values[resultSlot] = result;
+    } else {
+      values[resultSlot] = result;
+    }
+  }
+  resultPtr = savedResultPtr;
+  returnValue = savedReturnValue;
+  returnIsLogic = savedReturnIsLogic;
+  returnXz = savedReturnXz;
+  returnSites = std::move(savedSites);
   cleanup();
   return success();
 }
