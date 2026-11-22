@@ -10,7 +10,7 @@ from .bits import Bits, mux
 from .logic import Logic, XMode, bit, logic, mux_logic
 from .mem import Mem
 from .array_ram import ArrayRam
-from .sim import SimState, commit_state
+from .sim import SimModule, SimState, commit_state, step
 from .packed import Packed
 from .ram import Ram
 from .wire import Wire

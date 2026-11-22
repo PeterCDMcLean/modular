@@ -1,10 +1,13 @@
-"""Native simulation state traversal.
+"""Native simulation domain evaluation.
 
-`commit_state(module)` walks a module's field tree at the end of one process
-traversal and commits every stateful field exactly once. `Reg`, `Mem`, and
-`Ram` conform to `SimState`; nested module structs are traversed by reflection.
-A design's cycle step should evaluate its process methods first, then call
-`commit_state` on the module.
+A `@module` design that wants native simulation conforms to `SimModule` and
+implements `evaluate` to invoke its process methods for one domain traversal.
+The engine calls `evaluate` once, then `commit_state` reflects over the
+module's fields and commits every `SimState` field once.
+
+Mojo does not expose struct-method reflection in this toolchain, so the module
+declares its process entry point explicitly. The engine owns the traversal and
+the single commit; individual registers are never ticked by the harness.
 """
 
 trait SimState:
@@ -12,6 +15,14 @@ trait SimState:
 
     def commit(mut self):
         """Commits one cycle of state."""
+        ...
+
+
+trait SimModule:
+    """A design whose process tree can be evaluated for one domain cycle."""
+
+    def evaluate(mut self):
+        """Evaluates the module's process methods once."""
         ...
 
 
@@ -23,3 +34,9 @@ def commit_state[T: AnyType](mut value: T):
         comptime if reflect[T].is_struct():
             comptime for i in range(reflect[T].field_count()):
                 commit_state(reflect[T].field_ref[i](value))
+
+
+def step[M: SimModule](mut module: M):
+    """Evaluates one domain traversal and commits its state once."""
+    module.evaluate()
+    commit_state(module)

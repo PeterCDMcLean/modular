@@ -1,37 +1,32 @@
-from hdl import Bits, Reg, commit_state
+from hdl import Bits, Reg, SimModule, step
 
 
-struct SimDelay:
-    var d: Reg[Bits[8]]
+struct SimDomain(SimModule):
+    var a: Reg[Bits[8]]
+    var b: Reg[Bits[8]]
+    var din: Bits[8]
 
     def __init__(out self):
-        self.d = Reg[Bits[8]]()
+        self.a = Reg[Bits[8]]()
+        self.b = Reg[Bits[8]]()
+        self.din = Bits[8]()
 
-    def process(mut self, din: Bits[8]) -> Bits[8]:
-        self.d.next(2) <= din
-        return self.d.get()
+    def evaluate(mut self):
+        # Two process calls in one domain traversal.
+        self.a.next(1) <= self.din
+        self.b.next(1) <= self.a.get()
 
-    def step(mut self, din: Bits[8]) -> Bits[8]:
-        var y = self.process(din)
-        commit_state(self)
-        return y.copy()
+    def cycle(mut self, din: Bits[8]) -> Tuple[Bits[8], Bits[8]]:
+        self.din = din.copy()
+        step(self)
+        return (self.a.get(), self.b.get())
 
 
 def main():
-    var sim = SimDelay()
-    print("s0", sim.step(Bits[8](1)).to_int())
-    print("s1", sim.step(Bits[8](2)).to_int())
-    print(
-        "s2",
-        sim.step(Bits[8](3)).to_int(),
-        sim.d.get().to_int(),
-        sim.d.past(1).to_int(),
-        sim.d.past(2).to_int(),
-    )
-    print(
-        "s3",
-        sim.step(Bits[8](4)).to_int(),
-        sim.d.get().to_int(),
-        sim.d.past(1).to_int(),
-        sim.d.past(2).to_int(),
-    )
+    var sim = SimDomain()
+    var c0 = sim.cycle(Bits[8](1))
+    print("c0", c0[0].to_int(), c0[1].to_int())
+    var c1 = sim.cycle(Bits[8](2))
+    print("c1", c1[0].to_int(), c1[1].to_int())
+    var c2 = sim.cycle(Bits[8](3))
+    print("c2", c2[0].to_int(), c2[1].to_int())
