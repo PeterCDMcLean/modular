@@ -841,6 +841,29 @@ private:
   };
   SmallVector<ReturnSite> returnSites;
 
+  // Statically-unrolled `hlcf.loop` support. A `while` loop with a constant
+  // bound is unrolled by evaluating its control path; a stateful child may not
+  // tick more than once per clock and is diagnosed by the instance checks.
+  struct LoopControl {
+    bool breakTaken = false;
+    bool continueTaken = false;
+  };
+  SmallVector<LoopControl> loopStack;
+  bool inLoopUnroll = false;
+  // Constants currently held in stack slots, used to evaluate loop control.
+  DenseMap<Value, llvm::APInt> slotConstants;
+  std::optional<llvm::APInt> resolveConstant(Value value);
+
+  // A `range(n)` iterator is unrolled symbolically: `rangeValues` carries the
+  // bounds through stack slots and `rangeNext` is the next induction value.
+  struct RangeValue {
+    uint64_t start;
+    uint64_t stop;
+  };
+  DenseMap<Value, RangeValue> rangeValues;
+  DenseMap<Value, uint64_t> rangeNext;
+  std::optional<RangeValue> resolveRange(Value value);
+
   DenseMap<unsigned, Value> fieldRegs;
   DenseMap<unsigned, Value> fieldNext;
   DenseMap<unsigned, Value> fieldEnable;
@@ -1672,6 +1695,28 @@ Operation *CirctModuleEmitter::findBuiltModule(StringRef name) {
   return nullptr;
 }
 
+std::optional<llvm::APInt>
+CirctModuleEmitter::resolveConstant(Value value) {
+  if (auto constant = intConstants.find(value); constant != intConstants.end())
+    return constant->second;
+  if (auto constant = slotConstants.find(value);
+      constant != slotConstants.end())
+    return constant->second;
+  if (auto constant = value.getDefiningOp<hw::ConstantOp>())
+    return constant.getValue();
+  if (auto materialized = values.find(value); materialized != values.end())
+    if (auto constant = materialized->second.getDefiningOp<hw::ConstantOp>())
+      return constant.getValue();
+  return std::nullopt;
+}
+
+std::optional<CirctModuleEmitter::RangeValue>
+CirctModuleEmitter::resolveRange(Value value) {
+  if (auto range = rangeValues.find(value); range != rangeValues.end())
+    return range->second;
+  return std::nullopt;
+}
+
 Value CirctModuleEmitter::getValue(Value value) {
   auto it = values.find(value);
   if (it != values.end())
@@ -1970,14 +2015,61 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
   if (name == "hlcf.unreachable")
     return success();
 
+  if (name == "hlcf.break") {
+    if (loopStack.empty())
+      return op->emitError() << "HDL lowering: break outside a loop";
+    loopStack.back().breakTaken = true;
+    return success();
+  }
+
+  if (name == "hlcf.continue") {
+    if (loopStack.empty())
+      return op->emitError() << "HDL lowering: continue outside a loop";
+    loopStack.back().continueTaken = true;
+    return success();
+  }
+
+  if (name == "hlcf.loop") {
+    if (op->getNumRegions() != 1 || op->getRegion(0).empty())
+      return op->emitError() << "HDL lowering: malformed loop";
+    constexpr unsigned kMaxLoopIterations = 4096;
+    bool wasUnrolling = inLoopUnroll;
+    inLoopUnroll = true;
+    for (unsigned iteration = 0; iteration < kMaxLoopIterations;
+         ++iteration) {
+      loopStack.push_back({});
+      LogicalResult result =
+          emitBlock(op->getRegion(0).front(), condition, returnValue);
+      LoopControl control = loopStack.pop_back_val();
+      if (failed(result)) {
+        inLoopUnroll = wasUnrolling;
+        return failure();
+      }
+      if (control.breakTaken) {
+        inLoopUnroll = wasUnrolling;
+        return success();
+      }
+    }
+    inLoopUnroll = wasUnrolling;
+    return op->emitError()
+           << "HDL lowering: loop did not terminate after "
+           << kMaxLoopIterations
+           << " iterations; loop bounds must be constant";
+  }
+
   if (name == "hlcf.if") {
     if (op->getNumOperands() != 1 || op->getNumRegions() != 2 ||
         op->getNumResults() != 0)
       return op->emitError()
              << "HDL lowering: unsupported conditional in HDL method";
-    Value cond = getValue(op->getOperand(0));
-    if (!cond)
-      return op->emitError() << "HDL lowering: condition was not lowered";
+    std::optional<llvm::APInt> constantCond =
+        inLoopUnroll ? resolveConstant(op->getOperand(0)) : std::nullopt;
+    Value cond;
+    if (!constantCond) {
+      cond = getValue(op->getOperand(0));
+      if (!cond)
+        return op->emitError() << "HDL lowering: condition was not lowered";
+    }
     auto hasBody = [](Region &region) {
       if (region.empty())
         return false;
@@ -1987,6 +2079,23 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       return false;
     };
     Region &thenRegion = op->getRegion(0);
+    Region &elseRegion = op->getRegion(1);
+
+    // A constant condition in an unrolled loop selects one region directly.
+    if (constantCond) {
+      bool taken = !constantCond->isZero();
+      Region &chosen = taken ? thenRegion : elseRegion;
+      if (hasBody(chosen)) {
+        branchPath.push_back({Value(), true});
+        LogicalResult result =
+            emitBlock(chosen.front(), condition, returnValue);
+        branchPath.pop_back();
+        if (failed(result))
+          return failure();
+      }
+      return success();
+    }
+
     if (hasBody(thenRegion)) {
       Value thenCond =
           condition ? comb::AndOp::create(builder, loc, condition, cond) : cond;
@@ -1996,7 +2105,6 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       if (failed(result))
         return failure();
     }
-    Region &elseRegion = op->getRegion(1);
     if (hasBody(elseRegion)) {
       Value notCond = bitNot(cond);
       Value elseCond = condition
@@ -3541,6 +3649,15 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                              << "'";
     }
 
+    if ((callee.contains("::__bool__") || callee.contains("__mlir_bool__")) &&
+        inLoopUnroll) {
+      if (auto constant = resolveConstant(op->getOperand(0))) {
+        intConstants[op->getResult(0)] =
+            llvm::APInt(1, constant->isZero() ? 0 : 1);
+        values.erase(op->getResult(0));
+        return success();
+      }
+    }
     Value operand = op->getNumOperands() == 1 ? getValue(op->getOperand(0))
                                               : Value();
     if (callee.contains("::__bool__") || callee.contains("__mlir_bool__")) {
@@ -3558,8 +3675,56 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       return success();
     }
 
+    // In-place SIMD increment, used by loop induction variables.
+    if (callee.contains("SIMD::__iadd__") && op->getNumOperands() == 2) {
+      Value dest = op->getOperand(0);
+      if (inLoopUnroll) {
+        if (auto current = resolveConstant(dest))
+          if (auto increment = resolveConstant(op->getOperand(1))) {
+            slotConstants[dest] = *current + *increment;
+            values.erase(dest);
+            intConstants.erase(op->getResult(0));
+            return success();
+          }
+      }
+      Value old = getValue(dest);
+      Value increment = getValue(op->getOperand(1));
+      if (!old || !increment)
+        return op->emitError()
+               << "HDL lowering: in-place add operand was not lowered";
+      Value sum = comb::AddOp::create(builder, loc, old, increment);
+      values[dest] = sum;
+      if (auto field = fieldPtrs.find(dest); field != fieldPtrs.end())
+        return storeField(field->second, sum, condition);
+      slotConstants.erase(dest);
+      return success();
+    }
+
     // SIMD lane arithmetic from the primitive `UInt8`/`UInt16` DSL path.
     if (op->getNumOperands() == 2) {
+      if (inLoopUnroll &&
+          (callee.contains("SIMD::__lt__") || callee.contains("SIMD::__le__") ||
+           callee.contains("SIMD::__eq__") || callee.contains("SIMD::__ne__"))) {
+        if (auto lhsConstant = resolveConstant(op->getOperand(0)))
+          if (auto rhsConstant = resolveConstant(op->getOperand(1))) {
+            unsigned width =
+                std::max(lhsConstant->getBitWidth(), rhsConstant->getBitWidth());
+            llvm::APInt lhs = lhsConstant->zext(width);
+            llvm::APInt rhs = rhsConstant->zext(width);
+            bool result = false;
+            if (callee.contains("SIMD::__lt__"))
+              result = lhs.ult(rhs);
+            else if (callee.contains("SIMD::__le__"))
+              result = lhs.ule(rhs);
+            else if (callee.contains("SIMD::__eq__"))
+              result = lhs == rhs;
+            else
+              result = lhs != rhs;
+            intConstants[op->getResult(0)] = llvm::APInt(1, result ? 1 : 0);
+            values.erase(op->getResult(0));
+            return success();
+          }
+      }
       Value lhs = getValue(op->getOperand(0));
       Value rhs = getValue(op->getOperand(1));
       if (!lhs || !rhs)
@@ -3610,6 +3775,41 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       }
     }
 
+    // Constant `range(n)` loops are unrolled symbolically. The iterator
+    // protocol is carried through stack slots without emitting hardware.
+    if ((callee.contains("::range::range[") ||
+         callee.contains("::_ZeroStartingRange::__iter__")) &&
+        op->getNumOperands() == 1) {
+      if (auto range = resolveRange(op->getOperand(0))) {
+        rangeValues[op->getResult(0)] = *range;
+        return success();
+      }
+      if (auto stop = resolveConstant(op->getOperand(0))) {
+        rangeValues[op->getResult(0)] = {0, stop->getZExtValue()};
+        return success();
+      }
+      return op->emitError()
+             << "HDL lowering: loop range bound must be constant";
+    }
+    if (callee.contains("::_ZeroStartingRange::__next__")) {
+      auto range = resolveRange(op->getOperand(0));
+      if (!range || op->getNumOperands() < 2)
+        return op->emitError()
+               << "HDL lowering: loop range iterator was not lowered";
+      Value resultPtr = op->getOperand(op->getNumOperands() - 1);
+      uint64_t &next = rangeNext[op->getOperand(0)];
+      bool done = next >= range->stop;
+      intConstants[op->getResult(0)] =
+          llvm::APInt(1, done ? 1 : 0);
+      values.erase(op->getResult(0));
+      if (!done) {
+        slotConstants[resultPtr] = llvm::APInt(64, next);
+        values.erase(resultPtr);
+        ++next;
+      }
+      return success();
+    }
+
     return op->emitError() << "HDL lowering: unsupported call to '" << callee
                            << "'";
   }
@@ -3637,10 +3837,28 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
   }
 
   if (name == "pop.store") {
+    auto field = fieldPtrs.find(op->getOperand(1));
+    if (field == fieldPtrs.end()) {
+      // Remember integer constants and ranges held in stack slots so an
+      // unrolled loop can evaluate its control path. A materialized constant
+      // would only be dead state, so leave it symbolic until a load needs it.
+      if (auto range = resolveRange(op->getOperand(0))) {
+        rangeValues[op->getOperand(1)] = *range;
+        slotConstants.erase(op->getOperand(1));
+        values.erase(op->getOperand(1));
+        return success();
+      }
+      rangeValues.erase(op->getOperand(1));
+      if (auto constant = resolveConstant(op->getOperand(0))) {
+        slotConstants[op->getOperand(1)] = *constant;
+        values.erase(op->getOperand(1));
+        return success();
+      }
+      slotConstants.erase(op->getOperand(1));
+    }
     Value stored = getValue(op->getOperand(0));
     if (!stored)
       return op->emitError() << "HDL lowering: stored value was not lowered";
-    auto field = fieldPtrs.find(op->getOperand(1));
     if (field != fieldPtrs.end())
       return storeField(field->second, stored, condition);
     values[op->getOperand(1)] = stored;
@@ -3649,6 +3867,19 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
 
   if (name == "pop.load") {
     auto field = fieldPtrs.find(op->getOperand(0));
+    if (field == fieldPtrs.end()) {
+      if (auto range = resolveRange(op->getOperand(0))) {
+        rangeValues[op->getResult(0)] = *range;
+        values.erase(op->getResult(0));
+        return success();
+      }
+      auto slot = slotConstants.find(op->getOperand(0));
+      if (slot != slotConstants.end()) {
+        intConstants[op->getResult(0)] = slot->second;
+        values.erase(op->getResult(0));
+        return success();
+      }
+    }
     if (field != fieldPtrs.end()) {
       auto type = getHwType(op->getResult(0).getType());
       if (!type)
@@ -3683,9 +3914,15 @@ LogicalResult CirctModuleEmitter::emitOps(Operation *fn, Value &returnValue) {
 
 LogicalResult CirctModuleEmitter::emitBlock(Block &block, Value condition,
                                             Value &returnValue) {
-  for (Operation &op : block.getOperations())
+  for (Operation &op : block.getOperations()) {
+    // A break/continue ends the current block; enclosing blocks check the
+    // same flag at their next iteration.
+    if (!loopStack.empty() && (loopStack.back().breakTaken ||
+                               loopStack.back().continueTaken))
+      break;
     if (failed(emitOp(&op, condition, returnValue)))
       return failure();
+  }
   return success();
 }
 
