@@ -877,6 +877,8 @@ private:
   // computes its own last and propagates it to its parent.
   Value childLoopLast;
   bool childLoopRan = false;
+  // A runtime `break` inside a conditional becomes a loop-exit condition.
+  Value dynamicBreakCond;
   SmallVector<Value> collectLoopCarriedSlots(Block &block,
                                              Value inductionSlot);
   bool storeLoopCarried(Value slot, Value value, Value condition);
@@ -2172,6 +2174,10 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     return success();
 
   if (name == "hlcf.break") {
+    // In a time-multiplexed loop the enclosing conditional records the exit
+    // condition; the break itself produces no hardware.
+    if (inDynamicLoop)
+      return success();
     if (loopStack.empty())
       return op->emitError() << "HDL lowering: break outside a loop";
     loopStack.back().breakTaken = true;
@@ -2252,6 +2258,24 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     };
     Region &thenRegion = op->getRegion(0);
     Region &elseRegion = op->getRegion(1);
+
+    if (inDynamicLoop) {
+      auto regionHasBreak = [](Region &region) {
+        if (region.empty())
+          return false;
+        for (Operation &inner : region.front())
+          if (inner.getName().getStringRef() == "hlcf.break")
+            return true;
+        return false;
+      };
+      if (regionHasBreak(thenRegion) || regionHasBreak(elseRegion)) {
+        Value exitCond = cond ? cond : getConstant(true);
+        dynamicBreakCond =
+            dynamicBreakCond
+                ? comb::OrOp::create(builder, loc, dynamicBreakCond, exitCond)
+                : exitCond;
+      }
+    }
 
     // A constant condition in an unrolled loop selects one region directly.
     if (constantCond) {
@@ -4553,6 +4577,7 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
   values[slot] = counter;
   childLoopRan = false;
   childLoopLast = Value();
+  dynamicBreakCond = Value();
   bool sequenced = condition && condition == currentStartPulse;
   Value started;
   if (sequenced) {
@@ -4717,18 +4742,27 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
     boundValue = comb::ConcatOp::create(
         builder, loc, ArrayRef<Value>{zeros, boundValue});
   }
+  Value breakNow =
+      dynamicBreakCond
+          ? comb::AndOp::create(builder, loc, active, dynamicBreakCond)
+          : Value();
   Value atEnd = comb::ICmpOp::create(
       builder, loc, comb::ICmpPredicate::eq, incremented, boundValue);
-  Value last = comb::AndOp::create(builder, loc,
-                                   childLoopRan ? childLoopLast : active,
-                                   atEnd);
+  Value inRangeLast = comb::AndOp::create(
+      builder, loc, childLoopRan ? childLoopLast : active, atEnd);
+  Value last = breakNow ? comb::OrOp::create(builder, loc, inRangeLast, breakNow)
+                        : inRangeLast;
+  Value step =
+      breakNow ? comb::MuxOp::create(builder, loc, breakNow, boundValue,
+                                     incremented)
+               : incremented;
   Value next =
       childLoopRan
           ? comb::MuxOp::create(
                 builder, loc, childLoopLast,
                 comb::MuxOp::create(builder, loc, last, zero, incremented),
-                counter)
-          : comb::MuxOp::create(builder, loc, active, incremented, zero);
+                breakNow ? zero : counter)
+          : comb::MuxOp::create(builder, loc, active, step, zero);
   if (auto reg = counter.getDefiningOp<seq::CompRegOp>())
     reg->setOperand(0, next);
   else if (auto reg = counter.getDefiningOp<seq::FirRegOp>())
@@ -4896,6 +4930,7 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
   }
   childLoopRan = false;
   childLoopLast = Value();
+  dynamicBreakCond = Value();
   bool sequenced = condition && condition == currentStartPulse;
   Value started;
   if (sequenced) {
@@ -5029,18 +5064,27 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
   Value one = hw::ConstantOp::create(builder, loc, counterType, 1);
   Value incremented = comb::AddOp::create(builder, loc, counter, one);
   Value zero = hw::ConstantOp::create(builder, loc, counterType, 0);
+  Value breakNow =
+      dynamicBreakCond
+          ? comb::AndOp::create(builder, loc, active, dynamicBreakCond)
+          : Value();
   Value atEnd = comb::ICmpOp::create(
       builder, loc, comb::ICmpPredicate::eq, incremented, boundValue);
-  Value last = comb::AndOp::create(builder, loc,
-                                   childLoopRan ? childLoopLast : active,
-                                   atEnd);
+  Value inRangeLast = comb::AndOp::create(
+      builder, loc, childLoopRan ? childLoopLast : active, atEnd);
+  Value last = breakNow ? comb::OrOp::create(builder, loc, inRangeLast, breakNow)
+                        : inRangeLast;
+  Value step =
+      breakNow ? comb::MuxOp::create(builder, loc, breakNow, boundValue,
+                                     incremented)
+               : incremented;
   Value next =
       childLoopRan
           ? comb::MuxOp::create(
                 builder, loc, childLoopLast,
                 comb::MuxOp::create(builder, loc, last, zero, incremented),
-                counter)
-          : comb::MuxOp::create(builder, loc, active, incremented, zero);
+                breakNow ? zero : counter)
+          : comb::MuxOp::create(builder, loc, active, step, zero);
   if (auto reg = counter.getDefiningOp<seq::CompRegOp>())
     reg->setOperand(0, next);
   else if (auto reg = counter.getDefiningOp<seq::FirRegOp>())
@@ -5217,8 +5261,10 @@ LogicalResult CirctModuleEmitter::emitNestedRangeLoop(
                            innerCounter, innerBound);
   Value active = comb::AndOp::create(builder, loc, run, innerActive);
 
+  Value savedBreakCond = dynamicBreakCond;
   childLoopRan = false;
   childLoopLast = Value();
+  dynamicBreakCond = Value();
   SmallVector<Operation *> skipOps{nextOp, loopIf};
   if (indLoad)
     skipOps.push_back(indLoad);
@@ -5235,25 +5281,33 @@ LogicalResult CirctModuleEmitter::emitNestedRangeLoop(
       return failure();
   }
 
+  Value innerBreak = dynamicBreakCond;
+  dynamicBreakCond = savedBreakCond;
+  Value breakNow =
+      innerBreak
+          ? comb::AndOp::create(builder, loc, active, innerBreak)
+          : Value();
   Value one = hw::ConstantOp::create(builder, loc, counterType, 1);
   Value innerIncremented = comb::AddOp::create(builder, loc, innerCounter, one);
   Value innerZero = hw::ConstantOp::create(builder, loc, counterType, 0);
   Value innerAtEnd = comb::ICmpOp::create(
       builder, loc, comb::ICmpPredicate::eq, innerIncremented, innerBound);
-  Value myLast = comb::AndOp::create(
+  Value inRangeLast = comb::AndOp::create(
       builder, loc, childLoopRan ? childLoopLast : active, innerAtEnd);
+  Value myLast = breakNow
+                     ? comb::OrOp::create(builder, loc, inRangeLast, breakNow)
+                     : inRangeLast;
+  Value resetStep =
+      comb::MuxOp::create(builder, loc, myLast, innerZero, innerIncremented);
+  Value step =
+      breakNow
+          ? comb::MuxOp::create(builder, loc, breakNow, innerBound, resetStep)
+          : resetStep;
   Value innerNext =
       childLoopRan
-          ? comb::MuxOp::create(
-                builder, loc, childLoopLast,
-                comb::MuxOp::create(builder, loc, myLast, innerZero,
-                                    innerIncremented),
-                innerCounter)
-          : comb::MuxOp::create(
-                builder, loc, active,
-                comb::MuxOp::create(builder, loc, myLast, innerZero,
-                                    innerIncremented),
-                innerZero);
+          ? comb::MuxOp::create(builder, loc, childLoopLast, step,
+                                breakNow ? innerZero : innerCounter)
+          : comb::MuxOp::create(builder, loc, active, step, innerZero);
   if (auto cr = innerCounter.getDefiningOp<seq::CompRegOp>())
     cr->setOperand(0, innerNext);
   else if (auto fr = innerCounter.getDefiningOp<seq::FirRegOp>())
