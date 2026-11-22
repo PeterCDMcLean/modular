@@ -826,6 +826,15 @@ private:
   }
   DenseMap<unsigned, InstanceCallState> instanceCalls;
   SmallVector<BranchLiteral> branchPath;
+  // One result binding, in emission order. The condition is the branch path
+  // that produced it; `xz` is set for a four-state result. Sites are folded
+  // into one mux tree after the method body.
+  struct ReturnSite {
+    Value condition;
+    Value value;
+    Value xz;
+  };
+  SmallVector<ReturnSite> returnSites;
 
   DenseMap<unsigned, Value> fieldRegs;
   DenseMap<unsigned, Value> fieldNext;
@@ -1866,7 +1875,24 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                                          Value &returnValue) {
   StringRef name = op->getName().getStringRef();
 
+  // Record a value written to the method's by-ref result slot. Inside a
+  // branch the site keeps that branch condition, so the final output is a mux
+  // over the paths that returned.
+  auto recordReturn = [&](Value value, Value xz = Value()) {
+    returnSites.push_back({condition, value, xz});
+    returnValue = value;
+    if (xz) {
+      returnXz = xz;
+      returnIsLogic = true;
+    }
+  };
+
   if (name == "hlcf.yield")
+    return success();
+
+  // Emitted after a block where every path returned; the lowering has already
+  // recorded those returns.
+  if (name == "hlcf.unreachable")
     return success();
 
   if (name == "hlcf.if") {
@@ -1913,7 +1939,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
   if (name == "hlcf.return") {
     if (op->getNumOperands() == 1)
       if (Value value = getValue(op->getOperand(0)))
-        returnValue = value;
+        recordReturn(value);
     // Memory-only results are written through the by-ref result pointer and
     // `return` itself yields `none`.
     if (returnValue)
@@ -2360,7 +2386,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       Value dest = op->getOperand(2);
       values[dest] = readData;
       if (dest == resultPtr)
-        returnValue = readData;
+        recordReturn(readData);
       return success();
     }
 
@@ -2412,7 +2438,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       Value dest = op->getOperand(2);
       values[dest] = readData;
       if (dest == resultPtr)
-        returnValue = readData;
+        recordReturn(readData);
       return success();
     }
 
@@ -2468,15 +2494,12 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       Value dest = op->getOperand(2);
       if (isLogic) {
         logicValues[dest] = {result, resultXz};
-        if (dest == resultPtr) {
-          returnValue = result;
-          returnXz = resultXz;
-          returnIsLogic = true;
-        }
+        if (dest == resultPtr)
+          recordReturn(result, resultXz);
       } else {
         values[dest] = result;
         if (dest == resultPtr)
-          returnValue = result;
+          recordReturn(result);
       }
       return success();
     }
@@ -2601,15 +2624,12 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           }
           if (xz) {
             logicValues[dest] = {value, xz};
-            if (dest == resultPtr) {
-              returnValue = value;
-              returnXz = xz;
-              returnIsLogic = true;
-            }
+            if (dest == resultPtr)
+              recordReturn(value, xz);
           } else {
             values[dest] = value;
             if (dest == resultPtr)
-              returnValue = value;
+              recordReturn(value);
           }
           return success();
         };
@@ -2700,11 +2720,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           return storeLogicField(field->second, value, condition);
         }
         logicValues[dest] = value;
-        if (dest == resultPtr) {
-          returnValue = value.val;
-          returnXz = value.xz;
-          returnIsLogic = true;
-        }
+        if (dest == resultPtr)
+          recordReturn(value.val, value.xz);
         return success();
       };
 
@@ -2843,15 +2860,12 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           Value xz = hw::ConstantOp::create(
               builder, loc, llvm::APInt(width, 0));
           logicValues[dest] = {constant, xz};
-          if (dest == resultPtr) {
-            returnValue = constant;
-            returnXz = xz;
-            returnIsLogic = true;
-          }
+          if (dest == resultPtr)
+            recordReturn(constant, xz);
         } else {
           values[dest] = constant;
           if (dest == resultPtr)
-            returnValue = constant;
+            recordReturn(constant);
         }
         return success();
       }
@@ -2885,11 +2899,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           };
           LogicValue lane{extractLane(packed.val), extractLane(packed.xz)};
           logicValues[dest] = lane;
-          if (dest == resultPtr) {
-            returnValue = lane.val;
-            returnXz = lane.xz;
-            returnIsLogic = true;
-          }
+          if (dest == resultPtr)
+            recordReturn(lane.val, lane.xz);
           return success();
         }
 
@@ -2902,7 +2913,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                                              laneWidth);
         values[dest] = lane;
         if (dest == resultPtr)
-          returnValue = lane;
+          recordReturn(lane);
         return success();
       }
 
@@ -2967,11 +2978,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             return op->emitError()
                    << "HDL lowering: Packed operand was not lowered";
           logicValues[dest] = source;
-          if (dest == resultPtr) {
-            returnValue = source.val;
-            returnXz = source.xz;
-            returnIsLogic = true;
-          }
+          if (dest == resultPtr)
+            recordReturn(source.val, source.xz);
         } else {
           Value source = getValue(op->getOperand(0));
           if (!source)
@@ -2979,7 +2987,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                    << "HDL lowering: Packed operand was not lowered";
           values[dest] = source;
           if (dest == resultPtr)
-            returnValue = source;
+            recordReturn(source);
         }
         return success();
       }
@@ -3089,11 +3097,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             return op->emitError()
                    << "HDL lowering: unsupported Logic past() state";
           logicValues[dest] = result;
-          if (dest == resultPtr) {
-            returnValue = result.val;
-            returnXz = result.xz;
-            returnIsLogic = true;
-          }
+          if (dest == resultPtr)
+            recordReturn(result.val, result.xz);
           return success();
         }
         Value result = pastValue(field->second, delayValue);
@@ -3102,7 +3107,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                  << "HDL lowering: unsupported past() state";
         values[dest] = result;
         if (dest == resultPtr)
-          returnValue = result;
+          recordReturn(result);
         return success();
       }
 
@@ -3116,11 +3121,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             fieldIsLogic[field->second])
           return storeLogicField(field->second, value, condition);
         logicValues[dest] = value;
-        if (dest == resultPtr) {
-          returnValue = value.val;
-          returnXz = value.xz;
-          returnIsLogic = true;
-        }
+        if (dest == resultPtr)
+          recordReturn(value.val, value.xz);
         return success();
       };
 
@@ -3145,7 +3147,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           return storeLogicResult(dest, {value, xz});
         values[dest] = value;
         if (dest == resultPtr)
-          returnValue = value;
+          recordReturn(value);
         return success();
       };
 
@@ -3272,7 +3274,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           return op->emitError()
                  << "HDL lowering: Reg operand was not lowered";
         if (dest == resultPtr)
-          returnValue = source;
+          recordReturn(source);
         else if (auto field = fieldPtrs.find(dest); field != fieldPtrs.end())
           return storeField(field->second, source, condition);
         else
@@ -3308,7 +3310,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         else
           values[dest] = constant;
         if (dest == resultPtr)
-          returnValue = constant;
+          recordReturn(constant);
         return success();
       }
       if (op->getNumOperands() == 2) {
@@ -3325,7 +3327,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         else
           values[dest] = source;
         if (dest == resultPtr)
-          returnValue = source;
+          recordReturn(source);
         return success();
       }
       return op->emitError() << "HDL lowering: unsupported Wire call '"
@@ -3372,7 +3374,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                                  << callee << "'";
         values[op->getOperand(2)] = result;
         if (op->getOperand(2) == resultPtr)
-          returnValue = result;
+          recordReturn(result);
         return success();
       }
       if (op->getNumOperands() == 2) {
@@ -3390,7 +3392,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
               builder, loc, value->zextOrTrunc(width));
           values[op->getOperand(1)] = constant;
           if (op->getOperand(1) == resultPtr)
-            returnValue = constant;
+            recordReturn(constant);
           return success();
         }
 
@@ -3405,7 +3407,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           Value result = comb::XorOp::create(builder, loc, source, ones);
           values[op->getOperand(1)] = result;
           if (op->getOperand(1) == resultPtr)
-            returnValue = result;
+            recordReturn(result);
           return success();
         }
         if (callee.contains("Bits::bit(")) {
@@ -3443,7 +3445,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         if (callee.contains("Bits::__init__")) {
           // Move the computed value into a result slot or a state field.
           if (op->getOperand(1) == resultPtr) {
-            returnValue = source;
+            recordReturn(source);
           } else if (auto field = fieldPtrs.find(op->getOperand(1));
                      field != fieldPtrs.end()) {
             return storeField(field->second, source, condition);
@@ -3454,7 +3456,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         }
         if (callee.contains("Bits::copy")) {
           if (op->getOperand(1) == resultPtr)
-            returnValue = source;
+            recordReturn(source);
           else
             values[op->getOperand(1)] = source;
           return success();
@@ -3727,8 +3729,32 @@ LogicalResult CirctModuleEmitter::build() {
     returnXz = Value();
 
     Value returnValue;
+    returnSites.clear();
     if (failed(emitOps(methods[m], returnValue)))
       return failure();
+    // Fold branch returns into one value. Later returns are fallbacks for
+    // earlier conditional ones, so walk the sites in reverse emission order.
+    // A site's value and four-state mask are muxed together.
+    if (!returnSites.empty()) {
+      Value result = returnSites.back().value;
+      Value resultXz = returnSites.back().xz;
+      for (size_t i = returnSites.size() - 1; i-- > 0;) {
+        ReturnSite &site = returnSites[i];
+        if (site.condition) {
+          result = comb::MuxOp::create(builder, loc, site.condition,
+                                       site.value, result);
+          if (resultXz)
+            resultXz = comb::MuxOp::create(builder, loc, site.condition,
+                                           site.xz, resultXz);
+        } else {
+          result = site.value;
+          resultXz = site.xz;
+        }
+      }
+      returnValue = result;
+      if (returnXz)
+        returnXz = resultXz;
+    }
     if (methodOutputCounts[m] == 0)
       continue;
     if (!returnValue || (returnIsLogic && !returnXz))
