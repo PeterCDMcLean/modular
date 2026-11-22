@@ -4576,10 +4576,6 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
   SmallVector<Value> carried = collectLoopCarriedSlots(block, slot);
   Value running;
   if (!carried.empty()) {
-    if (sequenced)
-      return loop->emitError()
-             << "HDL lowering: loop-carried state in a sequenced runtime "
-                "loop is not supported yet";
     auto i1Type = builder.getI1Type();
     llvm::APInt zeroBit(1, 0);
     running = createRegister(loopRegisterId++, i1Type, zeroBit, zeroBit,
@@ -4781,9 +4777,13 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
                << "HDL lowering: unsupported carried register form";
     }
     Value notLast = bitNot(last);
-    Value runningNext =
+    Value runningBase =
         comb::MuxOp::create(builder, loc, running, notLast,
                             getConstant(true));
+    Value runningNext =
+        started ? comb::MuxOp::create(builder, loc, started, runningBase,
+                                      getConstant(false))
+                : runningBase;
     if (failed(setRegNext(running, runningNext)))
       return loop->emitError()
              << "HDL lowering: unsupported running register form";
@@ -4919,10 +4919,6 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
   SmallVector<Value> carried = collectLoopCarriedSlots(block, slot);
   Value running;
   if (!carried.empty()) {
-    if (sequenced)
-      return loop->emitError()
-             << "HDL lowering: loop-carried state in a sequenced runtime "
-                "loop is not supported yet";
     auto i1Type = builder.getI1Type();
     llvm::APInt zeroBit(1, 0);
     running = createRegister(loopRegisterId++, i1Type, zeroBit, zeroBit,
@@ -5092,9 +5088,13 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
                << "HDL lowering: unsupported carried register form";
     }
     Value notLast = bitNot(last);
-    Value runningNext =
+    Value runningBase =
         comb::MuxOp::create(builder, loc, running, notLast,
                             getConstant(true));
+    Value runningNext =
+        started ? comb::MuxOp::create(builder, loc, started, runningBase,
+                                      getConstant(false))
+                : runningBase;
     if (failed(setRegNext(running, runningNext)))
       return loop->emitError()
              << "HDL lowering: unsupported running register form";
