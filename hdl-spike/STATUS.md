@@ -23,8 +23,8 @@ Build and test record:
 * `hdl-spike/tests/run_all.sh`: **green** in both `-c dbg` and `-c opt`
   (00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15, 16,
   17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
-  35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48). `--emit=circt` and
-  `--emit=sv` run in-process.
+  35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49). `--emit=circt`
+  and `--emit=sv` run in-process.
 * Verilator lint: skipped (not installed).
 * CLI adaptation: the current compiler uses `-I <dir>`; the tests were updated
   from `-mojo-search-paths`.
@@ -44,7 +44,7 @@ Build and test record:
 | Native Sim delay | **green (prototype)** | `tests/12_sim_delay.mojo` | `Reg` keeps fixed-size `history` and `pending` rings. `.next(n) <=` schedules slot `n-1`; `Reg.commit()` shifts history, applies slot 0, and shifts the pending ring; `past(n)` reads `history[n-1]`. A design step evaluates its process tree first, then calls `commit_state(module)`, which uses reflection to commit every `SimState` field once (`Reg`, `Mem`, `Ram`, `ArrayRam`). `max_delay` defaults to 8 and out-of-range delays clamp. Bare `Array[Reg]` fields are not traversed yet. |
 | Unwritten hold / packed reset | **green (prototype)** | `designs/44_hold.mojo` | An unwritten register now holds its current value (`seq.compreg %reg` self-feedback) instead of falling to zero, and a constant-initialized `Reg[Packed[Bits[8],4]]` decodes the packed constant through the `Packed` constructor to the correct 32-bit reset/power-on value (`32'h4030201`). |
 | Delayed next / past | **green (prototype)** | `designs/42_delay.mojo`, `designs/46_logic_delay.mojo` | `reg.next(n) <= value` uses a `NextTarget` proxy: `Reg::next(n)` records the register and constant `n`, and `NextTarget::__le__` performs the update. User-facing writes always use `.next(n) <=`; `.next(1) <=` is the ordinary register update. `n > 1` emits a chain of `n` registers (the field's read becomes the last stage); `n <= 1` is the normal register update. `reg.past(n)` emits an `n`-stage read-only delay chain fed by the field's current value; `past(0)` is the current value. For `Logic[W]` state, both delayed next and past create parallel value/mask chains, so X/Z is delayed with the value (`46_logic_delay`). Delays must be compile-time constants. Native `Sim` now has cycle history: `Reg` stores a `max_delay` (default 8) history and pending slots; `reg.tick()` advances one cycle, applying `.next(n)` and shifting `.past(n)` history (`47_sim_delay`). A design or harness must tick its registers once per cycle. |
-| Packed arrays | **green (prototype)** | `designs/39_packed.mojo`, `designs/43_packed_elem.mojo` | `Packed[T, N]` wraps `Array[T, N]` and conforms to `HdlType` with `WIDTH = T.WIDTH * N`; lanes are little-endian. The pass flattens the whole value to an `iW` port/register, so `Packed[Bits[8],4]` becomes a 32-bit port and a 32-bit `seq.compreg`. Whole-value copy/move/constructor lowering works. Element access lowers on the flat `iW`: `p[i]` shifts right by `i * T.WIDTH` and extracts one lane; `p[i] = v` clears the shifted lane mask and ORs in the shifted value (`designs/43_packed_elem.mojo`). 4-state packed arrays are not implemented yet. |
+| Packed arrays | **green (prototype)** | `designs/39_packed.mojo`, `designs/43_packed_elem.mojo`, `designs/49_packed_logic.mojo` | `Packed[T, N]` wraps `Array[T, N]` and conforms to `HdlType` with `WIDTH = T.WIDTH * N`; lanes are little-endian. The pass flattens the whole value to an `iW` port/register, so `Packed[Bits[8],4]` becomes a 32-bit port and a 32-bit `seq.compreg`. Whole-value copy/move/constructor lowering works. Element access lowers on the flat `iW`: `p[i]` shifts right by `i * T.WIDTH` and extracts one lane; `p[i] = v` clears the shifted lane mask and ORs in the shifted value (`designs/43_packed_elem.mojo`). `Packed[Logic[W],N]` uses parallel value/mask words: ports, registers, whole-value copies, and element get/set all carry `val` and `xz` (`designs/49_packed_logic.mojo`). |
 | Typed Reg | **green (prototype)** | `designs/26_resettable.mojo`, `designs/33_resettable_logic.mojo`, `designs/37_reg.mojo` | `Reg[T, style]` is a generic typed state field over any `HdlType` payload: `Reg[Bits[W], style]` is 2-state and `Reg[Logic[W], style]` is 4-state. `reg.next(1) <= value` lowers to the register's clocked update (through the same enable/reset machinery as a field assignment) and `.get()` reads the current value; the immediate `next(value)` method is no longer part of the surface. A constructor constant becomes its reset/power-on value (`37_reg`, `26_resettable`, `33_resettable_logic`). |
 | Typed Wire | **green (prototype)** | `designs/36_wire.mojo` | `Wire[W]` is a combinational field, not state: assignments define an SSA net and reads copy it. A module containing only wires has no clock or register (`36_wire`). |
 | Clock sources | **green (prototype)** | `designs/35_clock_source.mojo` | A no-hardware `ClockDivider[pow2]` field roots a sub-domain: the module's registers and child instances are clocked by `seq.clock_div ambient by pow2`. A child module can therefore root its own divided domain beneath the parent (`35_clock_source`). |
@@ -59,8 +59,8 @@ Build and test record:
 
 `tests/run_all.sh` runs 00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11,
 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, and
-48; all pass.
+31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+and 49; all pass.
 
 **Second phase (combined CIRCT/LLVM lowering).** The compiler now builds *real*
 CIRCT ops. CIRCT is a **git submodule** at `third_party/circt` pointing at the

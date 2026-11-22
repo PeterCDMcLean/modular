@@ -34,9 +34,9 @@ grep -q 'hw.module @PackedSet(in %p : i32, in %i : i64, in %v : i8, out out : i3
 grep -q 'comb.mul %0, %c8_i32' "$out/43_packed_elem.mlir"
 grep -q 'comb.shru %p, %1' "$out/43_packed_elem.mlir"
 grep -q 'comb.extract %2 from 0 : (i32) -> i8' "$out/43_packed_elem.mlir"
-grep -q 'comb.shl %2, %1' "$out/43_packed_elem.mlir"
+grep -q 'comb.shl %3, %1' "$out/43_packed_elem.mlir"
 grep -q 'comb.and %p, %5' "$out/43_packed_elem.mlir"
-grep -q 'comb.or %6, %3' "$out/43_packed_elem.mlir"
+grep -q 'comb.or %6, %4' "$out/43_packed_elem.mlir"
 
 "$MOJO" build --emit=sv -o "$out/43_packed_elem.raw.sv" "${inc[@]}" \
     "$root/hdl-spike/designs/43_packed_elem.mojo"

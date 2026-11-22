@@ -525,8 +525,17 @@ static StringRef getDslTypeName(Type type) {
   return ref.getSymbol().getLeafReference().getValue();
 }
 
+static Type getDslTypeParam(Type type, unsigned index);
+
 static bool isLogicType(Type type) {
-  return getDslTypeName(type).contains("Logic");
+  StringRef name = getDslTypeName(type);
+  if (name.contains("Logic"))
+    return true;
+  if (name.contains("Packed")) {
+    Type element = getDslTypeParam(type, 0);
+    return element && isLogicType(element);
+  }
+  return false;
 }
 
 /// Return the HDL bit width of a DSL port type. `Bits[W]`/`Logic[W]` source
@@ -1315,8 +1324,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
       if (auto style = getDslTypeIntParam(fieldType, 1, &bindings))
         fieldResetStyle.back() = style->getZExtValue();
       fieldIsInstance.push_back(false);
-      fieldIsLogic.push_back(element &&
-                             getDslTypeName(element).contains("Logic"));
+      fieldIsLogic.push_back(element && isLogicType(element));
       fieldModuleNames.push_back({});
       continue;
     }
@@ -1338,7 +1346,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
       fieldIsLogic.push_back(false);
       fieldModuleNames.push_back({});
       arrayIsLogic[fieldIsArrayStorage.size() - 1] =
-          getDslTypeName(arrayPayload).contains("Logic");
+          arrayPayload && isLogicType(arrayPayload);
       arrayIsExplicitRam[fieldIsArrayStorage.size() - 1] = isRam;
       arrayIsArrayRam[fieldIsArrayStorage.size() - 1] = isArrayRam;
       continue;
@@ -1360,7 +1368,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
           break;
         }
     fieldIsInstance.push_back(isInstance);
-    fieldIsLogic.push_back(getDslTypeName(fieldType).contains("Logic"));
+    fieldIsLogic.push_back(isLogicType(fieldType));
     if (isInstance) {
       std::string display = StringRef(typeName).rsplit("::").second.str();
       for (auto binding : getDslTypeBindings(fieldType, &bindings))
@@ -2643,23 +2651,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     if (callee.contains("Packed::")) {
       if (callee.contains("::__deinit__") || callee.contains("::__del__"))
         return success();
-      if (callee.contains("__init__") && callee.contains("::SIMD") &&
-          !callee.contains("__init__(move:")) {
-        unsigned width = getCallPackedWidth(op, &bindings);
-        Operation *valueOp = op->getOperand(0).getDefiningOp();
-        auto value =
-            valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
-        if (!width || !value)
-          return op->emitError()
-                 << "HDL lowering: unsupported Packed constructor";
-        Value constant = hw::ConstantOp::create(
-            builder, loc, value->zextOrTrunc(width));
-        Value dest = op->getOperand(1);
-        values[dest] = constant;
-        if (dest == resultPtr)
-          returnValue = constant;
-        return success();
-      }
+      bool logicPacked = isLogicType(getCallTypeParam(op, 0));
       auto resize = [&](Value value, unsigned width) -> Value {
         unsigned valueWidth = value.getType().getIntOrFloatBitWidth();
         if (valueWidth == width)
@@ -2673,15 +2665,43 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         return comb::ExtractOp::create(builder, loc, value, 0, width);
       };
 
+      if (callee.contains("__init__") && callee.contains("::SIMD") &&
+          !callee.contains("__init__(move:")) {
+        unsigned width = getCallPackedWidth(op, &bindings);
+        Operation *valueOp = op->getOperand(0).getDefiningOp();
+        auto value =
+            valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
+        if (!width || !value)
+          return op->emitError()
+                 << "HDL lowering: unsupported Packed constructor";
+        Value constant = hw::ConstantOp::create(
+            builder, loc, value->zextOrTrunc(width));
+        Value dest = op->getOperand(1);
+        if (logicPacked) {
+          Value xz = hw::ConstantOp::create(
+              builder, loc, llvm::APInt(width, 0));
+          logicValues[dest] = {constant, xz};
+          if (dest == resultPtr) {
+            returnValue = constant;
+            returnXz = xz;
+            returnIsLogic = true;
+          }
+        } else {
+          values[dest] = constant;
+          if (dest == resultPtr)
+            returnValue = constant;
+        }
+        return success();
+      }
+
       if (callee.contains("__getitem__") && op->getNumOperands() == 3) {
         unsigned packedWidth = getCallPackedWidth(op, &bindings);
         if (!packedWidth)
           return op->emitError()
                  << "HDL lowering: unsupported Packed element access";
         unsigned laneWidth = getHdlWidth(getCallTypeParam(op, 0), &bindings);
-        Value packed = getValue(op->getOperand(0));
         Value index = getValue(op->getOperand(1));
-        if (!packed || !index)
+        if (!index)
           return op->emitError()
                  << "HDL lowering: Packed element operand was not lowered";
         Value shift = resize(index, packedWidth);
@@ -2689,10 +2709,35 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             builder, loc, llvm::APInt(packedWidth, laneWidth));
         Value offset =
             comb::MulOp::create(builder, loc, shift, laneWidthValue);
+        Value dest = op->getOperand(2);
+
+        if (logicPacked) {
+          LogicValue packed = getLogicValue(op->getOperand(0));
+          if (!packed)
+            return op->emitError()
+                   << "HDL lowering: Packed operand was not lowered";
+          auto extractLane = [&](Value word) -> Value {
+            Value shifted = comb::ShrUOp::create(builder, loc, word, offset);
+            return comb::ExtractOp::create(builder, loc, shifted, 0,
+                                           laneWidth);
+          };
+          LogicValue lane{extractLane(packed.val), extractLane(packed.xz)};
+          logicValues[dest] = lane;
+          if (dest == resultPtr) {
+            returnValue = lane.val;
+            returnXz = lane.xz;
+            returnIsLogic = true;
+          }
+          return success();
+        }
+
+        Value packed = getValue(op->getOperand(0));
+        if (!packed)
+          return op->emitError()
+                 << "HDL lowering: Packed operand was not lowered";
         Value shifted = comb::ShrUOp::create(builder, loc, packed, offset);
         Value lane = comb::ExtractOp::create(builder, loc, shifted, 0,
                                              laneWidth);
-        Value dest = op->getOperand(2);
         values[dest] = lane;
         if (dest == resultPtr)
           returnValue = lane;
@@ -2705,10 +2750,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           return op->emitError()
                  << "HDL lowering: unsupported Packed element access";
         unsigned laneWidth = getHdlWidth(getCallTypeParam(op, 0), &bindings);
-        Value packed = getValue(op->getOperand(0));
         Value index = getValue(op->getOperand(1));
-        Value value = getValue(op->getOperand(2));
-        if (!packed || !index || !value)
+        if (!index)
           return op->emitError()
                  << "HDL lowering: Packed element operand was not lowered";
         Value shift = resize(index, packedWidth);
@@ -2716,30 +2759,66 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             builder, loc, llvm::APInt(packedWidth, laneWidth));
         Value offset =
             comb::MulOp::create(builder, loc, shift, laneWidthValue);
-        Value valueWide = resize(value, packedWidth);
-        Value shiftedValue =
-            comb::ShlOp::create(builder, loc, valueWide, offset);
         llvm::APInt laneMask = llvm::APInt::getLowBitsSet(packedWidth,
                                                           laneWidth);
         Value mask = hw::ConstantOp::create(builder, loc, laneMask);
         Value shiftedMask = comb::ShlOp::create(builder, loc, mask, offset);
-        Value cleared =
-            comb::AndOp::create(builder, loc, packed, bitNot(shiftedMask));
-        Value updated =
-            comb::OrOp::create(builder, loc, cleared, shiftedValue);
-        values[op->getOperand(0)] = updated;
+
+        auto insertLane = [&](Value word, Value lane) -> Value {
+          Value wide = resize(lane, packedWidth);
+          Value shiftedValue =
+              comb::ShlOp::create(builder, loc, wide, offset);
+          Value cleared =
+              comb::AndOp::create(builder, loc, word, bitNot(shiftedMask));
+          return comb::OrOp::create(builder, loc, cleared, shiftedValue);
+        };
+
+        Value self = op->getOperand(0);
+        if (logicPacked) {
+          LogicValue packed = getLogicValue(self);
+          LogicValue value = getLogicValue(op->getOperand(2));
+          if (!packed || !value)
+            return op->emitError()
+                   << "HDL lowering: Packed element operand was not lowered";
+          LogicValue updated{insertLane(packed.val, value.val),
+                             insertLane(packed.xz, value.xz)};
+          values[self] = updated.val;
+          logicValues[self] = updated;
+          return success();
+        }
+
+        Value packed = getValue(self);
+        Value value = getValue(op->getOperand(2));
+        if (!packed || !value)
+          return op->emitError()
+                 << "HDL lowering: Packed element operand was not lowered";
+        Value updated = insertLane(packed, value);
+        values[self] = updated;
         return success();
       }
 
       if (op->getNumOperands() == 2) {
-        Value source = getValue(op->getOperand(0));
-        if (!source)
-          return op->emitError()
-                 << "HDL lowering: Packed operand was not lowered";
         Value dest = op->getOperand(1);
-        values[dest] = source;
-        if (dest == resultPtr)
-          returnValue = source;
+        if (logicPacked) {
+          LogicValue source = getLogicValue(op->getOperand(0));
+          if (!source)
+            return op->emitError()
+                   << "HDL lowering: Packed operand was not lowered";
+          logicValues[dest] = source;
+          if (dest == resultPtr) {
+            returnValue = source.val;
+            returnXz = source.xz;
+            returnIsLogic = true;
+          }
+        } else {
+          Value source = getValue(op->getOperand(0));
+          if (!source)
+            return op->emitError()
+                   << "HDL lowering: Packed operand was not lowered";
+          values[dest] = source;
+          if (dest == resultPtr)
+            returnValue = source;
+        }
         return success();
       }
       return op->emitError() << "HDL lowering: unsupported Packed call '"
