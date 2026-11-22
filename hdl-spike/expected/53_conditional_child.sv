@@ -1,29 +1,31 @@
 module AccCell(
-  input  [7:0] delta,
-  input        clk,
-               rst,
-  output [7:0] out
+  input  wire [7:0] delta,
+  input  wire       clk,
+  input  wire       rst,
+  output wire [7:0] out
 );
   wire      [7:0] _GEN;
   var logic [7:0] _GEN_0 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_0 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_0 <= _GEN;
+    end
   end
   assign _GEN = _GEN_0 + delta;
   assign out = _GEN_0;
 endmodule
 module ConditionalChain(
-  input        sel_a,
-               sel_b,
-  input  [7:0] a,
-               b,
-               c,
-  input        clk,
-               rst,
-  output [7:0] out
+  input  wire       sel_a,
+  input  wire       sel_b,
+  input  wire [7:0] a,
+  input  wire [7:0] b,
+  input  wire [7:0] c,
+  input  wire       clk,
+  input  wire       rst,
+  output wire [7:0] out
 );
   wire      [7:0] _GEN;
   wire      [7:0] _GEN_0;
@@ -36,10 +38,12 @@ module ConditionalChain(
   );
   var logic [7:0] _GEN_1 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_1 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_1 <= _GEN;
+    end
   end
   wire            _GEN_2 = ~sel_a;
   wire            _GEN_3 = _GEN_2 & sel_b;
@@ -49,12 +53,12 @@ module ConditionalChain(
   assign out = _GEN_1;
 endmodule
 module ConditionalTick(
-  input        sel,
-  input  [7:0] a,
-               b,
-  input        clk,
-               rst,
-  output [7:0] out
+  input  wire       sel,
+  input  wire [7:0] a,
+  input  wire [7:0] b,
+  input  wire       clk,
+  input  wire       rst,
+  output wire [7:0] out
 );
   wire      [7:0] _GEN;
   wire      [7:0] _cell_out;
@@ -66,10 +70,12 @@ module ConditionalTick(
   );
   var logic [7:0] _GEN_0 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_0 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_0 <= _cell_out;
+    end
   end
   assign _GEN = ~sel ? b : a;
   assign out = _GEN_0;

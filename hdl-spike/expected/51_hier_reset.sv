@@ -29,25 +29,28 @@
   `endif
 `endif
 module AsyncLowChild(
-  input        clk,
-               rst_n,
-  output [7:0] out
+  input  wire       clk,
+  input  wire       rst_n,
+  output wire [7:0] out
 );
   wire            _GEN = ~rst_n;
   var logic [7:0] reg_1 = 8'h3;
   always @(posedge clk or posedge _GEN) begin
-    if (_GEN)
+    if (_GEN) begin
       reg_1 <= 8'h3;
-    else
+    end
+    else begin
       reg_1 <= reg_1 + 8'h1;
+    end
   end
   `ifdef ENABLE_INITIAL_REG_
     `ifdef FIRRTL_BEFORE_INITIAL
       `FIRRTL_BEFORE_INITIAL
     `endif
     initial begin
-      if (_GEN)
+      if (_GEN) begin
         reg_1 = 8'h3;
+      end
     end
     `ifdef FIRRTL_AFTER_INITIAL
       `FIRRTL_AFTER_INITIAL
@@ -56,25 +59,27 @@ module AsyncLowChild(
   assign out = reg_1;
 endmodule
 module SyncHighChild(
-  input        clk,
-               rst,
-  output [7:0] out
+  input  wire       clk,
+  input  wire       rst,
+  output wire [7:0] out
 );
   wire      [7:0] _GEN;
   var logic [7:0] _GEN_0 = 8'h5;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_0 <= 8'h5;
-    else
+    end
+    else begin
       _GEN_0 <= _GEN;
+    end
   end
   assign _GEN = _GEN_0 + 8'h1;
   assign out = _GEN_0;
 endmodule
 module ResetParentHigh(
-  input        clk,
-               rst,
-  output [7:0] out
+  input  wire       clk,
+  input  wire       rst,
+  output wire [7:0] out
 );
   wire [7:0] _b_out;
   wire [7:0] _a_out;
@@ -91,9 +96,9 @@ module ResetParentHigh(
   assign out = _a_out ^ _b_out;
 endmodule
 module ResetParentLow(
-  input        clk,
-               rst_n,
-  output [7:0] out
+  input  wire       clk,
+  input  wire       rst_n,
+  output wire [7:0] out
 );
   wire [7:0] _b_out;
   wire [7:0] _a_out;

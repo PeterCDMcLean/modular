@@ -1,13 +1,13 @@
 module LogicWhileConditional(
-  input  [63:0] count,
-  input         a,
-                b,
-  input  [7:0]  wd,
-                wd_xz,
-  input         clk,
-                rst,
-  output [7:0]  out,
-                out_xz
+  input  wire [63:0] count,
+  input  wire        a,
+  input  wire        b,
+  input  wire [7:0]  wd,
+  input  wire [7:0]  wd_xz,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out,
+  output wire [7:0]  out_xz
 );
   wire      [7:0]  _GEN;
   wire      [7:0]  _GEN_0;
@@ -18,31 +18,39 @@ module LogicWhileConditional(
   wire      [7:0]  _GEN_5;
   var logic [63:0] _GEN_6 = 64'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_6 <= 64'h0;
-    else
+    end
+    else begin
       _GEN_6 <= _GEN_3;
+    end
   end
   var logic        _GEN_7 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_7 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_7 <= _GEN_2;
+    end
   end
   var logic [7:0]  _GEN_8 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_8 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_8 <= _GEN_5;
+    end
   end
   var logic [7:0]  _GEN_9 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_9 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_9 <= _GEN_4;
+    end
   end
   wire             _GEN_10 = _GEN_7 & _GEN_6 < count;
   wire             _GEN_11 = _GEN_10 & a;
@@ -61,47 +69,55 @@ module LogicWhileConditional(
   assign _GEN_3 = _GEN_10 ? (_GEN_16 ? count : _GEN_15) : 64'h0;
   var logic        _GEN_18 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_18 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_18 <= _GEN_17;
+    end
   end
   assign _GEN_2 = ~_GEN_7 | ~_GEN_17;
   var logic [7:0]  _GEN_19 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_19 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_19 <= _GEN_1;
+    end
   end
   var logic [7:0]  _GEN_20 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_20 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_20 <= _GEN_0;
+    end
   end
   assign _GEN_1 = _GEN_18 ? _GEN_8 : _GEN_19;
   assign _GEN_0 = _GEN_18 ? _GEN_9 : _GEN_20;
   var logic [7:0]  reg_1 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_1 <= 8'h0;
-    else if (_GEN_18)
+    end
+    else if (_GEN_18) begin
       reg_1 <= _GEN;
+    end
   end
   assign _GEN = reg_1 + 8'h1;
   assign out = _GEN_19;
   assign out_xz = _GEN_20;
 endmodule
 module WhileConditionalCarry(
-  input  [63:0] count,
-  input         a,
-                b,
-  input  [7:0]  wd,
-  input         clk,
-                rst,
-  output [7:0]  out
+  input  wire [63:0] count,
+  input  wire        a,
+  input  wire        b,
+  input  wire [7:0]  wd,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out
 );
   wire      [7:0]  _GEN;
   wire             _GEN_0;
@@ -109,24 +125,30 @@ module WhileConditionalCarry(
   wire      [7:0]  _GEN_2;
   var logic [63:0] _GEN_3 = 64'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_3 <= 64'h0;
-    else
+    end
+    else begin
       _GEN_3 <= _GEN_1;
+    end
   end
   var logic        _GEN_4 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_4 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_4 <= _GEN_0;
+    end
   end
   var logic [7:0]  _GEN_5 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_5 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_5 <= _GEN_2;
+    end
   end
   wire             _GEN_6 = _GEN_4 & _GEN_3 < count;
   wire      [7:0]  _GEN_7 = _GEN_6 ? _GEN_5 + wd : _GEN_5;
@@ -138,25 +160,31 @@ module WhileConditionalCarry(
   assign _GEN_1 = _GEN_6 ? (_GEN_10 ? count : _GEN_9) : 64'h0;
   var logic        _GEN_12 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_12 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_12 <= _GEN_11;
+    end
   end
   assign _GEN_0 = ~_GEN_4 | ~_GEN_11;
   var logic [7:0]  reg_0 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_0 <= 8'h0;
-    else if (_GEN_12)
+    end
+    else if (_GEN_12) begin
       reg_0 <= _GEN_5;
+    end
   end
   var logic [7:0]  reg_1 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_1 <= 8'h0;
-    else if (_GEN_12)
+    end
+    else if (_GEN_12) begin
       reg_1 <= _GEN;
+    end
   end
   assign _GEN = reg_1 + 8'h1;
   assign out = reg_0;

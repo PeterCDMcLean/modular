@@ -1,16 +1,16 @@
 module LogicCompare(
-  input  [7:0] a,
-               a_xz,
-               b,
-               b_xz,
-               x,
-               x_xz,
-               y,
-               y_xz,
-  output       eq_out,
-               eq_out_xz,
-               ne_out,
-               ne_out_xz
+  input  wire [7:0] a,
+  input  wire [7:0] a_xz,
+  input  wire [7:0] b,
+  input  wire [7:0] b_xz,
+  input  wire [7:0] x,
+  input  wire [7:0] x_xz,
+  input  wire [7:0] y,
+  input  wire [7:0] y_xz,
+  output wire       eq_out,
+  output wire       eq_out_xz,
+  output wire       ne_out,
+  output wire       ne_out_xz
 );
   wire [7:0] _GEN = a_xz | b_xz;
   wire       _GEN_0 = |_GEN;

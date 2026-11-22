@@ -1,14 +1,14 @@
 module MemTwoWrites(
-  input  [63:0] wa,
-  input  [7:0]  wd,
-  input         we,
-  input  [63:0] wb,
-  input  [7:0]  wd2,
-  input         we2,
-  input  [63:0] ra,
-  input         clk,
-                rst,
-  output [7:0]  out
+  input  wire [63:0] wa,
+  input  wire [7:0]  wd,
+  input  wire        we,
+  input  wire [63:0] wb,
+  input  wire [7:0]  wd2,
+  input  wire        we2,
+  input  wire [63:0] ra,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out
 );
   wire            _GEN;
   wire      [7:0] _GEN_0;
@@ -20,31 +20,39 @@ module MemTwoWrites(
   wire      [7:0] _GEN_6;
   var logic [7:0] mem_0_0 = 8'h1;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_0 <= 8'h1;
-    else if (_GEN_5)
+    end
+    else if (_GEN_5) begin
       mem_0_0 <= _GEN_6;
+    end
   end
   var logic [7:0] mem_0_1 = 8'h2;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_1 <= 8'h2;
-    else if (_GEN_3)
+    end
+    else if (_GEN_3) begin
       mem_0_1 <= _GEN_4;
+    end
   end
   var logic [7:0] mem_0_2 = 8'h3;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_2 <= 8'h3;
-    else if (_GEN_1)
+    end
+    else if (_GEN_1) begin
       mem_0_2 <= _GEN_2;
+    end
   end
   var logic [7:0] mem_0_3 = 8'h4;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_3 <= 8'h4;
-    else if (_GEN)
+    end
+    else if (_GEN) begin
       mem_0_3 <= _GEN_0;
+    end
   end
   wire            _GEN_7 = we2 & wb == 64'h0;
   assign _GEN_6 = _GEN_7 ? wd2 : wd;

@@ -1,17 +1,17 @@
 module LogicInverter(
-  input  [7:0] a,
-               a_xz,
-  output [7:0] out,
-               out_xz
+  input  wire [7:0] a,
+  input  wire [7:0] a_xz,
+  output wire [7:0] out,
+  output wire [7:0] out_xz
 );
   assign out = ~a;
   assign out_xz = a_xz;
 endmodule
 module LogicTop(
-  input  [7:0] d,
-               d_xz,
-  output [7:0] out,
-               out_xz
+  input  wire [7:0] d,
+  input  wire [7:0] d_xz,
+  output wire [7:0] out,
+  output wire [7:0] out_xz
 );
   LogicInverter inv (
     .a      (d),

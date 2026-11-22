@@ -1,14 +1,14 @@
 module MultiCarriedSequence(
-  input  [63:0] n,
-                m,
-  input  [7:0]  wa,
-                wa_xz,
-                wb,
-                wb_xz,
-  input         clk,
-                rst,
-  output [7:0]  out,
-                out_xz
+  input  wire [63:0] n,
+  input  wire [63:0] m,
+  input  wire [7:0]  wa,
+  input  wire [7:0]  wa_xz,
+  input  wire [7:0]  wb,
+  input  wire [7:0]  wb_xz,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out,
+  output wire [7:0]  out_xz
 );
   wire      [7:0]  _GEN;
   wire      [7:0]  _GEN_0;
@@ -33,131 +33,167 @@ module MultiCarriedSequence(
   wire      [7:0]  _GEN_19;
   var logic [63:0] _GEN_20 = 64'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_20 <= 64'h0;
-    else
+    end
+    else begin
       _GEN_20 <= _GEN_9;
+    end
   end
   var logic        _GEN_21 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_21 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_21 <= _GEN_10;
+    end
   end
   var logic [7:0]  _GEN_22 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_22 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_22 <= _GEN_6;
+    end
   end
   var logic [7:0]  _GEN_23 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_23 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_23 <= _GEN_5;
+    end
   end
   var logic [7:0]  _GEN_24 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_24 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_24 <= _GEN_4;
+    end
   end
   var logic [7:0]  _GEN_25 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_25 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_25 <= _GEN_3;
+    end
   end
   var logic [7:0]  _GEN_26 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_26 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_26 <= _GEN_8;
+    end
   end
   var logic [7:0]  _GEN_27 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_27 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_27 <= _GEN_7;
+    end
   end
   wire             _GEN_28 = _GEN_21 & _GEN_20 < n;
   wire      [63:0] _GEN_29 = _GEN_20 + 64'h1;
   var logic        _GEN_30 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_30 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_30 <= _GEN_28 & _GEN_29 == n;
+    end
   end
   var logic [63:0] _GEN_31 = 64'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_31 <= 64'h0;
-    else
+    end
+    else begin
       _GEN_31 <= _GEN_13;
+    end
   end
   var logic        _GEN_32 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_32 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_32 <= _GEN_12;
+    end
   end
   var logic        _GEN_33 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_33 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_33 <= _GEN_11;
+    end
   end
   var logic [7:0]  _GEN_34 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_34 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_34 <= _GEN_19;
+    end
   end
   var logic [7:0]  _GEN_35 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_35 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_35 <= _GEN_18;
+    end
   end
   var logic [7:0]  _GEN_36 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_36 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_36 <= _GEN_17;
+    end
   end
   var logic [7:0]  _GEN_37 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_37 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_37 <= _GEN_16;
+    end
   end
   var logic [7:0]  _GEN_38 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_38 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_38 <= _GEN_15;
+    end
   end
   var logic [7:0]  _GEN_39 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_39 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_39 <= _GEN_14;
+    end
   end
   wire             _GEN_40 = _GEN_32 & _GEN_33 & _GEN_31 < m;
   assign _GEN_19 = _GEN_33 ? {8{_GEN_40}} & wa | _GEN_34 : _GEN_22;
@@ -178,10 +214,12 @@ module MultiCarriedSequence(
   assign _GEN_12 = _GEN_30 | ~_GEN_42 & _GEN_32;
   var logic        _GEN_43 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_43 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_43 <= _GEN_42;
+    end
   end
   assign _GEN_11 = _GEN_32 & (~_GEN_33 | ~_GEN_42);
   assign _GEN_10 = ~_GEN_43;
@@ -200,49 +238,61 @@ module MultiCarriedSequence(
       : _GEN_28 ? (_GEN_25 | wb_xz) & (_GEN_25 | _GEN_24) & (wb_xz | wb) : _GEN_25;
   var logic [7:0]  _GEN_44 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_44 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_44 <= _GEN_2;
+    end
   end
   var logic [7:0]  _GEN_45 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_45 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_45 <= _GEN_1;
+    end
   end
   assign _GEN_2 = _GEN_43 ? _GEN_34 : _GEN_44;
   assign _GEN_1 = _GEN_43 ? _GEN_35 : _GEN_45;
   var logic [7:0]  _GEN_46 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_46 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_46 <= _GEN_0;
+    end
   end
   var logic [7:0]  _GEN_47 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_47 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_47 <= _GEN;
+    end
   end
   assign _GEN_0 = _GEN_43 ? _GEN_36 : _GEN_46;
   assign _GEN = _GEN_43 ? _GEN_37 : _GEN_47;
   var logic [7:0]  reg_2 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_2 <= 8'h0;
-    else if (_GEN_43)
+    end
+    else if (_GEN_43) begin
       reg_2 <= _GEN_38;
+    end
   end
   var logic [7:0]  reg_3 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_3 <= 8'h0;
-    else if (_GEN_43)
+    end
+    else if (_GEN_43) begin
       reg_3 <= _GEN_39;
+    end
   end
   assign out = _GEN_44;
   assign out_xz = _GEN_45;

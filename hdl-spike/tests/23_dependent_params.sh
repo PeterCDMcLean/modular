@@ -37,7 +37,7 @@ grep -q 'comb.add %1, %c4_i20 : i20' "$out/23_dependent_params.mlir"
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' "$out/23_dependent_params.raw.sv" \
     | grep -v '^$' > "$out/23_dependent_params.sv"
 diff -u "$root/hdl-spike/expected/23_dependent_params.sv" "$out/23_dependent_params.sv"
-grep -q 'output \[8:0\] out' "$out/23_dependent_params.sv"
-grep -q 'output \[19:0\] out' "$out/23_dependent_params.sv"
+grep -q 'output wire \[8:0\] out' "$out/23_dependent_params.sv"
+grep -q 'output wire \[19:0\] out' "$out/23_dependent_params.sv"
 
 echo "23_dependent_params: ok"

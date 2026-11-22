@@ -1,10 +1,10 @@
 module ConditionalMethodCarry(
-  input  [63:0] count,
-  input         en,
-  input  [7:0]  wd,
-  input         clk,
-                rst,
-  output [7:0]  out
+  input  wire [63:0] count,
+  input  wire        en,
+  input  wire [7:0]  wd,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out
 );
   wire             _GEN;
   wire      [63:0] _GEN_0;
@@ -12,31 +12,39 @@ module ConditionalMethodCarry(
   wire      [7:0]  _GEN_2;
   var logic [63:0] _GEN_3 = 64'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_3 <= 64'h0;
-    else
+    end
+    else begin
       _GEN_3 <= _GEN_0;
+    end
   end
   var logic        _GEN_4 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_4 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_4 <= _GEN;
+    end
   end
   var logic [7:0]  _GEN_5 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_5 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_5 <= _GEN_2;
+    end
   end
   var logic [7:0]  _GEN_6 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_6 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_6 <= _GEN_1;
+    end
   end
   wire             _GEN_7 = _GEN_4 & _GEN_3 < count;
   wire             _GEN_8 = _GEN_7 & en;
@@ -48,35 +56,41 @@ module ConditionalMethodCarry(
   assign _GEN_0 = _GEN_7 ? _GEN_10 : 64'h0;
   var logic        _GEN_12 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_12 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_12 <= _GEN_11;
+    end
   end
   assign _GEN = ~_GEN_4 | ~_GEN_11;
   var logic [7:0]  reg_0 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_0 <= 8'h0;
-    else if (_GEN_12)
+    end
+    else if (_GEN_12) begin
       reg_0 <= _GEN_5;
+    end
   end
   var logic [7:0]  reg_1 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_1 <= 8'h0;
-    else if (_GEN_12)
+    end
+    else if (_GEN_12) begin
       reg_1 <= _GEN_6;
+    end
   end
   assign out = reg_0;
 endmodule
 module LocalStepCarry(
-  input  [63:0] count,
-  input         en,
-  input  [7:0]  wd,
-  input         clk,
-                rst,
-  output [7:0]  out
+  input  wire [63:0] count,
+  input  wire        en,
+  input  wire [7:0]  wd,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out
 );
   wire             _GEN;
   wire      [63:0] _GEN_0;
@@ -84,31 +98,39 @@ module LocalStepCarry(
   wire      [7:0]  _GEN_2;
   var logic [63:0] _GEN_3 = 64'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_3 <= 64'h0;
-    else
+    end
+    else begin
       _GEN_3 <= _GEN_0;
+    end
   end
   var logic        _GEN_4 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_4 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_4 <= _GEN;
+    end
   end
   var logic [7:0]  _GEN_5 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_5 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_5 <= _GEN_2;
+    end
   end
   var logic [7:0]  _GEN_6 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_6 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_6 <= _GEN_1;
+    end
   end
   wire             _GEN_7 = _GEN_4 & _GEN_3 < count;
   wire      [7:0]  _GEN_8 = wd + 8'h2;
@@ -121,25 +143,31 @@ module LocalStepCarry(
   assign _GEN_0 = _GEN_7 ? _GEN_11 : 64'h0;
   var logic        _GEN_13 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_13 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_13 <= _GEN_12;
+    end
   end
   assign _GEN = ~_GEN_4 | ~_GEN_12;
   var logic [7:0]  reg_0 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_0 <= 8'h0;
-    else if (_GEN_13)
+    end
+    else if (_GEN_13) begin
       reg_0 <= _GEN_5;
+    end
   end
   var logic [7:0]  reg_1 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_1 <= 8'h0;
-    else if (_GEN_13)
+    end
+    else if (_GEN_13) begin
       reg_1 <= _GEN_6;
+    end
   end
   assign out = reg_0;
 endmodule

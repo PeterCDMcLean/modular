@@ -29,24 +29,27 @@
   `endif
 `endif
 module AsyncHighCounter(
-  input        clk,
-               rst,
-  output [7:0] out
+  input  wire       clk,
+  input  wire       rst,
+  output wire [7:0] out
 );
   var logic [7:0] reg_1 = 8'h2;
   always @(posedge clk or posedge rst) begin
-    if (rst)
+    if (rst) begin
       reg_1 <= 8'h2;
-    else
+    end
+    else begin
       reg_1 <= reg_1 + 8'h1;
+    end
   end
   `ifdef ENABLE_INITIAL_REG_
     `ifdef FIRRTL_BEFORE_INITIAL
       `FIRRTL_BEFORE_INITIAL
     `endif
     initial begin
-      if (rst)
+      if (rst) begin
         reg_1 = 8'h2;
+      end
     end
     `ifdef FIRRTL_AFTER_INITIAL
       `FIRRTL_AFTER_INITIAL
@@ -55,25 +58,28 @@ module AsyncHighCounter(
   assign out = reg_1;
 endmodule
 module AsyncLowCounter(
-  input        clk,
-               rst_n,
-  output [7:0] out
+  input  wire       clk,
+  input  wire       rst_n,
+  output wire [7:0] out
 );
   wire            _GEN = ~rst_n;
   var logic [7:0] reg_1 = 8'h3;
   always @(posedge clk or posedge _GEN) begin
-    if (_GEN)
+    if (_GEN) begin
       reg_1 <= 8'h3;
-    else
+    end
+    else begin
       reg_1 <= reg_1 + 8'h1;
+    end
   end
   `ifdef ENABLE_INITIAL_REG_
     `ifdef FIRRTL_BEFORE_INITIAL
       `FIRRTL_BEFORE_INITIAL
     `endif
     initial begin
-      if (_GEN)
+      if (_GEN) begin
         reg_1 = 8'h3;
+      end
     end
     `ifdef FIRRTL_AFTER_INITIAL
       `FIRRTL_AFTER_INITIAL
@@ -82,25 +88,27 @@ module AsyncLowCounter(
   assign out = reg_1;
 endmodule
 module SyncLowCounter(
-  input        clk,
-               rst_n,
-  output [7:0] out
+  input  wire       clk,
+  input  wire       rst_n,
+  output wire [7:0] out
 );
   wire      [7:0] _GEN;
   var logic [7:0] _GEN_0 = 8'h1;
   always @(posedge clk) begin
-    if (~rst_n)
+    if (~rst_n) begin
       _GEN_0 <= 8'h1;
-    else
+    end
+    else begin
       _GEN_0 <= _GEN;
+    end
   end
   assign _GEN = _GEN_0 + 8'h1;
   assign out = _GEN_0;
 endmodule
 module ResetTop(
-  input        clk,
-               rst,
-  output [7:0] out
+  input  wire       clk,
+  input  wire       rst,
+  output wire [7:0] out
 );
   SyncLowCounter low (
     .clk   (clk),

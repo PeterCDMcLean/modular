@@ -1,12 +1,12 @@
 module LogicMem(
-  input  [63:0] addr,
-  input  [7:0]  wd,
-                wd_xz,
-  input         we,
-                clk,
-                rst,
-  output [7:0]  out,
-                out_xz
+  input  wire [63:0] addr,
+  input  wire [7:0]  wd,
+  input  wire [7:0]  wd_xz,
+  input  wire        we,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out,
+  output wire [7:0]  out_xz
 );
   wire            _GEN;
   wire            _GEN_0;
@@ -14,59 +14,75 @@ module LogicMem(
   wire            _GEN_2;
   var logic [7:0] mem_0_0 = 8'h1;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_0 <= 8'h1;
-    else if (_GEN_2)
+    end
+    else if (_GEN_2) begin
       mem_0_0 <= wd;
+    end
   end
   var logic [7:0] mem_0_0_xz = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_0_xz <= 8'h0;
-    else if (_GEN_2)
+    end
+    else if (_GEN_2) begin
       mem_0_0_xz <= wd_xz;
+    end
   end
   var logic [7:0] mem_0_1 = 8'h2;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_1 <= 8'h2;
-    else if (_GEN_1)
+    end
+    else if (_GEN_1) begin
       mem_0_1 <= wd;
+    end
   end
   var logic [7:0] mem_0_1_xz = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_1_xz <= 8'h0;
-    else if (_GEN_1)
+    end
+    else if (_GEN_1) begin
       mem_0_1_xz <= wd_xz;
+    end
   end
   var logic [7:0] mem_0_2 = 8'h3;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_2 <= 8'h3;
-    else if (_GEN_0)
+    end
+    else if (_GEN_0) begin
       mem_0_2 <= wd;
+    end
   end
   var logic [7:0] mem_0_2_xz = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_2_xz <= 8'h0;
-    else if (_GEN_0)
+    end
+    else if (_GEN_0) begin
       mem_0_2_xz <= wd_xz;
+    end
   end
   var logic [7:0] mem_0_3 = 8'h4;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_3 <= 8'h4;
-    else if (_GEN)
+    end
+    else if (_GEN) begin
       mem_0_3 <= wd;
+    end
   end
   var logic [7:0] mem_0_3_xz = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_3_xz <= 8'h0;
-    else if (_GEN)
+    end
+    else if (_GEN) begin
       mem_0_3_xz <= wd_xz;
+    end
   end
   assign _GEN_2 = we & addr == 64'h0;
   assign _GEN_1 = we & addr == 64'h1;

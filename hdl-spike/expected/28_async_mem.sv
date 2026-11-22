@@ -29,12 +29,12 @@
   `endif
 `endif
 module AsyncMem(
-  input  [63:0] addr,
-  input  [7:0]  wdata,
-  input         we,
-                clk,
-                rst,
-  output [7:0]  out
+  input  wire [63:0] addr,
+  input  wire [7:0]  wdata,
+  input  wire        we,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out
 );
   var logic [7:0] mem_1_0 = 8'h5;
   var logic [7:0] mem_1_1 = 8'h5;

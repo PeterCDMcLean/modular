@@ -1,6 +1,6 @@
 module Inv(
-  input  a,
-  output y
+  input  wire a,
+  output wire y
 );
   assign y = ~a;
 endmodule

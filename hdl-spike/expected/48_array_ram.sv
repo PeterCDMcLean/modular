@@ -39,19 +39,20 @@
   `endif
 `endif
 module mem_4x8(
-  input  [1:0] R0_addr,
-  input        R0_en,
-               R0_clk,
-  output [7:0] R0_data,
-  input  [1:0] W0_addr,
-  input        W0_en,
-               W0_clk,
-  input  [7:0] W0_data
+  input  wire [1:0] R0_addr,
+  input  wire       R0_en,
+  input  wire       R0_clk,
+  output wire [7:0] R0_data,
+  input  wire [1:0] W0_addr,
+  input  wire       W0_en,
+  input  wire       W0_clk,
+  input  wire [7:0] W0_data
 );
   var logic [7:0] Memory[0:3];
   always @(posedge W0_clk) begin
-    if (W0_en)
+    if (W0_en) begin
       Memory[W0_addr] <= W0_data;
+    end
   end
   `ifdef ENABLE_INITIAL_MEM_
     var logic [31:0] _RANDOM_MEM;
@@ -68,12 +69,12 @@ module mem_4x8(
   assign R0_data = R0_en ? Memory[R0_addr] : 8'bx;
 endmodule
 module ArrayRamDemo(
-  input  [63:0] addr,
-  input  [7:0]  wd,
-  input         we,
-                clk,
-                rst,
-  output [7:0]  out
+  input  wire [63:0] addr,
+  input  wire [7:0]  wd,
+  input  wire        we,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out
 );
   wire [1:0] _addr_1to0;
   mem_4x8 mem_ext (

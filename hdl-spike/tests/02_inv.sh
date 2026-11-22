@@ -40,9 +40,15 @@ if [[ -x "$CIRCT_OPT" ]]; then
       -o "$out/01_inv.sv.mlir"
   "$CIRCT_OPT" "$out/01_inv.sv.mlir" --export-verilog -o /dev/null \
       > "$out/01_inv.circt-opt.sv" 2>/dev/null
+  # The external circt-opt build may predate the wire/begin-end style
+  # defaults; normalize port declarations before comparing the body.
   sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' \
-      "$out/01_inv.circt-opt.sv" | grep -v '^$' > "$out/01_inv.circt-opt.clean.sv"
-  diff -u "$out/01_inv.sv" "$out/01_inv.circt-opt.clean.sv"
+      "$out/01_inv.circt-opt.sv" \
+      | sed -E 's/^  input  wire /  input  /; s/^  output wire /  output /' \
+      | grep -v '^$' > "$out/01_inv.circt-opt.clean.sv"
+  sed -E 's/^  input  wire /  input  /; s/^  output wire /  output /' \
+      "$out/01_inv.sv" > "$out/01_inv.cmp.sv"
+  diff -u "$out/01_inv.cmp.sv" "$out/01_inv.circt-opt.clean.sv"
 fi
 
 # 5. Optional lint.

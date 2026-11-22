@@ -1,12 +1,12 @@
 module LogicOps(
-  input        c,
-               c_xz,
-  input  [7:0] a,
-               a_xz,
-               b,
-               b_xz,
-  output [7:0] out,
-               out_xz
+  input  wire       c,
+  input  wire       c_xz,
+  input  wire [7:0] a,
+  input  wire [7:0] a_xz,
+  input  wire [7:0] b,
+  input  wire [7:0] b_xz,
+  output wire [7:0] out,
+  output wire [7:0] out_xz
 );
   wire [7:0] _GEN = (a_xz | b_xz) & (a_xz | a) & (b_xz | b);
   wire [7:0] _GEN_0 = a & b;

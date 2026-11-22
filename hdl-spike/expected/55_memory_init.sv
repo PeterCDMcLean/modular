@@ -1,10 +1,10 @@
 module ArrayRamInit(
-  input  [63:0] addr,
-  input  [7:0]  wd,
-  input         we,
-                clk,
-                rst,
-  output [7:0]  out
+  input  wire [63:0] addr,
+  input  wire [7:0]  wd,
+  input  wire        we,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out
 );
   var logic [7:0] array_ram_1[0:3];
   initial begin
@@ -21,19 +21,20 @@ module ArrayRamInit(
       array_ram_1[2'h3] <= 8'h4;
     end
     else begin
-      if (we)
+      if (we) begin
         array_ram_1[addr[1:0]] <= wd;
+      end
     end
   end
   assign out = array_ram_1[addr[1:0]];
 endmodule
 module ArrayRamInitLow(
-  input  [63:0] addr,
-  input  [7:0]  wd,
-  input         we,
-                clk,
-                rst_n,
-  output [7:0]  out
+  input  wire [63:0] addr,
+  input  wire [7:0]  wd,
+  input  wire        we,
+  input  wire        clk,
+  input  wire        rst_n,
+  output wire [7:0]  out
 );
   wire            _GEN = ~rst_n;
   var logic [7:0] array_ram_1[0:3];
@@ -51,19 +52,20 @@ module ArrayRamInitLow(
       array_ram_1[2'h3] <= 8'h4;
     end
     else begin
-      if (we)
+      if (we) begin
         array_ram_1[addr[1:0]] <= wd;
+      end
     end
   end
   assign out = array_ram_1[addr[1:0]];
 endmodule
 module RamInit(
-  input  [63:0] addr,
-  input  [7:0]  wd,
-  input         we,
-                clk,
-                rst,
-  output [7:0]  out
+  input  wire [63:0] addr,
+  input  wire [7:0]  wd,
+  input  wire        we,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out
 );
   var logic [7:0] ram_1[0:3];
   initial begin
@@ -80,19 +82,20 @@ module RamInit(
       ram_1[2'h3] <= 8'h4;
     end
     else begin
-      if (we)
+      if (we) begin
         ram_1[addr[1:0]] <= wd;
+      end
     end
   end
   assign out = ram_1[addr[1:0]];
 endmodule
 module RamInitAsync(
-  input  [63:0] addr,
-  input  [7:0]  wd,
-  input         we,
-                clk,
-                rst,
-  output [7:0]  out
+  input  wire [63:0] addr,
+  input  wire [7:0]  wd,
+  input  wire        we,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out
 );
   var logic [7:0] ram_1[0:3];
   initial begin
@@ -109,8 +112,9 @@ module RamInitAsync(
       ram_1[2'h3] <= 8'h4;
     end
     else begin
-      if (we)
+      if (we) begin
         ram_1[addr[1:0]] <= wd;
+      end
     end
   end
   assign out = ram_1[addr[1:0]];

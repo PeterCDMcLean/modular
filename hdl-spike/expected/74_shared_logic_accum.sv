@@ -1,12 +1,12 @@
 module SharedLogicAccum(
-  input  [63:0] n,
-                m,
-  input  [7:0]  wd,
-                wd_xz,
-  input         clk,
-                rst,
-  output [7:0]  out,
-                out_xz
+  input  wire [63:0] n,
+  input  wire [63:0] m,
+  input  wire [7:0]  wd,
+  input  wire [7:0]  wd_xz,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out,
+  output wire [7:0]  out_xz
 );
   wire      [7:0]  _GEN;
   wire      [7:0]  _GEN_0;
@@ -22,75 +22,95 @@ module SharedLogicAccum(
   wire      [7:0]  _GEN_10;
   var logic [63:0] _GEN_11 = 64'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_11 <= 64'h0;
-    else
+    end
+    else begin
       _GEN_11 <= _GEN_4;
+    end
   end
   var logic        _GEN_12 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_12 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_12 <= _GEN_5;
+    end
   end
   var logic [7:0]  _GEN_13 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_13 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_13 <= _GEN_3;
+    end
   end
   var logic [7:0]  _GEN_14 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_14 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_14 <= _GEN_2;
+    end
   end
   wire             _GEN_15 = _GEN_12 & _GEN_11 < n;
   wire      [63:0] _GEN_16 = _GEN_11 + 64'h1;
   var logic        _GEN_17 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_17 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_17 <= _GEN_15 & _GEN_16 == n;
+    end
   end
   var logic [63:0] _GEN_18 = 64'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_18 <= 64'h0;
-    else
+    end
+    else begin
       _GEN_18 <= _GEN_8;
+    end
   end
   var logic        _GEN_19 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_19 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_19 <= _GEN_7;
+    end
   end
   var logic        _GEN_20 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_20 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_20 <= _GEN_6;
+    end
   end
   var logic [7:0]  _GEN_21 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_21 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_21 <= _GEN_10;
+    end
   end
   var logic [7:0]  _GEN_22 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_22 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_22 <= _GEN_9;
+    end
   end
   wire             _GEN_23 = _GEN_19 & _GEN_20 & _GEN_18 < m;
   assign _GEN_10 = _GEN_20 ? {8{_GEN_23}} & wd | _GEN_21 : _GEN_13;
@@ -104,10 +124,12 @@ module SharedLogicAccum(
   assign _GEN_7 = _GEN_17 | ~_GEN_25 & _GEN_19;
   var logic        _GEN_26 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_26 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_26 <= _GEN_25;
+    end
   end
   assign _GEN_6 = _GEN_19 & (~_GEN_20 | ~_GEN_25);
   assign _GEN_5 = ~_GEN_26;
@@ -119,26 +141,32 @@ module SharedLogicAccum(
       : _GEN_15 ? (_GEN_14 | wd_xz) & (_GEN_14 | ~_GEN_13) & (wd_xz | ~wd) : _GEN_14;
   var logic [7:0]  _GEN_27 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_27 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_27 <= _GEN_1;
+    end
   end
   var logic [7:0]  _GEN_28 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_28 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_28 <= _GEN_0;
+    end
   end
   assign _GEN_1 = _GEN_26 ? _GEN_21 : _GEN_27;
   assign _GEN_0 = _GEN_26 ? _GEN_22 : _GEN_28;
   var logic [7:0]  reg_1 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_1 <= 8'h0;
-    else if (_GEN_26)
+    end
+    else if (_GEN_26) begin
       reg_1 <= _GEN;
+    end
   end
   assign _GEN = reg_1 + 8'h1;
   assign out = _GEN_27;

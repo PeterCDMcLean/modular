@@ -40,6 +40,6 @@ diff -u "$root/hdl-spike/expected/26_resettable.sv" "$out/26_resettable.sv"
 grep -q 'always @(posedge clk_sync_step)' "$out/26_resettable.sv"
 grep -q 'always @(posedge clk_async_step or posedge rst_async_step)' \
     "$out/26_resettable.sv"
-grep -q 'output \[7:0\] sync_step_out' "$out/26_resettable.sv"
+grep -q 'output wire \[7:0\] sync_step_out' "$out/26_resettable.sv"
 
 echo "26_resettable: ok"

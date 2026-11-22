@@ -29,34 +29,38 @@
   `endif
 `endif
 module MixedLogicReset(
-  input  [7:0] d,
-               d_xz,
-               e,
-               e_xz,
-  input        clk_sync_step,
-               rst_sync_step,
-               clk_async_step,
-               rst_async_step,
-  output [7:0] sync_step_out,
-               sync_step_out_xz,
-               async_step_out,
-               async_step_out_xz
+  input  wire [7:0] d,
+  input  wire [7:0] d_xz,
+  input  wire [7:0] e,
+  input  wire [7:0] e_xz,
+  input  wire       clk_sync_step,
+  input  wire       rst_sync_step,
+  input  wire       clk_async_step,
+  input  wire       rst_async_step,
+  output wire [7:0] sync_step_out,
+  output wire [7:0] sync_step_out_xz,
+  output wire [7:0] async_step_out,
+  output wire [7:0] async_step_out_xz
 );
   wire      [7:0] _GEN;
   wire      [7:0] _GEN_0;
   var logic [7:0] _GEN_1 = 8'h3;
   always @(posedge clk_sync_step) begin
-    if (rst_sync_step)
+    if (rst_sync_step) begin
       _GEN_1 <= 8'h3;
-    else
+    end
+    else begin
       _GEN_1 <= _GEN;
+    end
   end
   var logic [7:0] _GEN_2 = 8'h0;
   always @(posedge clk_sync_step) begin
-    if (rst_sync_step)
+    if (rst_sync_step) begin
       _GEN_2 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_2 <= _GEN_0;
+    end
   end
   assign _GEN_0 = (_GEN_2 | d_xz) & (_GEN_2 | _GEN_1) & (d_xz | d);
   assign _GEN = ~(_GEN_1 & d);

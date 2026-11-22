@@ -52,7 +52,7 @@ sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' \
 diff -u "$root/hdl-spike/expected/57_array_value.sv" \
     "$out/57_array_value.sv"
 
-grep -q 'input  \[31:0\] a' "$out/57_array_value.sv"
+grep -q 'input  wire \[31:0\] a' "$out/57_array_value.sv"
 grep -q "var logic \[31:0\] _GEN_0 = 32'h4030201;" \
     "$out/57_array_value.sv"
 grep -q '_GEN_0\[7:0\]' "$out/57_array_value.sv"

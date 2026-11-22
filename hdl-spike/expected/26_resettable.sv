@@ -29,36 +29,41 @@
   `endif
 `endif
 module MixedReset(
-  input        clk_sync_step,
-               rst_sync_step,
-               clk_async_step,
-               rst_async_step,
-  output [7:0] sync_step_out,
-               async_step_out
+  input  wire       clk_sync_step,
+  input  wire       rst_sync_step,
+  input  wire       clk_async_step,
+  input  wire       rst_async_step,
+  output wire [7:0] sync_step_out,
+  output wire [7:0] async_step_out
 );
   wire      [7:0] _GEN;
   var logic [7:0] _GEN_0 = 8'h3;
   always @(posedge clk_sync_step) begin
-    if (rst_sync_step)
+    if (rst_sync_step) begin
       _GEN_0 <= 8'h3;
-    else
+    end
+    else begin
       _GEN_0 <= _GEN;
+    end
   end
   assign _GEN = _GEN_0 + 8'h1;
   var logic [7:0] reg_1 = 8'h5;
   always @(posedge clk_async_step or posedge rst_async_step) begin
-    if (rst_async_step)
+    if (rst_async_step) begin
       reg_1 <= 8'h5;
-    else
+    end
+    else begin
       reg_1 <= reg_1 + 8'h1;
+    end
   end
   `ifdef ENABLE_INITIAL_REG_
     `ifdef FIRRTL_BEFORE_INITIAL
       `FIRRTL_BEFORE_INITIAL
     `endif
     initial begin
-      if (rst_async_step)
+      if (rst_async_step) begin
         reg_1 = 8'h5;
+      end
     end
     `ifdef FIRRTL_AFTER_INITIAL
       `FIRRTL_AFTER_INITIAL

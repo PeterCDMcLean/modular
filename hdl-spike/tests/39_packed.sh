@@ -45,7 +45,7 @@ fi
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' "$out/39_packed.raw.sv" \
     | grep -v '^$' > "$out/39_packed.sv"
 diff -u "$root/hdl-spike/expected/39_packed.sv" "$out/39_packed.sv"
-grep -q 'input  \[31:0\] din' "$out/39_packed.sv"
+grep -q 'input  wire \[31:0\] din' "$out/39_packed.sv"
 grep -q 'var logic \[31:0\] _GEN' "$out/39_packed.sv"
 grep -q '_GEN <= din;' "$out/39_packed.sv"
 grep -q 'assign out = din;' "$out/39_packed.sv"

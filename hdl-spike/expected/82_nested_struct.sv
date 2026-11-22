@@ -1,9 +1,9 @@
 module NestedCarry(
-  input  [63:0] count,
-  input  [7:0]  wd,
-  input         clk,
-                rst,
-  output [7:0]  out
+  input  wire [63:0] count,
+  input  wire [7:0]  wd,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out
 );
   wire             _GEN;
   wire      [63:0] _GEN_0;
@@ -12,38 +12,48 @@ module NestedCarry(
   wire      [7:0]  _GEN_3;
   var logic [63:0] _GEN_4 = 64'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_4 <= 64'h0;
-    else
+    end
+    else begin
       _GEN_4 <= _GEN_0;
+    end
   end
   var logic        _GEN_5 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_5 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_5 <= _GEN;
+    end
   end
   var logic [7:0]  _GEN_6 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_6 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_6 <= _GEN_3;
+    end
   end
   var logic [7:0]  _GEN_7 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_7 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_7 <= _GEN_2;
+    end
   end
   var logic [7:0]  _GEN_8 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_8 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_8 <= _GEN_1;
+    end
   end
   wire             _GEN_9 = _GEN_5 & _GEN_4 < count;
   assign _GEN_3 = _GEN_5 ? (_GEN_9 ? _GEN_6 + wd : _GEN_6) : wd + 8'h1;
@@ -54,45 +64,53 @@ module NestedCarry(
   assign _GEN_0 = _GEN_9 ? _GEN_10 : 64'h0;
   var logic        _GEN_12 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_12 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_12 <= _GEN_11;
+    end
   end
   assign _GEN = ~_GEN_5 | ~_GEN_11;
   var logic [7:0]  reg_0 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_0 <= 8'h0;
-    else if (_GEN_12)
+    end
+    else if (_GEN_12) begin
       reg_0 <= _GEN_6;
+    end
   end
   var logic [7:0]  reg_1 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_1 <= 8'h0;
-    else if (_GEN_12)
+    end
+    else if (_GEN_12) begin
       reg_1 <= _GEN_7;
+    end
   end
   var logic [7:0]  reg_2 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_2 <= 8'h0;
-    else if (_GEN_12)
+    end
+    else if (_GEN_12) begin
       reg_2 <= _GEN_8;
+    end
   end
   assign out = reg_0;
 endmodule
 module NestedMethodCarry(
-  input  [63:0] count,
-  input  [7:0]  init,
-                init_xz,
-                wd,
-                wd_xz,
-  input         clk,
-                rst,
-  output [7:0]  out,
-                out_xz
+  input  wire [63:0] count,
+  input  wire [7:0]  init,
+  input  wire [7:0]  init_xz,
+  input  wire [7:0]  wd,
+  input  wire [7:0]  wd_xz,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out,
+  output wire [7:0]  out_xz
 );
   wire      [7:0]  _GEN;
   wire      [7:0]  _GEN_0;
@@ -103,38 +121,48 @@ module NestedMethodCarry(
   wire      [7:0]  _GEN_5;
   var logic [63:0] _GEN_6 = 64'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_6 <= 64'h0;
-    else
+    end
+    else begin
       _GEN_6 <= _GEN_2;
+    end
   end
   var logic        _GEN_7 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_7 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_7 <= _GEN_1;
+    end
   end
   var logic [7:0]  _GEN_8 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_8 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_8 <= _GEN_5;
+    end
   end
   var logic [7:0]  _GEN_9 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_9 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_9 <= _GEN_4;
+    end
   end
   var logic [3:0]  _GEN_10 = 4'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_10 <= 4'h0;
-    else
+    end
+    else begin
       _GEN_10 <= _GEN_3;
+    end
   end
   wire             _GEN_11 = _GEN_7 & _GEN_6 < count;
   assign _GEN_5 = _GEN_7 ? {8{_GEN_11}} & wd | _GEN_8 : init;
@@ -148,34 +176,42 @@ module NestedMethodCarry(
   assign _GEN_2 = _GEN_11 ? _GEN_12 : 64'h0;
   var logic        _GEN_14 = 1'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_14 <= 1'h0;
-    else
+    end
+    else begin
       _GEN_14 <= _GEN_13;
+    end
   end
   assign _GEN_1 = ~_GEN_7 | ~_GEN_13;
   var logic [7:0]  _GEN_15 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_15 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_15 <= _GEN_0;
+    end
   end
   var logic [7:0]  _GEN_16 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       _GEN_16 <= 8'h0;
-    else
+    end
+    else begin
       _GEN_16 <= _GEN;
+    end
   end
   assign _GEN_0 = _GEN_14 ? _GEN_8 : _GEN_15;
   assign _GEN = _GEN_14 ? _GEN_9 : _GEN_16;
   var logic [3:0]  reg_1 = 4'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       reg_1 <= 4'h0;
-    else if (_GEN_14)
+    end
+    else if (_GEN_14) begin
       reg_1 <= _GEN_10;
+    end
   end
   assign out = _GEN_15;
   assign out_xz = _GEN_16;

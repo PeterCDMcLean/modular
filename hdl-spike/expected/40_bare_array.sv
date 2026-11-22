@@ -1,10 +1,10 @@
 module BareArray(
-  input  [63:0] addr,
-  input  [7:0]  wd,
-  input         we,
-                clk,
-                rst,
-  output [7:0]  out
+  input  wire [63:0] addr,
+  input  wire [7:0]  wd,
+  input  wire        we,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out
 );
   wire            _GEN;
   wire            _GEN_0;
@@ -12,31 +12,39 @@ module BareArray(
   wire            _GEN_2;
   var logic [7:0] mem_0_0 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_0 <= 8'h0;
-    else if (_GEN_2)
+    end
+    else if (_GEN_2) begin
       mem_0_0 <= wd;
+    end
   end
   var logic [7:0] mem_0_1 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_1 <= 8'h0;
-    else if (_GEN_1)
+    end
+    else if (_GEN_1) begin
       mem_0_1 <= wd;
+    end
   end
   var logic [7:0] mem_0_2 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_2 <= 8'h0;
-    else if (_GEN_0)
+    end
+    else if (_GEN_0) begin
       mem_0_2 <= wd;
+    end
   end
   var logic [7:0] mem_0_3 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_3 <= 8'h0;
-    else if (_GEN)
+    end
+    else if (_GEN) begin
       mem_0_3 <= wd;
+    end
   end
   assign _GEN_2 = we & addr == 64'h0;
   assign _GEN_1 = we & addr == 64'h1;
@@ -46,44 +54,52 @@ module BareArray(
     addr == 64'h3 ? mem_0_3 : addr == 64'h2 ? mem_0_2 : addr == 64'h1 ? mem_0_1 : mem_0_0;
 endmodule
 module LogicArray(
-  input  [63:0] addr,
-  input  [7:0]  wd,
-                wd_xz,
-  input         we,
-                clk,
-                rst,
-  output [7:0]  out,
-                out_xz
+  input  wire [63:0] addr,
+  input  wire [7:0]  wd,
+  input  wire [7:0]  wd_xz,
+  input  wire        we,
+  input  wire        clk,
+  input  wire        rst,
+  output wire [7:0]  out,
+  output wire [7:0]  out_xz
 );
   wire            _GEN;
   wire            _GEN_0;
   var logic [7:0] mem_0_0 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_0 <= 8'h0;
-    else if (_GEN_0)
+    end
+    else if (_GEN_0) begin
       mem_0_0 <= wd;
+    end
   end
   var logic [7:0] mem_0_0_xz = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_0_xz <= 8'h0;
-    else if (_GEN_0)
+    end
+    else if (_GEN_0) begin
       mem_0_0_xz <= wd_xz;
+    end
   end
   var logic [7:0] mem_0_1 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_1 <= 8'h0;
-    else if (_GEN)
+    end
+    else if (_GEN) begin
       mem_0_1 <= wd;
+    end
   end
   var logic [7:0] mem_0_1_xz = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_1_xz <= 8'h0;
-    else if (_GEN)
+    end
+    else if (_GEN) begin
       mem_0_1_xz <= wd_xz;
+    end
   end
   assign _GEN_0 = we & addr == 64'h0;
   assign _GEN = we & addr == 64'h1;
@@ -92,23 +108,26 @@ module LogicArray(
   assign out_xz = _GEN_1 ? mem_0_1_xz : mem_0_0_xz;
 endmodule
 module StaticArray(
-  input  [7:0] wd,
-  input        we,
-               clk,
-               rst,
-  output [7:0] out
+  input  wire [7:0] wd,
+  input  wire       we,
+  input  wire       clk,
+  input  wire       rst,
+  output wire [7:0] out
 );
   var logic [7:0] mem_0_0 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_0 <= 8'h0;
-    else if (we)
+    end
+    else if (we) begin
       mem_0_0 <= wd;
+    end
   end
   var logic [7:0] mem_0_1 = 8'h0;
   always @(posedge clk) begin
-    if (rst)
+    if (rst) begin
       mem_0_1 <= 8'h0;
+    end
   end
   assign out = mem_0_1;
 endmodule
