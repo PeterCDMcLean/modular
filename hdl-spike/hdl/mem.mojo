@@ -59,6 +59,7 @@ struct Mem[T: HdlType & Deinitable & Defaultable, N: Int = 4](
         if enable:
             var element = self.data[index].copy()
             element.next(1) <= value
+            element.tick()
             self.data[index] = element^
 
     def read(self, index: Int) -> Self.T:
