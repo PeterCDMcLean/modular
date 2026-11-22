@@ -23,8 +23,8 @@ Build and test record:
 * `hdl-spike/tests/run_all.sh`: **green** in both `-c dbg` and `-c opt`
   (00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15, 16,
   17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
-  35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49). `--emit=circt`
-  and `--emit=sv` run in-process.
+  35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50).
+  `--emit=circt` and `--emit=sv` run in-process.
 * Verilator lint: skipped (not installed).
 * CLI adaptation: the current compiler uses `-I <dir>`; the tests were updated
   from `-mojo-search-paths`.
@@ -49,6 +49,7 @@ Build and test record:
 | Typed Wire | **green (prototype)** | `designs/36_wire.mojo` | `Wire[W]` is a combinational field, not state: assignments define an SSA net and reads copy it. A module containing only wires has no clock or register (`36_wire`). |
 | Clock sources | **green (prototype)** | `designs/35_clock_source.mojo` | A no-hardware `ClockDivider[pow2]` field roots a sub-domain: the module's registers and child instances are clocked by `seq.clock_div ambient by pow2`. A child module can therefore root its own divided domain beneath the parent (`35_clock_source`). |
 | Processes/domains | **green (prototype)** | `designs/15_two_domains.mojo`, `designs/21_bad_multi_driver.mojo`, `designs/21_bad_cross_read.mojo` | The single-method restriction is removed. Each method is a process; every stateful method root gets its own `clk_<method>`/`rst_<method>` pair, its registers are clocked by that domain, and multi-method outputs default to `<method>_out`. Writing one state field from two processes, or reading a field from a process other than its driver, is a diagnostic (`21_domain_checks`). |
+| Automatic Sim process discovery | **green (prototype)** | `tools/gen_sim_step.py`, `designs/50_auto_process.mojo`, `tests/50_auto_process.sh` | The generator scans an `@module` source for `# @process` methods and emits `<Module>_step(mut sim)`, which invokes every discovered process and then `commit_state`. The design contains no `step`/`commit_state` registration. Test 50 concatenates design, generated adapter, and a harness, then runs a two-process domain (`c0 1 0`, `c1 2 1`, `c2 3 2`). This is source generation, not compiler method reflection. |
 | Array Sim state | **green (prototype)** | `tests/12_sim_delay.mojo` | `hdl.Array` wraps the native fixed-size array and conforms to `SimState`. Its `commit` visits every element once, so a domain traversal commits bare `Array[Reg[T],N]` fields and arrays of nested module structs. The Sim test includes two registers, two array registers, and two array child modules; both arrays commit after both process calls (`a0 1 0 1 0`, `a1 2 1 2 1`). |
 | Direct array assignment | **green (prototype)** | `designs/45_direct_array.mojo` | `mem[i] = Reg[T](value)` lowers as a clocked element update. In practice the elaborator forwards the `Reg` construction into the element pointer; the pass also recognizes an explicit `Array::__setitem__` form and routes it through the same array-write helper. Dynamic and static indices work, and `T = Logic[W]` drives both the value and mask registers. |
 | Array-register memory | **green (prototype)** | `designs/48_array_ram.mojo` | `ArrayRam[T, N]` lowers to one array-typed `seq.firreg` plus `hw.array_get`, `hw.array_inject`, and a `comb.mux` write-enable cone — the form CIRCT's `seq-reg-of-vec-to-mem` recognizes. The local SV path pattern-matches that form and emits an unpacked-array memory (`var logic [7:0] array_ram_0[0:3]`) with an `always_ff` write and combinational read. No CIRCT Seq transforms are linked. |
@@ -61,7 +62,7 @@ Build and test record:
 `tests/run_all.sh` runs 00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11,
 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
-and 49; all pass.
+49, and 50; all pass.
 
 **Second phase (combined CIRCT/LLVM lowering).** The compiler now builds *real*
 CIRCT ops. CIRCT is a **git submodule** at `third_party/circt` pointing at the
