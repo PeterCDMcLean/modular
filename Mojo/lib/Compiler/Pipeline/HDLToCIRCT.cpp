@@ -858,6 +858,9 @@ private:
   // One-cycle pulse after a runtime loop completes. Subsequent ops in the
   // same block are gated by it, so post-loop code runs once per traversal.
   Value pendingLoopDone;
+  // The done pulse that started the next loop; distinguishes sequencing from
+  // an ordinary enclosing condition.
+  Value currentStartPulse;
 
   // Locals read and written across a runtime loop become registers. The value
   // is loaded from the pre-loop source during the init/done cycle and updated
@@ -4427,10 +4430,11 @@ LogicalResult CirctModuleEmitter::emitBlock(Block &block, Value condition,
     // A completed runtime loop yields a one-cycle pulse. Ops after it in the
     // same block only take effect on that pulse.
     if (pendingLoopDone) {
-      condition = condition
-                      ? comb::AndOp::create(builder, loc, condition,
-                                            pendingLoopDone)
-                      : pendingLoopDone;
+      // Post-loop ops depend on the loop's done pulse rather than on the
+      // condition that started it. This also lets a second loop in the same
+      // block use the pulse as its start handshake.
+      condition = pendingLoopDone;
+      currentStartPulse = pendingLoopDone;
       pendingLoopDone = Value();
     }
   }
@@ -4550,6 +4554,14 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
   dynamicOuterCounter = counter;
   dynamicOuterBound = getValue(bound);
   nestedLoopSeen = false;
+  bool sequenced = condition && condition == currentStartPulse;
+  Value started;
+  if (sequenced) {
+    auto i1Type = builder.getI1Type();
+    llvm::APInt zeroBit(1, 0);
+    started = createRegister(loopRegisterId++, i1Type, zeroBit, zeroBit,
+                             resetStyle);
+  }
 
   auto setRegNext = [&](Value reg, Value next) -> LogicalResult {
     if (auto cr = reg.getDefiningOp<seq::CompRegOp>()) {
@@ -4565,6 +4577,10 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
   SmallVector<Value> carried = collectLoopCarriedSlots(block, slot);
   Value running;
   if (!carried.empty()) {
+    if (sequenced)
+      return loop->emitError()
+             << "HDL lowering: loop-carried state in a sequenced runtime "
+                "loop is not supported yet";
     auto i1Type = builder.getI1Type();
     llvm::APInt zeroBit(1, 0);
     running = createRegister(loopRegisterId++, i1Type, zeroBit, zeroBit,
@@ -4625,11 +4641,13 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
       active = breakInThen ? bitNot(cond) : cond;
       if (running)
         active = comb::AndOp::create(builder, loc, running, active);
+      if (started)
+        active = comb::AndOp::create(builder, loc, started, active);
       Region &keep = breakInThen ? op.getRegion(1) : op.getRegion(0);
-      Value inner = outerCondition
-                        ? comb::AndOp::create(builder, loc, outerCondition,
-                                              active)
-                        : active;
+      Value inner =
+          (outerCondition && !sequenced)
+              ? comb::AndOp::create(builder, loc, outerCondition, active)
+              : active;
       if (!keep.empty())
         if (failed(emitBlock(keep.front(), inner, returnValue)))
           return failure();
@@ -4639,12 +4657,16 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
     if (op.getName().getStringRef() == "hlcf.continue" || op.getName().getStringRef() == "hlcf.yield" ||
         op.getName().getStringRef() == "hlcf.break")
       continue;
-    Value opCondition = sawIf
-                            ? (outerCondition
-                                   ? comb::AndOp::create(builder, loc,
-                                                         outerCondition, active)
-                                   : active)
-                            : outerCondition;
+    Value opCondition;
+    if (!sawIf)
+      opCondition = sequenced ? Value() : outerCondition;
+    else if (sequenced)
+      opCondition = active;
+    else
+      opCondition = outerCondition
+                        ? comb::AndOp::create(builder, loc, outerCondition,
+                                              active)
+                        : active;
     if (failed(emitOp(&op, opCondition, returnValue)))
       return failure();
   }
@@ -4722,6 +4744,15 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
   Value atEnd = comb::ICmpOp::create(
       builder, loc, comb::ICmpPredicate::eq, incremented, boundValue);
   Value last = comb::AndOp::create(builder, loc, active, atEnd);
+  if (started) {
+    Value trueValue = getConstant(true);
+    Value falseValue = getConstant(false);
+    Value hold = comb::MuxOp::create(builder, loc, last, falseValue, started);
+    Value next = comb::MuxOp::create(builder, loc, condition, trueValue, hold);
+    if (failed(setRegNext(started, next)))
+      return loop->emitError()
+             << "HDL lowering: unsupported sequenced start form";
+  }
   auto i1Type = builder.getI1Type();
   llvm::APInt oneBit(1, 1);
   llvm::APInt zeroBit(1, 0);
@@ -4871,6 +4902,14 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
   dynamicOuterCounter = counter;
   dynamicOuterBound = boundValue;
   nestedLoopSeen = false;
+  bool sequenced = condition && condition == currentStartPulse;
+  Value started;
+  if (sequenced) {
+    auto i1Type = builder.getI1Type();
+    llvm::APInt zeroBit(1, 0);
+    started = createRegister(loopRegisterId++, i1Type, zeroBit, zeroBit,
+                             resetStyle);
+  }
 
   auto setRegNext = [&](Value reg, Value next) -> LogicalResult {
     if (auto cr = reg.getDefiningOp<seq::CompRegOp>()) {
@@ -4886,6 +4925,10 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
   SmallVector<Value> carried = collectLoopCarriedSlots(block, slot);
   Value running;
   if (!carried.empty()) {
+    if (sequenced)
+      return loop->emitError()
+             << "HDL lowering: loop-carried state in a sequenced runtime "
+                "loop is not supported yet";
     auto i1Type = builder.getI1Type();
     llvm::APInt zeroBit(1, 0);
     running = createRegister(loopRegisterId++, i1Type, zeroBit, zeroBit,
@@ -4934,6 +4977,8 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
       builder, loc, comb::ICmpPredicate::ult, counter, boundValue);
   if (running)
     active = comb::AndOp::create(builder, loc, running, active);
+  if (started)
+    active = comb::AndOp::create(builder, loc, started, active);
 
   SmallVector<Operation *> skipOps{nextOp, loopIf};
   if (indLoad)
@@ -4951,7 +4996,7 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
         name == "hlcf.break")
       continue;
     Value opCondition =
-        condition
+        (condition && !sequenced)
             ? comb::AndOp::create(builder, loc, condition, active)
             : active;
     if (failed(emitOp(&op, opCondition, returnValue)))
@@ -5013,6 +5058,15 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
   Value atEnd = comb::ICmpOp::create(
       builder, loc, comb::ICmpPredicate::eq, incremented, boundValue);
   Value last = comb::AndOp::create(builder, loc, active, atEnd);
+  if (started) {
+    Value trueValue = getConstant(true);
+    Value falseValue = getConstant(false);
+    Value hold = comb::MuxOp::create(builder, loc, last, falseValue, started);
+    Value next = comb::MuxOp::create(builder, loc, condition, trueValue, hold);
+    if (failed(setRegNext(started, next)))
+      return loop->emitError()
+             << "HDL lowering: unsupported sequenced start form";
+  }
   auto i1Type = builder.getI1Type();
   llvm::APInt zeroBit(1, 0);
   Value done = createRegister(loopRegisterId++, i1Type, zeroBit, zeroBit,
@@ -5375,6 +5429,7 @@ LogicalResult CirctModuleEmitter::build() {
     Value returnValue;
     returnSites.clear();
     pendingLoopDone = Value();
+    currentStartPulse = Value();
     if (failed(emitOps(methods[m], returnValue)))
       return failure();
     // Fold branch returns into one value. Later returns are fallbacks for
