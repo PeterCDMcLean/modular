@@ -767,6 +767,11 @@ private:
   /// The ambient clock name of a process domain, or "combinational" when the
   /// method has no state of its own.
   std::string domainName(unsigned method) const;
+  /// Lower a runtime-bounded `while` loop one iteration per clock. Sets
+  /// `handled` when the loop matches; otherwise leaves the IR untouched so the
+  /// constant-unroll path can run.
+  LogicalResult emitDynamicLoop(Operation *loop, Value condition,
+                                Value &returnValue, bool &handled);
   LogicalResult emitOps(Operation *fn, Value &returnValue);
   LogicalResult emitBlock(Block &block, Value condition, Value &returnValue);
   LogicalResult emitOp(Operation *op, Value condition, Value &returnValue);
@@ -833,6 +838,18 @@ private:
     return false;
   }
   DenseMap<unsigned, InstanceCallState> instanceCalls;
+  // Runtime-bounded loop time-multiplexing: one iteration per clock. The
+  // induction variable is a register and body effects are gated by its
+  // in-range condition.
+  bool inDynamicLoop = false;
+  Value dynamicLoopSlot;
+  unsigned loopRegisterId = 4096;
+  // Stack slots allocated before the runtime loop. Writing one inside the
+  // loop would be a loop-carried local, which this lowering does not model.
+  SmallVector<Value> stackSlots;
+  SmallVector<Value> dynamicLoopOuterSlots;
+  bool isLoopCarriedSlot(Value value) const;
+
   // Direct `self.child.<field>` accesses, diagnosed after every process has
   // been seen so the owning domain is known regardless of method order.
   struct ChildFieldAccess {
@@ -1498,6 +1515,12 @@ LogicalResult CirctModuleEmitter::collectProcesses(
   return success();
 }
 
+bool CirctModuleEmitter::isLoopCarriedSlot(Value value) const {
+  if (!inDynamicLoop || value == dynamicLoopSlot)
+    return false;
+  return llvm::is_contained(dynamicLoopOuterSlots, value);
+}
+
 std::string CirctModuleEmitter::domainName(unsigned method) const {
   if (method < methodHasState.size() && !methodHasState[method])
     return "combinational";
@@ -2064,6 +2087,11 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
   if (name == "hlcf.loop") {
     if (op->getNumRegions() != 1 || op->getRegion(0).empty())
       return op->emitError() << "HDL lowering: malformed loop";
+    bool handled = false;
+    if (failed(emitDynamicLoop(op, condition, returnValue, handled)))
+      return failure();
+    if (handled)
+      return success();
     constexpr unsigned kMaxLoopIterations = 4096;
     bool wasUnrolling = inLoopUnroll;
     inLoopUnroll = true;
@@ -3895,6 +3923,10 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         }
         if (callee.contains("Bits::__init__")) {
           // Move the computed value into a result slot or a state field.
+          if (isLoopCarriedSlot(op->getOperand(1)))
+            return op->emitError()
+                   << "HDL lowering: loop-carried local variable in a "
+                      "runtime-bounded loop; store it in a state field instead";
           if (op->getOperand(1) == resultPtr) {
             recordReturn(source);
           } else if (auto field = fieldPtrs.find(op->getOperand(1));
@@ -3906,8 +3938,15 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           return success();
         }
         if (callee.contains("Bits::copy")) {
+          if (isLoopCarriedSlot(op->getOperand(1)))
+            return op->emitError()
+                   << "HDL lowering: loop-carried local variable in a "
+                      "runtime-bounded loop; store it in a state field instead";
           if (op->getOperand(1) == resultPtr)
             recordReturn(source);
+          else if (auto field = fieldPtrs.find(op->getOperand(1));
+                   field != fieldPtrs.end())
+            return storeField(field->second, source, condition);
           else
             values[op->getOperand(1)] = source;
           return success();
@@ -4134,6 +4173,10 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
   }
 
   if (name == "pop.store") {
+    if (isLoopCarriedSlot(op->getOperand(1)))
+      return op->emitError()
+             << "HDL lowering: loop-carried local variable in a "
+                "runtime-bounded loop; store it in a state field instead";
     auto field = fieldPtrs.find(op->getOperand(1));
     if (field == fieldPtrs.end()) {
       // Remember integer constants and ranges held in stack slots so an
@@ -4196,9 +4239,15 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     return success();
   }
 
+  // Track allocations so a runtime loop can tell its own temporaries from
+  // locals that live across iterations.
+  if (name == "pop.stack_allocation") {
+    stackSlots.push_back(op->getResult(0));
+    return success();
+  }
+
   // Ignore lifetime/bookkeeping ops.
-  if (name == "pop.stack_allocation" ||
-      name == "pop.stack_alloc.lifetime.start" ||
+  if (name == "pop.stack_alloc.lifetime.start" ||
       name == "pop.stack_alloc.lifetime.end" || name.starts_with("debuginfo."))
     return success();
 
@@ -4225,6 +4274,175 @@ LogicalResult CirctModuleEmitter::emitBlock(Block &block, Value condition,
     if (failed(emitOp(&op, condition, returnValue)))
       return failure();
   }
+  return success();
+}
+
+LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
+                                                 Value condition,
+                                                 Value &returnValue,
+                                                 bool &handled) {
+  handled = false;
+  if (inDynamicLoop)
+    return success(); // Nested runtime loops are not supported yet.
+  if (loop->getNumRegions() != 1 || loop->getRegion(0).empty())
+    return success();
+  Block &block = loop->getRegion(0).front();
+
+  // Recognize the canonical `while i < bound` shape: an in-place increment of
+  // a stack slot, a compare against that load, and an `hlcf.if` whose one
+  // region breaks out of the loop.
+  Operation *increment = nullptr;
+  Value slot;
+  for (Operation &op : block.getOperations())
+    if (op.getName().getStringRef() == "kgen.call" &&
+        callCalleeName(&op).contains("SIMD::__iadd__") &&
+        op.getNumOperands() == 2) {
+      increment = &op;
+      slot = op.getOperand(0);
+      break;
+    }
+  if (!increment || !slot || fieldPtrs.count(slot))
+    return success();
+
+  Operation *load = nullptr;
+  for (Operation &op : block.getOperations())
+    if (op.getName().getStringRef() == "pop.load" && op.getOperand(0) == slot) {
+      load = &op;
+      break;
+    }
+  if (!load)
+    return success();
+
+  Operation *compare = nullptr;
+  Value bound;
+  for (Operation &op : block.getOperations()) {
+    if (op.getName().getStringRef() != "kgen.call" || op.getNumOperands() != 2)
+      continue;
+    StringRef callee = callCalleeName(&op);
+    if (!callee.contains("SIMD::__lt__") && !callee.contains("SIMD::__le__"))
+      continue;
+    if (op.getOperand(0) == load->getResult(0))
+      bound = op.getOperand(1);
+    else if (op.getOperand(1) == load->getResult(0))
+      bound = op.getOperand(0);
+    else
+      continue;
+    compare = &op;
+    break;
+  }
+  if (!compare || !bound)
+    return success();
+
+  // A constant bound is unrolled instead.
+  if (slotConstants.count(bound))
+    return success();
+  if (Operation *boundOp = bound.getDefiningOp())
+    if (getConstantInt(boundOp, &bindings))
+      return success();
+
+  Operation *boolOp = nullptr;
+  for (Operation &op : block.getOperations())
+    if (op.getName().getStringRef() == "kgen.call" && op.getNumOperands() == 1 &&
+        callCalleeName(&op).contains("__mlir_bool__") &&
+        op.getOperand(0) == compare->getResult(0)) {
+      boolOp = &op;
+      break;
+    }
+  if (!boolOp)
+    return success();
+
+  Operation *loopIf = nullptr;
+  bool breakInThen = false;
+  for (Operation &op : block.getOperations()) {
+    if (op.getName().getStringRef() != "hlcf.if" || op.getNumOperands() != 1 ||
+        op.getOperand(0) != boolOp->getResult(0))
+      continue;
+    auto hasBreak = [](Region &region) {
+      if (region.empty())
+        return false;
+      for (Operation &inner : region.front())
+        if (inner.getName().getStringRef() == "hlcf.break")
+          return true;
+      return false;
+    };
+    bool thenBreak = hasBreak(op.getRegion(0));
+    bool elseBreak = hasBreak(op.getRegion(1));
+    if (thenBreak != elseBreak) {
+      loopIf = &op;
+      breakInThen = thenBreak;
+      break;
+    }
+  }
+  if (!loopIf)
+    return success();
+
+  handled = true;
+  unsigned width = 64;
+  if (auto type = getHwType(load->getResult(0).getType()))
+    width = type.getIntOrFloatBitWidth();
+  auto counterType = IntegerType::get(builder.getContext(), width);
+  llvm::APInt zeroBits(width, 0);
+  Value counter = createRegister(loopRegisterId++, counterType, zeroBits,
+                                 zeroBits, resetStyle);
+  slotConstants.erase(slot);
+  rangeValues.erase(slot);
+  values[slot] = counter;
+
+  Value active;
+  bool sawIf = false;
+  Value &outerCondition = condition;
+  dynamicLoopOuterSlots = stackSlots;
+  inDynamicLoop = true;
+  dynamicLoopSlot = slot;
+  for (Operation &op : block.getOperations()) {
+    if (&op == increment)
+      continue; // The counter update replaces the in-place increment.
+    if (&op == loopIf) {
+      Value cond = getValue(op.getOperand(0));
+      if (!cond)
+        return op.emitError() << "HDL lowering: loop condition was not lowered";
+      active = breakInThen ? bitNot(cond) : cond;
+      Region &keep = breakInThen ? op.getRegion(1) : op.getRegion(0);
+      Value inner = outerCondition
+                        ? comb::AndOp::create(builder, loc, outerCondition,
+                                              active)
+                        : active;
+      if (!keep.empty())
+        if (failed(emitBlock(keep.front(), inner, returnValue)))
+          return failure();
+      sawIf = true;
+      continue;
+    }
+    if (op.getName().getStringRef() == "hlcf.continue" || op.getName().getStringRef() == "hlcf.yield" ||
+        op.getName().getStringRef() == "hlcf.break")
+      continue;
+    Value opCondition = sawIf
+                            ? (outerCondition
+                                   ? comb::AndOp::create(builder, loc,
+                                                         outerCondition, active)
+                                   : active)
+                            : outerCondition;
+    if (failed(emitOp(&op, opCondition, returnValue)))
+      return failure();
+  }
+  inDynamicLoop = false;
+  dynamicLoopSlot = Value();
+  dynamicLoopOuterSlots.clear();
+  if (!sawIf)
+    return loop->emitError()
+           << "HDL lowering: runtime loop has no condition";
+
+  Value one = hw::ConstantOp::create(builder, loc, counterType, 1);
+  Value incremented = comb::AddOp::create(builder, loc, counter, one);
+  Value zero = hw::ConstantOp::create(builder, loc, counterType, 0);
+  Value next =
+      comb::MuxOp::create(builder, loc, active, incremented, zero);
+  if (auto reg = counter.getDefiningOp<seq::CompRegOp>())
+    reg->setOperand(0, next);
+  else if (auto reg = counter.getDefiningOp<seq::FirRegOp>())
+    reg->setOperand(0, next);
+  else
+    return loop->emitError() << "HDL lowering: unsupported loop counter form";
   return success();
 }
 
