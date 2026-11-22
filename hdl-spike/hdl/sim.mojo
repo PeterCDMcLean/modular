@@ -1,15 +1,16 @@
 """Native simulation domain evaluation.
 
 A `@module` design that wants native simulation conforms to `SimModule` and
-implements `evaluate` to invoke its process methods for one domain traversal.
-The engine calls `evaluate` once, then `commit_state` reflects over the
-module's fields and commits every `SimState` field once. `Array` conforms to
-`SimState`, so bare `Array[Reg[T], N]` and arrays of nested modules commit all
-elements.
+passes its process methods to the engine's `step`. The engine invokes the
+registered processes in order, then `commit_state` reflects over the module's
+fields and commits every `SimState` field once. `Array` conforms to
+`SimState`, so bare `Array[Reg[T], N]` fields and arrays of nested modules
+commit all elements.
 
-Mojo does not expose struct-method reflection in this toolchain, so the module
-declares its process entry point explicitly. The engine owns the traversal and
-the single commit; individual registers are never ticked by the harness.
+Mojo does not expose struct-method reflection in this toolchain, so the design
+registers method references when it calls `step`. The engine owns the
+traversal and the single commit; individual registers are never ticked by the
+harness.
 """
 
 trait SimState:
@@ -21,11 +22,8 @@ trait SimState:
 
 
 trait SimModule(Deinitable):
-    """A design whose process tree can be evaluated for one domain cycle."""
-
-    def evaluate(mut self):
-        """Evaluates the module's process methods once."""
-        ...
+    """A design whose process methods can be registered with the engine."""
+    pass
 
 
 def commit_state[T: AnyType](mut value: T):
@@ -38,7 +36,31 @@ def commit_state[T: AnyType](mut value: T):
                 commit_state(reflect[T].field_ref[i](value))
 
 
-def step[M: SimModule](mut module: M):
-    """Evaluates one domain traversal and commits its state once."""
-    module.evaluate()
+def step[M: SimModule](mut module: M, p1: Some[def(mut M)]):
+    """Runs one registered process, then commits state once."""
+    p1(module)
+    commit_state(module)
+
+
+def step[
+    M: SimModule
+](mut module: M, p1: Some[def(mut M)], p2: Some[def(mut M)]):
+    """Runs two registered processes, then commits state once."""
+    p1(module)
+    p2(module)
+    commit_state(module)
+
+
+def step[
+    M: SimModule
+](
+    mut module: M,
+    p1: Some[def(mut M)],
+    p2: Some[def(mut M)],
+    p3: Some[def(mut M)],
+):
+    """Runs three registered processes, then commits state once."""
+    p1(module)
+    p2(module)
+    p3(module)
     commit_state(module)

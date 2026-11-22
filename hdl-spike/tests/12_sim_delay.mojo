@@ -18,13 +18,15 @@ struct SimDomain(SimModule):
         self.b = Reg[Bits[8]]()
         self.din = Bits[8]()
 
-    def evaluate(mut self):
+    def p1(mut self):
         self.a.next(1) <= self.din
+
+    def p2(mut self):
         self.b.next(1) <= self.a.get()
 
     def cycle(mut self, din: Bits[8]) -> Tuple[Bits[8], Bits[8]]:
         self.din = din.copy()
-        step(self)
+        step(self, Self.p1, Self.p2)
         return (self.a.get(), self.b.get())
 
 
@@ -38,7 +40,7 @@ struct SimArrayDomain(SimModule):
         self.children = Array[Child, 2]()
         self.din = Bits[8]()
 
-    def evaluate(mut self):
+    def p1(mut self):
         var r0 = self.regs[0].copy()
         r0.next(1) <= self.din
         self.regs[0] = r0^
@@ -46,6 +48,7 @@ struct SimArrayDomain(SimModule):
         r1.next(1) <= self.regs[0].get()
         self.regs[1] = r1^
 
+    def p2(mut self):
         var c0 = self.children[0].copy()
         c0.r.next(1) <= self.din
         self.children[0] = c0^
@@ -55,7 +58,7 @@ struct SimArrayDomain(SimModule):
 
     def cycle(mut self, din: Bits[8]) -> Tuple[Int, Int, Int, Int]:
         self.din = din.copy()
-        step(self)
+        step(self, Self.p1, Self.p2)
         return (
             self.regs[0].get().to_int(),
             self.regs[1].get().to_int(),
