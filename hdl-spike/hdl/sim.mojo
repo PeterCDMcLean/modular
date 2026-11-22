@@ -7,10 +7,12 @@ fields and commits every `SimState` field once. `Array` conforms to
 `SimState`, so bare `Array[Reg[T], N]` fields and arrays of nested modules
 commit all elements.
 
-Mojo does not expose struct-method reflection in this toolchain, so the design
-registers method references when it calls `step`. The engine owns the
-traversal and the single commit; individual registers are never ticked by the
-harness.
+Mojo does not expose struct-method reflection at runtime, so process
+discovery happens in the compiler: `mojo build --emit=sim-step` reads the
+elaborated `@module` signatures and prints a `<Module>_step` adapter for every
+`mut self` method with no other arguments and no result. The engine still owns
+the traversal and the single commit; individual registers are never ticked by
+the harness.
 """
 
 trait SimState:

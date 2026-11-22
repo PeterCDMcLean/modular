@@ -740,6 +740,11 @@ public:
   LogicalResult build();
   hw::HWModuleOp getModule() const { return builtModule; }
 
+  /// Collect the methods that can run as native-Sim processes: a `mut self`
+  /// method with no other arguments and no result. This is compiler-level
+  /// discovery over the elaborated signatures, independent of source comments.
+  LogicalResult collectProcesses(SmallVectorImpl<std::string> &processes);
+
 private:
   struct Port {
     std::string name;
@@ -1402,6 +1407,32 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     } else {
       fieldModuleNames.push_back({});
     }
+  }
+  return success();
+}
+
+LogicalResult CirctModuleEmitter::collectProcesses(
+    SmallVectorImpl<std::string> &processes) {
+  if (failed(findMethods()))
+    return failure();
+  for (unsigned m = 0; m < methods.size(); ++m) {
+    Operation *fn = methods[m];
+    KGEN::FuncType sourceFunc = getSourceFuncType(fn);
+    if (!sourceFunc)
+      continue;
+    ArrayRef<KGEN::ArgConvention> conventions =
+        sourceFunc.getArgConventions();
+    if (conventions.size() != 1 || conventions[0] != KGEN::ArgConvention::Mut)
+      continue;
+    auto funcType = getFuncTypeGenerator(fn);
+    if (!funcType)
+      continue;
+    auto results = funcType.getBody().getResults();
+    if (results.size() > 1)
+      continue;
+    if (results.size() == 1 && !isa<KGEN::NoneType>(results[0]))
+      continue;
+    processes.push_back(methodNames[m]);
   }
   return success();
 }
@@ -3888,6 +3919,41 @@ public:
           << "HDL lowering: no `@module` struct found (the design must mark "
              "module structs with @module)";
       signalPassFailure();
+      return;
+    }
+
+    // `--emit=sim-step`: derive native-Sim processes from the elaborated
+    // `@module` method signatures and print a step adapter. No CIRCT module is
+    // built.
+    if (options.simStep) {
+      OwningOpRef<ModuleOp> scratch = ModuleOp::create(module.getLoc());
+      SmallVector<std::pair<std::string, SmallVector<std::string>>> adapters;
+      for (const ModuleSpec &spec : collectModuleSpecs(module, modules)) {
+        CirctModuleEmitter emitter(module, spec.structName, spec.displayName,
+                                   spec.bindings, *scratch, modules);
+        SmallVector<std::string> processes;
+        if (failed(emitter.collectProcesses(processes))) {
+          signalPassFailure();
+          return;
+        }
+        if (processes.empty())
+          continue;
+        adapters.emplace_back(spec.displayName, std::move(processes));
+      }
+      if (adapters.empty()) {
+        module.emitError()
+            << "HDL simulation: no process method found; a process is a "
+               "`mut self` method with no other arguments and no result";
+        signalPassFailure();
+        return;
+      }
+      os << "from hdl import commit_state\n\n";
+      for (auto &[name, processes] : adapters) {
+        os << "def " << name << "_step(mut sim: " << name << "):\n";
+        for (const std::string &process : processes)
+          os << "    sim." << process << "()\n";
+        os << "    commit_state(sim)\n\n";
+      }
       return;
     }
 

@@ -331,6 +331,8 @@ def EmitAs : I32EnumAttr<"EmitAs", "compile_assembly emission kind", [
   I32EnumAttrCase<"CIRCT", 7, "circt">,
   // Prototype fork: export SystemVerilog in-process from the CIRCT module.
   I32EnumAttrCase<"SV", 8, "sv">,
+  // Prototype fork: generate a native Sim step adapter from @module methods.
+  I32EnumAttrCase<"SIM_STEP", 9, "sim-step">,
 ]> {
   let cppNamespace = "M::KGEN";
   let genSpecializedAttr = 0;

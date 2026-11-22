@@ -450,6 +450,7 @@ static ErrorOr<StringAttr> compileStandaloneKernel(
   case EmitAs::MLIR:
   case EmitAs::CIRCT:
   case EmitAs::SV:
+  case EmitAs::SIM_STEP:
     // Prototype fork: host-module products, not valid for offload kernels.
     return Error("emission kind is not supported for offload kernels");
   }
@@ -1055,6 +1056,7 @@ void KGEN::populateHDLEmitPasses(
   hdlOptions.output = options.hdlOutput;
   hdlOptions.dumpSourceIR = options.hdlDumpSourceIR;
   hdlOptions.emitSV = options.hdlEmitSV;
+  hdlOptions.simStep = options.hdlEmitSimStep;
   hdlOptions.builtModule = options.hdlEmitSV ? &builtModule : nullptr;
   pm.addPass(createHDLToCIRCTPass(hdlOptions));
 }

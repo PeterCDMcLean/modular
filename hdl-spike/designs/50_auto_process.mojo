@@ -1,4 +1,4 @@
-"""Two-process design discovered by the Sim step generator."""
+"""Two-process design discovered from its @module method signatures."""
 
 from hdl import Bits, Reg
 
@@ -14,10 +14,8 @@ struct AutoDomain:
         self.b = Reg[Bits[8]]()
         self.din = Bits[8]()
 
-    # @process
     def p1(mut self):
         self.a.next(1) <= self.din
 
-    # @process
     def p2(mut self):
         self.b.next(1) <= self.a.get()

@@ -62,6 +62,9 @@ struct HDLEmitOptions {
   /// Export SystemVerilog through CIRCT's ExportVerilog instead of printing
   /// the MLIR module. No external `circt-opt` is involved.
   bool emitSV = false;
+  /// Print a generated native-Sim step adapter instead of lowering to CIRCT.
+  /// Process methods are derived from the elaborated `@module` signatures.
+  bool simStep = false;
   /// Where the pass leaves the built module in `emitSV` mode. The driver runs
   /// seq-to-sv and ExportVerilog after the pass manager has finished, outside
   /// its execution context.

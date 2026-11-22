@@ -225,16 +225,21 @@ static std::optional<int> compileModuleToArchive(
   std::unique_ptr<llvm::ToolOutputFile> irOutFile;
   const bool irToStdout = args.getLastArgValue(options::OPT_o) == "-";
   if (emitAs == EmitAs::MLIR || emitAs == EmitAs::CIRCT ||
-      emitAs == EmitAs::SV) {
+      emitAs == EmitAs::SV || emitAs == EmitAs::SIM_STEP) {
     if (!irToStdout) {
+      llvm::StringRef extension = emitAs == EmitAs::SV        ? ".sv"
+                                  : emitAs == EmitAs::SIM_STEP ? ".mojo"
+                                                               : ".mlir";
       irOutFile = createOutputFile(state, args, /*hasBinaryOutput=*/false,
-                                   emitAs == EmitAs::SV ? ".sv" : ".mlir");
+                                   extension);
       if (!irOutFile)
         return EXIT_FAILURE;
     }
-    if (emitAs == EmitAs::CIRCT || emitAs == EmitAs::SV) {
+    if (emitAs == EmitAs::CIRCT || emitAs == EmitAs::SV ||
+        emitAs == EmitAs::SIM_STEP) {
       effectiveOptions.hdlEmit = true;
       effectiveOptions.hdlEmitSV = emitAs == EmitAs::SV;
+      effectiveOptions.hdlEmitSimStep = emitAs == EmitAs::SIM_STEP;
       effectiveOptions.hdlOutput =
           irToStdout ? &llvm::outs() : &irOutFile->os();
       effectiveOptions.hdlDumpSourceIR =
@@ -267,7 +272,8 @@ static std::optional<int> compileModuleToArchive(
       irOutFile->keep();
     return EXIT_SUCCESS;
   }
-  if (emitAs == EmitAs::CIRCT || emitAs == EmitAs::SV) {
+  if (emitAs == EmitAs::CIRCT || emitAs == EmitAs::SV ||
+      emitAs == EmitAs::SIM_STEP) {
     if (irOutFile)
       irOutFile->keep();
     return EXIT_SUCCESS;

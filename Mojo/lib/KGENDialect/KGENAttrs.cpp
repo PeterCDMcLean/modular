@@ -147,6 +147,7 @@ bool EmitAsAttr::classof(Attribute attr) {
                  EmitAs::MLIR,
                  EmitAs::CIRCT,
                  EmitAs::SV,
+                 EmitAs::SIM_STEP,
              },
              [&](EmitAs kind) { return (int)kind == intAttr.getInt(); });
 #else
@@ -162,6 +163,7 @@ bool EmitAsAttr::classof(Attribute attr) {
                  EmitAs::MLIR,
                  EmitAs::CIRCT,
                  EmitAs::SV,
+                 EmitAs::SIM_STEP,
              },
              [&](EmitAs kind) { return (int)kind == intAttr.getInt(); });
 #endif

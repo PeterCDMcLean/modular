@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Automatic Sim process discovery: generator emits the step adapter.
+# Compiler-derived Sim process discovery: `--emit=sim-step` emits the adapter.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -25,9 +25,17 @@ if [[ ! -f "$MODULAR_HOME/modular.cfg" ]]; then
 fi
 
 design="$root/hdl-spike/designs/50_auto_process.mojo"
-python3 "$root/hdl-spike/tools/gen_sim_step.py" "$design" \
-    > "$out/50_adapter.mojo"
-grep -q 'def AutoDomain_step' "$out/50_adapter.mojo"
+
+# The design has no marker comments: discovery reads the elaborated methods.
+if grep -q '@process' "$design"; then
+  echo "FAIL: design should not carry process markers" >&2
+  exit 1
+fi
+
+"$MOJO" build --emit=sim-step -o "$out/50_adapter.mojo" "${inc[@]}" "$design"
+diff -u "$root/hdl-spike/expected/50_auto_process.step.mojo" \
+    "$out/50_adapter.mojo"
+grep -q 'def AutoDomain_step(mut sim: AutoDomain):' "$out/50_adapter.mojo"
 grep -q 'sim.p1()' "$out/50_adapter.mojo"
 grep -q 'sim.p2()' "$out/50_adapter.mojo"
 grep -q 'commit_state(sim)' "$out/50_adapter.mojo"
@@ -42,5 +50,25 @@ cat "$design" "$out/50_adapter.mojo" \
 grep -q '^c0 1 0$' "$out/50_auto.txt"
 grep -q '^c1 2 1$' "$out/50_auto.txt"
 grep -q '^c2 3 2$' "$out/50_auto.txt"
+
+# Methods with arguments or results are not processes.
+"$MOJO" build --emit=sim-step -o "$out/50_filtered.mojo" "${inc[@]}" \
+    "$root/hdl-spike/designs/50_process_filter.mojo"
+diff -u "$root/hdl-spike/expected/50_process_filter.step.mojo" \
+    "$out/50_filtered.mojo"
+grep -q 'sim.p1()' "$out/50_filtered.mojo"
+if grep -Eq 'sim\.(tick|status)' "$out/50_filtered.mojo"; then
+  echo "FAIL: port methods were treated as processes" >&2
+  exit 1
+fi
+
+# A design with no process method is rejected.
+if "$MOJO" build --emit=sim-step -o /dev/null "${inc[@]}" \
+    "$root/hdl-spike/designs/50_bad_no_process.mojo" \
+    > "$out/50_bad_no_process.out" 2>&1; then
+  echo "FAIL: a design with no process was accepted" >&2
+  exit 1
+fi
+grep -q 'no process method found' "$out/50_bad_no_process.out"
 
 echo "50_auto_process: ok"

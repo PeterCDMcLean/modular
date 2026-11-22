@@ -252,6 +252,9 @@ public:
   /// When true (with `--emit=sv`), the HDL pass exports SystemVerilog directly
   /// through CIRCT's ExportVerilog instead of printing MLIR.
   bool hdlEmitSV = false;
+  /// When true (with `--emit=sim-step`), the HDL pass prints a native Sim step
+  /// adapter derived from the elaborated `@module` methods.
+  bool hdlEmitSimStep = false;
   /// Where the HDL-to-CIRCT pass writes its textual CIRCT module. When null,
   /// the pass writes to stdout.
   llvm::raw_ostream *hdlOutput = nullptr;

@@ -65,6 +65,9 @@ llvm::ArrayRef<TargetTraits::EmissionKind> TargetTraits::commonEmissionKinds() {
        "CIRCT hw/comb/seq IR lowered from the HDL DSL (prototype fork)"},
       {"sv", EmitAs::SV,
        "SystemVerilog exported in-process from the HDL lowering (prototype fork)"},
+      {"sim-step", EmitAs::SIM_STEP,
+       "a native Sim step adapter generated from the design's @module "
+       "methods (prototype fork)"},
   };
   return kinds;
 }
@@ -132,6 +135,8 @@ llvm::StringRef TargetTraits::extensionFor(EmitAs kind) const {
     return ".mlir";
   case EmitAs::SV:
     return ".sv";
+  case EmitAs::SIM_STEP:
+    return ".mojo";
   }
   llvm_unreachable("unhandled EmitAs");
 }

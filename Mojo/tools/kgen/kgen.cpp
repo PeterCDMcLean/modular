@@ -94,7 +94,7 @@ private:
 static constexpr EmitAs kEmitAsKinds[] = {
     EmitAs::OBJECT, EmitAs::LLVM,     EmitAs::LLVM_BITCODE,
     EmitAs::ASM,    EmitAs::LLVM_OPT, EmitAs::LLVM_OPT_BITCODE,
-    EmitAs::MLIR,   EmitAs::CIRCT,  EmitAs::SV};
+    EmitAs::MLIR,   EmitAs::CIRCT,  EmitAs::SV, EmitAs::SIM_STEP};
 
 /// kgen products with no EmitAs identity, named only here.
 static constexpr llvm::StringRef kAsmVerboseKind = "asm-verbose";
@@ -364,8 +364,10 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
   // Prototype fork: `--emit=circt` stops after elaboration and runs the HDL
   // pass; `--hdl-dump-ir` is its Stage-1 no-op mode.
   options.hdlEmit = isEmitCmd(clOptions.cmd, EmitAs::CIRCT) ||
-                    isEmitCmd(clOptions.cmd, EmitAs::SV);
+                    isEmitCmd(clOptions.cmd, EmitAs::SV) ||
+                    isEmitCmd(clOptions.cmd, EmitAs::SIM_STEP);
   options.hdlEmitSV = isEmitCmd(clOptions.cmd, EmitAs::SV);
+  options.hdlEmitSimStep = isEmitCmd(clOptions.cmd, EmitAs::SIM_STEP);
   options.hdlDumpSourceIR = clOptions.hdlDumpIR;
   options.cacheBaseExtra = "kgen";
 
@@ -555,7 +557,8 @@ static LogicalResult runToolPipeline(MLIRContext *ctx, llvm::SourceMgr &mgr,
   if (isEmitCmd(clOptions.cmd, EmitAs::MLIR))
     return emitModuleIR(*theModule, clOptions);
   if (isEmitCmd(clOptions.cmd, EmitAs::CIRCT) ||
-      isEmitCmd(clOptions.cmd, EmitAs::SV))
+      isEmitCmd(clOptions.cmd, EmitAs::SV) ||
+      isEmitCmd(clOptions.cmd, EmitAs::SIM_STEP))
     return mlir::success(); // The HDL pass already wrote to stdout.
 
   // Construct the symbol table and the export map.
