@@ -870,6 +870,9 @@ private:
   Value getStructFieldSlot(Operation *gep, Value base, unsigned index);
   Value resolveStructField(Value value) const;
   LogicalResult emitStructConstructor(Operation *op, StringRef callee);
+  LogicalResult emitStructMethod(Operation *op, StringRef callee,
+                                Value condition, Value &returnValue);
+  Operation *findFunction(StringRef name);
   // One-cycle pulse after a runtime loop completes. Subsequent ops in the
   // same block are gated by it, so post-loop code runs once per traversal.
   Value pendingLoopDone;
@@ -1203,6 +1206,107 @@ LogicalResult CirctModuleEmitter::collectMethodDomains() {
     });
     methodHasState[m] = stateful;
   }
+  return success();
+}
+
+Operation *CirctModuleEmitter::findFunction(StringRef name) {
+  for (Operation &candidate : source.getBody()->getOperations()) {
+    auto symbol =
+        candidate.getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName());
+    if (symbol && symbol.getValue() == name)
+      return &candidate;
+  }
+  return nullptr;
+}
+
+LogicalResult CirctModuleEmitter::emitStructMethod(Operation *op,
+                                                   StringRef callee,
+                                                   Value condition,
+                                                   Value &returnValue) {
+  Operation *method = findFunction(callee);
+  if (!method)
+    return op->emitError()
+           << "HDL lowering: struct method '" << callee << "' was not found";
+  auto func = dyn_cast<FunctionOpInterface>(method);
+  if (!func || func.getFunctionBody().empty())
+    return op->emitError() << "HDL lowering: struct method has no body";
+  Block &body = func.getFunctionBody().front();
+
+  // Substitute the method's entry arguments with the call operands. A method
+  // takes `self` first; the inliner only handles straight-line bodies.
+  DenseMap<Value, Value> subst;
+  for (unsigned i = 0; i < body.getNumArguments(); ++i) {
+    if (i >= op->getNumOperands())
+      return op->emitError()
+             << "HDL lowering: struct method argument was not lowered";
+    subst[body.getArgument(i)] = op->getOperand(i);
+  }
+
+  SmallVector<Operation *> scratch;
+  auto cleanup = [&]() {
+    // Later clones use earlier clone results, so drop them in reverse order.
+    for (auto it = scratch.rbegin(); it != scratch.rend(); ++it)
+      (*it)->destroy();
+    scratch.clear();
+  };
+
+  for (Operation &inner : body.getOperations()) {
+    StringRef name = inner.getName().getStringRef();
+    if (name == "hlcf.return")
+      break;
+    if (name == "pop.stack_allocation") {
+      subst[inner.getResult(0)] = inner.getResult(0);
+      continue;
+    }
+    if (name.starts_with("pop.stack_alloc.lifetime") ||
+        name.starts_with("debuginfo."))
+      continue;
+    if (name == "kgen.struct.gep") {
+      if (inner.getNumOperands() != 1) {
+        inner.emitError()
+            << "HDL lowering: unsupported struct method field access";
+        cleanup();
+        return failure();
+      }
+      auto index = inner.getAttrOfType<IntegerAttr>("index");
+      if (!index) {
+        inner.emitError()
+            << "HDL lowering: unsupported struct method field access";
+        cleanup();
+        return failure();
+      }
+      auto base = subst.find(inner.getOperand(0));
+      if (base == subst.end()) {
+        inner.emitError()
+            << "HDL lowering: struct method field base was not lowered";
+        cleanup();
+        return failure();
+      }
+      Value slot = getStructFieldSlot(&inner, base->second, index.getInt());
+      subst[inner.getResult(0)] = slot;
+      continue;
+    }
+
+    Operation *cloned = inner.clone();
+    scratch.push_back(cloned);
+    for (unsigned i = 0; i < cloned->getNumOperands(); ++i) {
+      auto value = subst.find(cloned->getOperand(i));
+      if (value == subst.end()) {
+        inner.emitError()
+            << "HDL lowering: struct method operand was not lowered";
+        cleanup();
+        return failure();
+      }
+      cloned->setOperand(i, value->second);
+    }
+    if (failed(emitOp(cloned, condition, returnValue))) {
+      cleanup();
+      return failure();
+    }
+    for (unsigned i = 0; i < cloned->getNumResults(); ++i)
+      subst[inner.getResult(i)] = cloned->getResult(i);
+  }
+  cleanup();
   return success();
 }
 
@@ -1610,11 +1714,14 @@ CirctModuleEmitter::collectLoopCarriedSlots(Block &block,
     if (!llvm::is_contained(result, value))
       result.push_back(value);
   };
-  auto addPointer = [&](Value value) {
+  auto addPointer = [&](Value value, Value calleeSelf = Value(),
+                        Value callerSelf = Value()) {
     if (Operation *defining = value.getDefiningOp();
         defining && defining->getName().getStringRef() == "kgen.struct.gep" &&
         defining->getNumOperands() == 1) {
       Value base = defining->getOperand(0);
+      if (calleeSelf && base == calleeSelf)
+        base = callerSelf;
       if (base != selfPtr && llvm::is_contained(stackSlots, base))
         if (auto index = defining->getAttrOfType<IntegerAttr>("index")) {
           Value slot = getStructFieldSlot(defining, base, index.getInt());
@@ -1647,6 +1754,45 @@ CirctModuleEmitter::collectLoopCarriedSlots(Block &block,
       add(op->getOperand(0));
     else if (callee.contains("SIMD::__iadd__") && op->getNumOperands() == 2)
       add(op->getOperand(0));
+    else if (op->getNumOperands() >= 1 &&
+             llvm::is_contained(stackSlots, op->getOperand(0)) &&
+             !callee.split('(').first.contains("hdl::") &&
+             !callee.split('(').first.contains("std::") &&
+             !callee.split('(').first.ends_with("::__init__") &&
+             !callee.split('(').first.ends_with("::__copyinit__") &&
+             !callee.split('(').first.ends_with("::__moveinit__")) {
+      // A simple user struct method: scan its field stores so the fields it
+      // updates become carried slots of the caller's loop.
+      Operation *method = findFunction(callee);
+      auto func = method ? dyn_cast<FunctionOpInterface>(method) : nullptr;
+      if (!func || func.getFunctionBody().empty())
+        return;
+      Block &methodBody = func.getFunctionBody().front();
+      if (methodBody.getNumArguments() == 0)
+        return;
+      Value calleeSelf = methodBody.getArgument(0);
+      Value callerSelf = op->getOperand(0);
+      for (Operation &inner : methodBody.getOperations()) {
+        StringRef innerName = inner.getName().getStringRef();
+        if (innerName == "pop.store" && inner.getNumOperands() == 2) {
+          addPointer(inner.getOperand(1), calleeSelf, callerSelf);
+          continue;
+        }
+        if (innerName != "kgen.call" || inner.getNumOperands() < 2)
+          continue;
+        StringRef innerCallee = callCalleeName(&inner);
+        if ((innerCallee.contains("Bits::copy") ||
+             innerCallee.contains("Bits::__init__") ||
+             innerCallee.contains("Logic::copy") ||
+             innerCallee.contains("Logic::__init__") ||
+             innerCallee.contains("Array::copy") ||
+             innerCallee.contains("Array::__init__") ||
+             innerCallee.contains("Packed::copy") ||
+             innerCallee.contains("Packed::__init__")))
+          addPointer(inner.getOperand(inner.getNumOperands() - 1),
+                     calleeSelf, callerSelf);
+      }
+    }
   };
   for (Operation &op : block.getOperations())
     op.walk(scan);
@@ -2566,6 +2712,14 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
 
   if (name == "kgen.call") {
     StringRef callee = callCalleeName(op);
+    StringRef userCallName = callee.split('(').first;
+    if (!userCallName.contains("hdl::") && !userCallName.contains("std::") &&
+        !userCallName.ends_with("::__init__") &&
+        !userCallName.ends_with("::__copyinit__") &&
+        !userCallName.ends_with("::__moveinit__") &&
+        op->getNumOperands() >= 1 &&
+        llvm::is_contained(stackSlots, op->getOperand(0)))
+      return emitStructMethod(op, callee, condition, returnValue);
 
     auto constantIndex = [](Value value) -> std::optional<uint64_t> {
       if (auto constant = value.getDefiningOp<hw::ConstantOp>())
