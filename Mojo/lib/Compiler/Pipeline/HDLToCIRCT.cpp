@@ -531,7 +531,7 @@ static bool isLogicType(Type type) {
   StringRef name = getDslTypeName(type);
   if (name.contains("Logic"))
     return true;
-  if (name.contains("Packed")) {
+  if (name.contains("Packed") || name.ends_with("Array")) {
     Type element = getDslTypeParam(type, 0);
     return element && isLogicType(element);
   }
@@ -554,7 +554,7 @@ static unsigned getHdlWidth(Type type,
         if (auto width = getTypedAttrInt(params.front(), bindings))
           return static_cast<unsigned>(width->getZExtValue());
     }
-    if (ref && name.contains("Packed")) {
+    if (ref && (name.contains("Packed") || name.ends_with("Array"))) {
       auto params = ref.getParamValues();
       if (params.size() >= 2) {
         auto elemRef = KGEN::getTypeRefForTypeValueIfResolved(params[0]);
@@ -1185,7 +1185,8 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
       if (!callee.contains("Bits::__init__") &&
           !callee.contains("Logic::__init__") &&
           !callee.contains("Reg::__init__") &&
-          !callee.contains("Packed::__init__") && !isMemoryInit(callee))
+          !callee.contains("Packed::__init__") &&
+          !callee.contains("Array::__init__") && !isMemoryInit(callee))
         continue;
       // A packed constructor writes its integer constant through a
       // destination pointer; remember it so a following `Reg[Packed]`
@@ -1195,6 +1196,20 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
         Value dest = op.getOperand(op.getNumOperands() - 1);
         if (auto value = resolveConstant(op.getOperand(0)))
           packedConstants[dest] = *value;
+        continue;
+      }
+
+      // A payload `Array[T, N](constant)` initializes a field directly.
+      // Storage arrays (`Array[Reg[T], N]`) keep their per-entry path.
+      if (callee.contains("Array::__init__") &&
+          !callee.contains("__init__(move:") && op.getNumOperands() == 2) {
+        auto field = fieldIndexes.find(op.getOperand(1));
+        if (field != fieldIndexes.end() &&
+            !(field->second < fieldIsArrayStorage.size() &&
+              fieldIsArrayStorage[field->second])) {
+          if (auto value = resolveConstant(op.getOperand(0)))
+            resetValues[field->second] = *value;
+        }
         continue;
       }
 
@@ -1424,13 +1439,6 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
       arrayIsArrayRam[fieldIsArrayStorage.size() - 1] = isArrayRam;
       continue;
     }
-
-    if (!isConfig && StringRef(typeName).ends_with("Array"))
-      return source.emitError()
-             << "HDL lowering: unsupported array field '"
-             << fieldNames.back()
-             << "'; use Array[Reg[T], N] for state or Packed[T, N] for a "
-                "packed value";
 
     fieldWidths.push_back(getHdlWidth(fieldType, &bindings));
     bool isInstance = false;
@@ -2433,11 +2441,75 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         return op->emitError()
                << "HDL lowering: unexpected Array::__setitem__ form";
       auto array = fieldPtrs.find(op->getOperand(0));
-      if (array == fieldPtrs.end() ||
-          array->second >= fieldIsArrayStorage.size() ||
-          !fieldIsArrayStorage[array->second])
-        return op->emitError()
-               << "HDL lowering: Array::__setitem__ on a non-array field";
+      bool isStorage = array != fieldPtrs.end() &&
+                       array->second < fieldIsArrayStorage.size() &&
+                       fieldIsArrayStorage[array->second];
+      if (!isStorage) {
+        // A payload array is one packed value: replace the selected lane.
+        Type elemType = getCallTypeParam(op, 0);
+        unsigned laneWidth = getHdlWidth(elemType, &bindings);
+        bool logicArray = elemType && isLogicType(elemType);
+        Value self = op->getOperand(0);
+        Value index = getValue(op->getOperand(1));
+        if (!laneWidth || !index)
+          return op->emitError()
+                 << "HDL lowering: unsupported Array element access";
+        auto resize = [&](Value value, unsigned width) -> Value {
+          unsigned current = value.getType().getIntOrFloatBitWidth();
+          if (current == width)
+            return value;
+          if (current < width) {
+            Value zeros = hw::ConstantOp::create(
+                builder, loc, llvm::APInt(width - current, 0));
+            return comb::ConcatOp::create(builder, loc,
+                                          ArrayRef<Value>{zeros, value});
+          }
+          return comb::ExtractOp::create(builder, loc, value, 0, width);
+        };
+        unsigned packedWidth =
+            logicArray ? getLogicValue(self).val.getType().getIntOrFloatBitWidth()
+                       : getValue(self).getType().getIntOrFloatBitWidth();
+        Value shift = resize(index, packedWidth);
+        Value laneWidthValue = hw::ConstantOp::create(
+            builder, loc, llvm::APInt(packedWidth, laneWidth));
+        Value offset =
+            comb::MulOp::create(builder, loc, shift, laneWidthValue);
+        Value mask = hw::ConstantOp::create(
+            builder, loc, llvm::APInt::getLowBitsSet(packedWidth, laneWidth));
+        Value shiftedMask = comb::ShlOp::create(builder, loc, mask, offset);
+        auto insertLane = [&](Value word, Value lane) -> Value {
+          Value wide = resize(lane, packedWidth);
+          Value shiftedValue =
+              comb::ShlOp::create(builder, loc, wide, offset);
+          Value cleared =
+              comb::AndOp::create(builder, loc, word, bitNot(shiftedMask));
+          return comb::OrOp::create(builder, loc, cleared, shiftedValue);
+        };
+        if (logicArray) {
+          LogicValue packed = getLogicValue(self);
+          LogicValue value = getLogicValue(op->getOperand(2));
+          if (!packed || !value)
+            return op->emitError()
+                   << "HDL lowering: Array element value was not lowered";
+          LogicValue updated{insertLane(packed.val, value.val),
+                             insertLane(packed.xz, value.xz)};
+          if (array != fieldPtrs.end())
+            return storeLogicField(array->second, updated, condition);
+          values[self] = updated.val;
+          logicValues[self] = updated;
+          return success();
+        }
+        Value packed = getValue(self);
+        Value value = getValue(op->getOperand(2));
+        if (!packed || !value)
+          return op->emitError()
+                 << "HDL lowering: Array element operand was not lowered";
+        Value updated = insertLane(packed, value);
+        if (array != fieldPtrs.end())
+          return storeField(array->second, updated, condition);
+        values[self] = updated;
+        return success();
+      }
       unsigned field = array->second;
       Value index = getValue(op->getOperand(1));
       if (!index)
@@ -2467,15 +2539,46 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         return op->emitError()
                << "HDL lowering: unexpected Array::__getitem_param__ form";
       auto array = fieldPtrs.find(op->getOperand(0));
-      if (array == fieldPtrs.end() ||
-          array->second >= fieldIsArrayStorage.size() ||
-          !fieldIsArrayStorage[array->second])
-        return op->emitError()
-               << "HDL lowering: Array::__getitem_param__ on a non-array field";
+      bool isStorage = array != fieldPtrs.end() &&
+                       array->second < fieldIsArrayStorage.size() &&
+                       fieldIsArrayStorage[array->second];
       auto indexValue = getCallIntParam(op, 2, &bindings);
       if (!indexValue)
         return op->emitError()
                << "HDL lowering: array index was not resolved";
+      if (!isStorage) {
+        Type elemType = getCallTypeParam(op, 0);
+        unsigned laneWidth = getHdlWidth(elemType, &bindings);
+        bool logicArray = elemType && isLogicType(elemType);
+        Value self = op->getOperand(0);
+        if (!laneWidth)
+          return op->emitError()
+                 << "HDL lowering: unsupported Array element access";
+        uint64_t lane = indexValue->getZExtValue();
+        if (logicArray) {
+          LogicValue packed = getLogicValue(self);
+          if (!packed)
+            return op->emitError()
+                   << "HDL lowering: Array operand was not lowered";
+          LogicValue result{
+              comb::ExtractOp::create(builder, loc, packed.val,
+                                      static_cast<int32_t>(lane * laneWidth),
+                                      laneWidth),
+              comb::ExtractOp::create(builder, loc, packed.xz,
+                                      static_cast<int32_t>(lane * laneWidth),
+                                      laneWidth)};
+          logicValues[op->getResult(0)] = result;
+          return success();
+        }
+        Value packed = getValue(self);
+        if (!packed)
+          return op->emitError()
+                 << "HDL lowering: Array operand was not lowered";
+        values[op->getResult(0)] = comb::ExtractOp::create(
+            builder, loc, packed, static_cast<int32_t>(lane * laneWidth),
+            laneWidth);
+        return success();
+      }
       Value index = hw::ConstantOp::create(
           builder, loc, builder.getI64Type(),
           static_cast<int64_t>(indexValue->getZExtValue()));
@@ -2490,15 +2593,57 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         return op->emitError()
                << "HDL lowering: unexpected Array::__getitem__ form";
       auto array = fieldPtrs.find(op->getOperand(0));
-      if (array == fieldPtrs.end() ||
-          array->second >= fieldIsArrayStorage.size() ||
-          !fieldIsArrayStorage[array->second])
-        return op->emitError()
-               << "HDL lowering: Array::__getitem__ on a non-array field";
+      bool isStorage = array != fieldPtrs.end() &&
+                       array->second < fieldIsArrayStorage.size() &&
+                       fieldIsArrayStorage[array->second];
       Value index = getValue(op->getOperand(1));
       if (!index)
         return op->emitError()
                << "HDL lowering: array index was not lowered";
+      if (!isStorage) {
+        Type elemType = getCallTypeParam(op, 0);
+        unsigned laneWidth = getHdlWidth(elemType, &bindings);
+        bool logicArray = elemType && isLogicType(elemType);
+        Value self = op->getOperand(0);
+        if (!laneWidth)
+          return op->emitError()
+                 << "HDL lowering: unsupported Array element access";
+        auto extractLane = [&](Value word) -> Value {
+          unsigned packedWidth = word.getType().getIntOrFloatBitWidth();
+          Value shift = index;
+          unsigned indexWidth = shift.getType().getIntOrFloatBitWidth();
+          if (indexWidth > packedWidth)
+            shift = comb::ExtractOp::create(builder, loc, shift, 0,
+                                            packedWidth);
+          else if (indexWidth < packedWidth) {
+            Value zeros = hw::ConstantOp::create(
+                builder, loc, llvm::APInt(packedWidth - indexWidth, 0));
+            shift = comb::ConcatOp::create(
+                builder, loc, ArrayRef<Value>{zeros, shift});
+          }
+          Value laneWidthValue = hw::ConstantOp::create(
+              builder, loc, llvm::APInt(packedWidth, laneWidth));
+          Value offset =
+              comb::MulOp::create(builder, loc, shift, laneWidthValue);
+          Value shifted = comb::ShrUOp::create(builder, loc, word, offset);
+          return comb::ExtractOp::create(builder, loc, shifted, 0, laneWidth);
+        };
+        if (logicArray) {
+          LogicValue packed = getLogicValue(self);
+          if (!packed)
+            return op->emitError()
+                   << "HDL lowering: Array operand was not lowered";
+          LogicValue result{extractLane(packed.val), extractLane(packed.xz)};
+          logicValues[op->getResult(0)] = result;
+          return success();
+        }
+        Value packed = getValue(self);
+        if (!packed)
+          return op->emitError()
+                 << "HDL lowering: Array operand was not lowered";
+        values[op->getResult(0)] = extractLane(packed);
+        return success();
+      }
       arrayElements[op->getResult(0)] = {array->second, index};
       return success();
     }
@@ -3176,6 +3321,72 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       }
       return op->emitError() << "HDL lowering: unsupported Packed call '"
                              << callee << "'";
+    }
+
+    // `Array[T, N]` used as a payload behaves like `Packed`: one flat value.
+    // Copies, moves, and a packed-integer constructor only move the value.
+    if (callee.contains("Array::") && !callee.contains("__getitem") &&
+        !callee.contains("__setitem") &&
+        (callee.contains("Array::copy") || callee.contains("Array::__init__")) &&
+        op->getNumOperands() == 2) {
+      Value dest = op->getOperand(1);
+      bool storageDest = false;
+      if (auto field = fieldPtrs.find(dest); field != fieldPtrs.end())
+        storageDest = field->second < fieldIsArrayStorage.size() &&
+                      fieldIsArrayStorage[field->second];
+      if (!storageDest) {
+        Type elemType = getCallTypeParam(op, 0);
+        auto depth = getCallIntParam(op, 1, &bindings);
+        unsigned laneWidth = getHdlWidth(elemType, &bindings);
+        bool logicArray = elemType && isLogicType(elemType);
+        auto writeValue = [&](Value value, Value xz) -> LogicalResult {
+          if (auto field = fieldPtrs.find(dest); field != fieldPtrs.end()) {
+            if (xz)
+              return storeLogicField(field->second, {value, xz}, condition);
+            return storeField(field->second, value, condition);
+          }
+          if (xz)
+            logicValues[dest] = {value, xz};
+          values[dest] = value;
+          if (dest == resultPtr) {
+            if (xz)
+              recordReturn(value, xz);
+            else
+              recordReturn(value);
+          }
+          return success();
+        };
+        if (callee.contains("Bits::__init__"))
+          return success();
+        if (callee.contains("__init__") && !callee.contains("move:")) {
+          if (!laneWidth || !depth)
+            return op->emitError()
+                   << "HDL lowering: unsupported Array constructor";
+          Operation *valueOp = op->getOperand(0).getDefiningOp();
+          auto constant =
+              valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
+          if (!constant)
+            return op->emitError()
+                   << "HDL lowering: Array constructor argument must be a "
+                      "constant";
+          unsigned total = laneWidth * depth->getZExtValue();
+          Value packed = hw::ConstantOp::create(
+              builder, loc, constant->zextOrTrunc(total));
+          return writeValue(packed, Value());
+        }
+        if (logicArray) {
+          LogicValue source = getLogicValue(op->getOperand(0));
+          if (!source)
+            return op->emitError()
+                   << "HDL lowering: Array operand was not lowered";
+          return writeValue(source.val, source.xz);
+        }
+        Value source = getValue(op->getOperand(0));
+        if (!source)
+          return op->emitError()
+                 << "HDL lowering: Array operand was not lowered";
+        return writeValue(source, Value());
+      }
     }
 
     // `q.next(n) <= v`: the `Reg::next` delay overload recorded a target;
@@ -3885,6 +4096,11 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       if (!type)
         return op->emitError() << "HDL lowering: unsupported state type";
       values[op->getResult(0)] = getOrCreateReg(field->second, type);
+      return success();
+    }
+    if (auto logic = logicValues.find(op->getOperand(0));
+        logic != logicValues.end()) {
+      logicValues[op->getResult(0)] = logic->second;
       return success();
     }
     Value stored = getValue(op->getOperand(0));
