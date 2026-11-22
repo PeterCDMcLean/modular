@@ -41,13 +41,13 @@ diff -u "$root/hdl-spike/expected/71_shared_accum.sv" \
 
 # The last loop's done re-arms the first loop: running clears for one cycle,
 # its counter resets, and the shared accumulator reloads the pre-loop value.
-grep -q 'assign _GEN_6 = ~_GEN_12;' "$out/71_shared_accum.sv"
-grep -q 'assign _GEN_5 = _GEN_12 ? 64.h0 : _GEN_10 ? _GEN_11 : _GEN_7;' \
+grep -q 'assign _GEN_2 = ~_GEN_20;' "$out/71_shared_accum.sv"
+grep -q 'assign _GEN_1 = _GEN_20 ? 64.h0 : _GEN_10 ? _GEN_11 : _GEN_7;' \
     "$out/71_shared_accum.sv"
-grep -q 'assign _GEN_4 = _GEN_12 | ~_GEN_8 ? 8.h0 : _GEN_10 ? _GEN_9 + wd : _GEN_9;' \
+grep -q 'assign _GEN_0 = _GEN_20 | ~_GEN_8 ? 8.h0 : _GEN_10 ? _GEN_9 + wd : _GEN_9;' \
     "$out/71_shared_accum.sv"
 # The first loop's final accumulator seeds the second loop's carried register.
-grep -q 'assign _GEN_3 = _GEN_15 ? (_GEN_17 ? _GEN_16 + wd : _GEN_16) : _GEN_9;' \
+grep -q 'assign _GEN_6 = _GEN_15 ? (_GEN_17 ? _GEN_16 + wd : _GEN_16) : _GEN_9;' \
     "$out/71_shared_accum.sv"
 # The post-loop total samples the second loop's final accumulator on its done.
 grep -q 'else if (_GEN_20)' "$out/71_shared_accum.sv"
