@@ -797,6 +797,7 @@ private:
   DenseMap<Value, llvm::APInt> intConstants;
   DenseMap<Value, unsigned> fieldPtrs;
   DenseMap<Value, unsigned> instancePtrs;
+  DenseMap<unsigned, unsigned> instanceMethod;
   DenseMap<unsigned, Value> fieldRegs;
   DenseMap<unsigned, Value> fieldNext;
   DenseMap<unsigned, Value> fieldEnable;
@@ -2433,6 +2434,27 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                                  << fieldModuleNames[fieldIndex]
                                  << "' was not built";
         auto child = cast<hw::HWModuleOp>(childOp);
+        bool childHasClock = false;
+        for (hw::PortInfo port : child.getPortList())
+          if (port.dir == hw::ModulePort::Direction::Input &&
+              isa<seq::ClockType>(port.type))
+            childHasClock = true;
+        if (childHasClock) {
+          if (auto owner = instanceMethod.find(fieldIndex);
+              owner != instanceMethod.end()) {
+            if (owner->second != currentMethod)
+              return op->emitError()
+                     << "HDL lowering: instance '" << fieldNames[fieldIndex]
+                     << "' is ticked from multiple processes ('"
+                     << methodNames[owner->second] << "' and '"
+                     << methodNames[currentMethod] << "')";
+            return op->emitError()
+                   << "HDL lowering: instance '" << fieldNames[fieldIndex]
+                   << "' is ticked more than once in process '"
+                   << methodNames[currentMethod] << "'";
+          }
+          instanceMethod[fieldIndex] = currentMethod;
+        }
         MLIRContext *ctx = source.getContext();
         SmallVector<hw::PortInfo> childInputs;
         for (hw::PortInfo port : child.getPortList())
