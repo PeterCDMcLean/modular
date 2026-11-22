@@ -863,11 +863,22 @@ private:
     Value val;
     Value xz;
   };
-  DenseMap<Value, SmallVector<std::pair<unsigned, Value>>> structFieldsByBase;
+  // A nested field access is a chain of GEPs. Keep the index path and the
+  // root stack slot so every chain to the same leaf shares one carried slot.
+  struct StructFieldPath {
+    Value root;
+    SmallVector<unsigned> path;
+  };
+  DenseMap<Value, StructFieldPath> structFieldPaths;
+  DenseMap<Value, SmallVector<std::pair<SmallVector<unsigned>, Value>>>
+      structFieldSlots;
   DenseMap<Value, Value> structFieldAliases;
   DenseMap<Value, SmallVector<std::pair<unsigned, StructFieldInit>>>
       structFieldInits;
-  Value getStructFieldSlot(Operation *gep, Value base, unsigned index);
+  Value getStructFieldSlot(Operation *gep, Value root,
+                           ArrayRef<unsigned> path);
+  std::optional<StructFieldPath> resolveStructFieldPath(Value base,
+                                                        unsigned index) const;
   Value resolveStructField(Value value) const;
   LogicalResult emitStructConstructor(Operation *op, StringRef callee,
                                       Value condition,
@@ -1284,7 +1295,15 @@ LogicalResult CirctModuleEmitter::emitStructMethod(Operation *op,
         cleanup();
         return failure();
       }
-      Value slot = getStructFieldSlot(&inner, base->second, index.getInt());
+      auto path = resolveStructFieldPath(base->second, index.getInt());
+      if (!path) {
+        inner.emitError()
+            << "HDL lowering: struct method field base is not a struct";
+        cleanup();
+        return failure();
+      }
+      structFieldPaths[inner.getResult(0)] = *path;
+      Value slot = getStructFieldSlot(&inner, path->root, path->path);
       subst[inner.getResult(0)] = slot;
       continue;
     }
@@ -1724,9 +1743,11 @@ CirctModuleEmitter::collectLoopCarriedSlots(Block &block,
       Value base = defining->getOperand(0);
       if (calleeSelf && base == calleeSelf)
         base = callerSelf;
-      if (base != selfPtr && llvm::is_contained(stackSlots, base))
-        if (auto index = defining->getAttrOfType<IntegerAttr>("index")) {
-          Value slot = getStructFieldSlot(defining, base, index.getInt());
+      if (auto index = defining->getAttrOfType<IntegerAttr>("index"))
+        if (auto path = resolveStructFieldPath(base, index.getInt())) {
+          structFieldPaths[defining->getResult(0)] = *path;
+          Value slot =
+              getStructFieldSlot(defining, path->root, path->path);
           structFieldAliases[value] = slot;
           add(slot);
           return;
@@ -1776,6 +1797,15 @@ CirctModuleEmitter::collectLoopCarriedSlots(Block &block,
       Value callerSelf = op->getOperand(0);
       for (Operation &inner : methodBody.getOperations()) {
         StringRef innerName = inner.getName().getStringRef();
+        if (innerName == "kgen.struct.gep" && inner.getNumOperands() == 1) {
+          Value base = inner.getOperand(0);
+          if (base == calleeSelf)
+            base = callerSelf;
+          if (auto index = inner.getAttrOfType<IntegerAttr>("index"))
+            if (auto path = resolveStructFieldPath(base, index.getInt()))
+              structFieldPaths[inner.getResult(0)] = *path;
+          continue;
+        }
         if (innerName == "pop.store" && inner.getNumOperands() == 2) {
           addPointer(inner.getOperand(1), calleeSelf, callerSelf);
           continue;
@@ -1796,6 +1826,21 @@ CirctModuleEmitter::collectLoopCarriedSlots(Block &block,
       }
     }
   };
+  // Register every GEP chain first, so a nested field store can resolve its
+  // full path during the store scan.
+  auto registerPath = [&](Operation *op) {
+    if (op->getName().getStringRef() != "kgen.struct.gep" ||
+        op->getNumOperands() != 1)
+      return;
+    auto index = op->getAttrOfType<IntegerAttr>("index");
+    if (!index)
+      return;
+    if (auto path = resolveStructFieldPath(op->getOperand(0),
+                                           index.getInt()))
+      structFieldPaths[op->getResult(0)] = *path;
+  };
+  for (Operation &op : block.getOperations())
+    op.walk(registerPath);
   for (Operation &op : block.getOperations())
     op.walk(scan);
   return result;
@@ -1845,26 +1890,45 @@ Value CirctModuleEmitter::resolveStructField(Value value) const {
   return it != structFieldAliases.end() ? it->second : value;
 }
 
-Value CirctModuleEmitter::getStructFieldSlot(Operation *gep, Value base,
-                                             unsigned index) {
-  auto &fields = structFieldsByBase[base];
-  for (auto &[fieldIndex, slot] : fields)
-    if (fieldIndex == index)
+std::optional<CirctModuleEmitter::StructFieldPath>
+CirctModuleEmitter::resolveStructFieldPath(Value base, unsigned index) const {
+  auto known = structFieldPaths.find(base);
+  if (known != structFieldPaths.end()) {
+    StructFieldPath result = known->second;
+    result.path.push_back(index);
+    return result;
+  }
+  if (base != selfPtr && llvm::is_contained(stackSlots, base)) {
+    StructFieldPath result;
+    result.root = base;
+    result.path.push_back(index);
+    return result;
+  }
+  return std::nullopt;
+}
+
+Value CirctModuleEmitter::getStructFieldSlot(Operation *gep, Value root,
+                                             ArrayRef<unsigned> path) {
+  auto &fields = structFieldSlots[root];
+  for (auto &[candidate, slot] : fields)
+    if (candidate == path)
       return slot;
   // The GEP pointer is only a map key: it is never emitted, so it is safe to
   // reuse a source-region value as the canonical slot.
   Value slot = gep->getResult(0);
-  fields.push_back({index, slot});
+  fields.push_back({SmallVector<unsigned>(path), slot});
   stackSlots.push_back(slot);
-  if (auto inits = structFieldInits.find(base);
-      inits != structFieldInits.end())
-    for (auto &[initIndex, init] : inits->second)
-      if (initIndex == index) {
-        values[slot] = init.val;
-        if (init.xz)
-          logicValues[slot] = {init.val, init.xz};
-        break;
-      }
+  if (path.size() == 1) {
+    if (auto inits = structFieldInits.find(root);
+        inits != structFieldInits.end())
+      for (auto &[initIndex, init] : inits->second)
+        if (initIndex == path[0]) {
+          values[slot] = init.val;
+          if (init.xz)
+            logicValues[slot] = {init.val, init.xz};
+          break;
+        }
+  }
   return slot;
 }
 
@@ -1915,23 +1979,50 @@ LogicalResult CirctModuleEmitter::emitStructConstructor(Operation *op,
   if (!self)
     return op->emitError()
            << "HDL lowering: struct constructor has no field stores";
+  Value dest = op->getOperand(op->getNumOperands() - 1);
+  // A constructor writing into a nested struct field is inlined so its leaf
+  // fields get values directly instead of a lazy init on the root slot.
+  if (structFieldPaths.count(dest))
+    return emitStructMethod(op, callee, condition, returnValue);
   SmallVector<std::pair<unsigned, Value>> inits;
+  bool forceInline = false;
+  auto isPayloadCopy = [](StringRef name) {
+    return name.contains("Bits::copy") || name.contains("Bits::__init__") ||
+           name.contains("Logic::copy") || name.contains("Logic::__init__") ||
+           name.contains("Array::copy") || name.contains("Array::__init__") ||
+           name.contains("Packed::copy") || name.contains("Packed::__init__");
+  };
   for (Operation &o : body.getOperations()) {
     StringRef name = o.getName().getStringRef();
     if (name == "pop.store" && o.getNumOperands() == 2) {
       auto field = fieldOf.find(o.getOperand(1));
       if (field != fieldOf.end())
         inits.push_back({field->second, o.getOperand(0)});
+      else if (Operation *target = o.getOperand(1).getDefiningOp();
+               target &&
+               target->getName().getStringRef() == "kgen.struct.gep")
+        forceInline = true;
       continue;
     }
     if (name != "kgen.call" || o.getNumOperands() < 2)
       continue;
     StringRef inner = callCalleeName(&o);
-    if (!inner.contains("::copy") && !inner.contains("::__init__"))
+    if (!isPayloadCopy(inner)) {
+      StringRef innerName = inner.split('(').first;
+      if (innerName.ends_with("::__init__") ||
+          innerName.ends_with("::__copyinit__") ||
+          innerName.ends_with("::__moveinit__"))
+        forceInline = true;
       continue;
+    }
     auto field = fieldOf.find(o.getOperand(o.getNumOperands() - 1));
-    if (field == fieldOf.end())
+    if (field == fieldOf.end()) {
+      if (Operation *target =
+              o.getOperand(o.getNumOperands() - 1).getDefiningOp();
+          target && target->getName().getStringRef() == "kgen.struct.gep")
+        forceInline = true;
       continue;
+    }
     inits.push_back({field->second, o.getOperand(0)});
   }
   // A constructor that computes field values is inlined like a method. The
@@ -1946,13 +2037,12 @@ LogicalResult CirctModuleEmitter::emitStructConstructor(Operation *op,
         return true;
     return false;
   };
-  bool computed = inits.empty();
+  bool computed = inits.empty() || forceInline;
   for (auto &[field, source] : inits)
     if (!isSimpleInitializer(source))
       computed = true;
   if (computed)
     return emitStructMethod(op, callee, condition, returnValue);
-  Value dest = op->getOperand(op->getNumOperands() - 1);
   for (auto &[field, source] : inits) {
     Value value;
     Value xz;
@@ -4888,12 +4978,13 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       // emitted once every process (and therefore every owning domain) is
       // known.
       Value base = op->getOperand(0);
-      if (!instancePtrs.count(base) && llvm::is_contained(stackSlots, base)) {
-        Value slot =
-            getStructFieldSlot(op, base, index.getInt());
-        structFieldAliases[op->getResult(0)] = slot;
-        return success();
-      }
+      if (!instancePtrs.count(base))
+        if (auto path = resolveStructFieldPath(base, index.getInt())) {
+          structFieldPaths[op->getResult(0)] = *path;
+          Value slot = getStructFieldSlot(op, path->root, path->path);
+          structFieldAliases[op->getResult(0)] = slot;
+          return success();
+        }
       if (auto instance = instancePtrs.find(base);
           instance != instancePtrs.end()) {
         unsigned field = instance->second;
