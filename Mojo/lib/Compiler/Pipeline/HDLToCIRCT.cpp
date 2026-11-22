@@ -798,6 +798,30 @@ private:
   DenseMap<Value, unsigned> fieldPtrs;
   DenseMap<Value, unsigned> instancePtrs;
   DenseMap<unsigned, unsigned> instanceMethod;
+
+  // A branch literal is one `if` condition together with the polarity of the
+  // branch being emitted. Two call sites are mutually exclusive when their
+  // paths contain the same condition with opposite polarity.
+  struct BranchLiteral {
+    Value cond;
+    bool positive;
+  };
+  struct InstanceCallState {
+    Operation *op = nullptr;
+    unsigned results = 0;
+    SmallVector<SmallVector<BranchLiteral>> paths;
+  };
+  static bool pathsExclusive(ArrayRef<BranchLiteral> lhs,
+                             ArrayRef<BranchLiteral> rhs) {
+    for (const BranchLiteral &a : lhs)
+      for (const BranchLiteral &b : rhs)
+        if (a.cond == b.cond && a.positive != b.positive)
+          return true;
+    return false;
+  }
+  DenseMap<unsigned, InstanceCallState> instanceCalls;
+  SmallVector<BranchLiteral> branchPath;
+
   DenseMap<unsigned, Value> fieldRegs;
   DenseMap<unsigned, Value> fieldNext;
   DenseMap<unsigned, Value> fieldEnable;
@@ -1834,7 +1858,10 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     if (hasBody(thenRegion)) {
       Value thenCond =
           condition ? comb::AndOp::create(builder, loc, condition, cond) : cond;
-      if (failed(emitBlock(thenRegion.front(), thenCond, returnValue)))
+      branchPath.push_back({cond, true});
+      LogicalResult result = emitBlock(thenRegion.front(), thenCond, returnValue);
+      branchPath.pop_back();
+      if (failed(result))
         return failure();
     }
     Region &elseRegion = op->getRegion(1);
@@ -1843,7 +1870,10 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       Value elseCond = condition
                            ? comb::AndOp::create(builder, loc, condition, notCond)
                            : notCond;
-      if (failed(emitBlock(elseRegion.front(), elseCond, returnValue)))
+      branchPath.push_back({cond, false});
+      LogicalResult result = emitBlock(elseRegion.front(), elseCond, returnValue);
+      branchPath.pop_back();
+      if (failed(result))
         return failure();
     }
     return success();
@@ -2441,18 +2471,13 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             childHasClock = true;
         if (childHasClock) {
           if (auto owner = instanceMethod.find(fieldIndex);
-              owner != instanceMethod.end()) {
-            if (owner->second != currentMethod)
-              return op->emitError()
-                     << "HDL lowering: instance '" << fieldNames[fieldIndex]
-                     << "' is ticked from multiple processes ('"
-                     << methodNames[owner->second] << "' and '"
-                     << methodNames[currentMethod] << "')";
+              owner != instanceMethod.end() &&
+              owner->second != currentMethod)
             return op->emitError()
                    << "HDL lowering: instance '" << fieldNames[fieldIndex]
-                   << "' is ticked more than once in process '"
-                   << methodNames[currentMethod] << "'";
-          }
+                   << "' is ticked from multiple processes ('"
+                   << methodNames[owner->second] << "' and '"
+                   << methodNames[currentMethod] << "')";
           instanceMethod[fieldIndex] = currentMethod;
         }
         MLIRContext *ctx = source.getContext();
@@ -2462,6 +2487,9 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             childInputs.push_back(port);
 
         SmallVector<Value> inputs;
+        // Operand slot and lowered value for each non-clock/reset input, used
+        // to mux a second tick from a mutually exclusive branch.
+        SmallVector<std::pair<unsigned, Value>> dataInputs;
         unsigned operandIndex = 1;
         for (unsigned p = 0; p < childInputs.size(); ++p) {
           hw::PortInfo port = childInputs[p];
@@ -2500,7 +2528,9 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
               return op->emitError()
                      << "HDL lowering: instance operand was not lowered";
             inputs.push_back(value.val);
+            dataInputs.push_back({inputs.size() - 1, value.val});
             inputs.push_back(value.xz);
+            dataInputs.push_back({inputs.size() - 1, value.xz});
             ++p;
             continue;
           }
@@ -2517,32 +2547,111 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             return op->emitError()
                    << "HDL lowering: instance operand was not lowered";
           inputs.push_back(value);
+          dataInputs.push_back({inputs.size() - 1, value});
         }
         if (operandIndex + 1 != op->getNumOperands())
           return op->emitError()
                  << "HDL lowering: too many instance operands";
+
+        // The by-ref result slot of a tick is either a temporary (bound as a
+        // value) or a `self.<field>` pointer, in which case the call stores
+        // the result into the field through the normal register path.
+        auto bindResult = [&](Value dest, Value value, Value xz) -> LogicalResult {
+          if (auto field = fieldPtrs.find(dest); field != fieldPtrs.end()) {
+            bool logicField = field->second < fieldIsLogic.size() &&
+                              fieldIsLogic[field->second];
+            if (logicField) {
+              if (!xz)
+                return op->emitError()
+                       << "HDL lowering: Logic instance result has no mask";
+              return storeLogicField(field->second, {value, xz}, condition);
+            }
+            return storeField(field->second, value, condition);
+          }
+          if (xz) {
+            logicValues[dest] = {value, xz};
+            if (dest == resultPtr) {
+              returnValue = value;
+              returnXz = xz;
+              returnIsLogic = true;
+            }
+          } else {
+            values[dest] = value;
+            if (dest == resultPtr)
+              returnValue = value;
+          }
+          return success();
+        };
+
+        // A stateful child ticked once per branch of the same `if`/`else`
+        // chain is a single instance: its inputs are muxed on the branch
+        // condition and each call site sees its own gated result. Overlapping
+        // call sites (the same branch, or two unconditional ticks) stay
+        // errors.
+        auto existing = instanceCalls.find(fieldIndex);
+        if (existing != instanceCalls.end() && childHasClock) {
+          InstanceCallState &state = existing->second;
+          for (const auto &path : state.paths)
+            if (!pathsExclusive(path, branchPath))
+              return op->emitError()
+                     << "HDL lowering: instance '" << fieldNames[fieldIndex]
+                     << "' is ticked more than once in process '"
+                     << methodNames[currentMethod]
+                     << "' (branches are not mutually exclusive)";
+          for (auto &[index, value] : dataInputs) {
+            Value previous = state.op->getOperand(index);
+            state.op->setOperand(
+                index, comb::MuxOp::create(builder, loc, condition, value,
+                                           previous));
+          }
+          state.paths.push_back(branchPath);
+
+          Value dest = op->getOperand(op->getNumOperands() - 1);
+          auto gate = [&](Value value) -> Value {
+            auto integer = dyn_cast<IntegerType>(value.getType());
+            if (!integer)
+              return value;
+            Value zero = hw::ConstantOp::create(builder, loc, integer, 0);
+            return comb::MuxOp::create(builder, loc, condition, value, zero);
+          };
+          if (state.results == 1)
+            return bindResult(dest, gate(state.op->getResult(0)), Value());
+          if (state.results == 2)
+            return bindResult(dest, gate(state.op->getResult(0)),
+                              gate(state.op->getResult(1)));
+          return op->emitError()
+                 << "HDL lowering: instance with " << state.results
+                 << " outputs is not supported";
+        }
+
         auto instanceOp = hw::InstanceOp::create(
             builder, loc, childOp,
             StringAttr::get(ctx, fieldNames[fieldIndex]), inputs);
-        Value dest = op->getOperand(op->getNumOperands() - 1);
-        if (instanceOp.getNumResults() == 1) {
-          values[dest] = instanceOp.getResult(0);
-          if (dest == resultPtr)
-            returnValue = instanceOp.getResult(0);
-        } else if (instanceOp.getNumResults() == 2) {
-          logicValues[dest] = {instanceOp.getResult(0),
-                               instanceOp.getResult(1)};
-          if (dest == resultPtr) {
-            returnValue = instanceOp.getResult(0);
-            returnXz = instanceOp.getResult(1);
-            returnIsLogic = true;
-          }
-        } else {
-          return op->emitError()
-                 << "HDL lowering: instance with "
-                 << instanceOp.getNumResults() << " outputs is not supported";
+        if (childHasClock) {
+          InstanceCallState &state = instanceCalls[fieldIndex];
+          state.op = instanceOp;
+          state.results = instanceOp.getNumResults();
+          state.paths.push_back(branchPath);
         }
-        return success();
+
+        Value dest = op->getOperand(op->getNumOperands() - 1);
+        auto gate = [&](Value value) -> Value {
+          if (!condition)
+            return value;
+          auto integer = dyn_cast<IntegerType>(value.getType());
+          if (!integer)
+            return value;
+          Value zero = hw::ConstantOp::create(builder, loc, integer, 0);
+          return comb::MuxOp::create(builder, loc, condition, value, zero);
+        };
+        if (instanceOp.getNumResults() == 1)
+          return bindResult(dest, gate(instanceOp.getResult(0)), Value());
+        if (instanceOp.getNumResults() == 2)
+          return bindResult(dest, gate(instanceOp.getResult(0)),
+                            gate(instanceOp.getResult(1)));
+        return op->emitError()
+               << "HDL lowering: instance with " << instanceOp.getNumResults()
+               << " outputs is not supported";
       }
     }
 
