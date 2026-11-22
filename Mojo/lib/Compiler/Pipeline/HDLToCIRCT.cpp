@@ -2657,6 +2657,10 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                << "HDL lowering: unknown delayed-next target";
       unsigned field = target->second.field;
       if (target->second.isArrayElement) {
+        if (target->second.delay > 1)
+          return op->emitError()
+                 << "HDL lowering: delayed next on array elements is not "
+                    "supported yet";
         bool isLogic = arrayIsLogic.lookup(field);
         if (isLogic) {
           LogicValue value = getLogicValue(op->getOperand(1));
