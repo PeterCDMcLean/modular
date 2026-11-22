@@ -33,13 +33,13 @@ diff -u "$root/hdl-spike/expected/62_loop_carried.mlir" \
 [ "$(grep -c 'hw.module' "$out/62_loop_carried.mlir")" = "2" ]
 # Each module has a running flag, a carried accumulator, and a done pulse.
 [ "$(grep -c 'seq.compreg %18, %clk reset %rst' "$out/62_loop_carried.mlir")" = "2" ]
-[ "$(grep -c 'seq.compreg %16, %clk reset %rst' "$out/62_loop_carried.mlir")" = "2" ]
-[ "$(grep -c 'seq.compreg %13, %clk reset %rst' "$out/62_loop_carried.mlir")" = "2" ]
+[ "$(grep -c 'seq.compreg %10, %clk reset %rst' "$out/62_loop_carried.mlir")" = "2" ]
+[ "$(grep -c 'seq.compreg %14, %clk reset %rst' "$out/62_loop_carried.mlir")" = "2" ]
 # `acc` accumulates under active and reloads zero during init/done.
 [ "$(grep -c 'comb.mux %3, %9, %c0_i8 : i8' "$out/62_loop_carried.mlir")" = "2" ]
 [ "$(grep -c 'comb.add %5, %wd : i8' "$out/62_loop_carried.mlir")" = "2" ]
 # Post-loop total/cycles capture the final accumulator on the done pulse.
-[ "$(grep -c 'seq.compreg.ce sym @reg_0 %5, %clk, %15' "$out/62_loop_carried.mlir")" = "2" ]
+[ "$(grep -c 'seq.compreg.ce sym @reg_0 %5, %clk, %16' "$out/62_loop_carried.mlir")" = "2" ]
 
 "$MOJO" build --emit=sv -o "$out/62_loop_carried.raw.sv" "${inc[@]}" "$design"
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' \
@@ -48,7 +48,7 @@ sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' \
 diff -u "$root/hdl-spike/expected/62_loop_carried.sv" \
     "$out/62_loop_carried.sv"
 
-[ "$(grep -c 'assign _GEN_1 = _GEN_4 ? (_GEN_6 ? _GEN_5 + wd : _GEN_5) : 8.h0;' \
+[ "$(grep -c 'assign _GEN_2 = _GEN_4 ? (_GEN_6 ? _GEN_5 + wd : _GEN_5) : 8.h0;' \
     "$out/62_loop_carried.sv")" = "2" ]
 [ "$(grep -c 'else if (_GEN_9)' "$out/62_loop_carried.sv")" = "4" ]
 [ "$(grep -c 'assign out = reg_0;' "$out/62_loop_carried.sv")" = "2" ]

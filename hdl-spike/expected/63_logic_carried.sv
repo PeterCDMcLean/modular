@@ -11,15 +11,15 @@ module RuntimeForLogicAccum(
   wire      [7:0]  _GEN_0;
   wire      [7:0]  _GEN_1;
   wire             _GEN_2;
-  wire      [7:0]  _GEN_3;
+  wire      [63:0] _GEN_3;
   wire      [7:0]  _GEN_4;
-  wire      [63:0] _GEN_5;
+  wire      [7:0]  _GEN_5;
   var logic [63:0] _GEN_6 = 64'h0;
   always @(posedge clk) begin
     if (rst)
       _GEN_6 <= 64'h0;
     else
-      _GEN_6 <= _GEN_5;
+      _GEN_6 <= _GEN_3;
   end
   var logic        _GEN_7 = 1'h0;
   always @(posedge clk) begin
@@ -33,18 +33,23 @@ module RuntimeForLogicAccum(
     if (rst)
       _GEN_8 <= 8'h0;
     else
-      _GEN_8 <= _GEN_4;
+      _GEN_8 <= _GEN_5;
   end
   var logic [7:0]  _GEN_9 = 8'h0;
   always @(posedge clk) begin
     if (rst)
       _GEN_9 <= 8'h0;
     else
-      _GEN_9 <= _GEN_3;
+      _GEN_9 <= _GEN_4;
   end
   wire             _GEN_10 = _GEN_7 & _GEN_6 < count;
+  assign _GEN_5 = _GEN_7 ? {8{_GEN_10}} & wd | _GEN_8 : wd;
+  assign _GEN_4 =
+    _GEN_7
+      ? (_GEN_10 ? (_GEN_9 | wd_xz) & (_GEN_9 | ~_GEN_8) & (wd_xz | ~wd) : _GEN_9)
+      : wd_xz;
   wire      [63:0] _GEN_11 = _GEN_6 + 64'h1;
-  assign _GEN_5 = _GEN_10 ? _GEN_11 : 64'h0;
+  assign _GEN_3 = _GEN_10 ? _GEN_11 : 64'h0;
   wire             _GEN_12 = _GEN_10 & _GEN_11 == count;
   var logic        _GEN_13 = 1'h0;
   always @(posedge clk) begin
@@ -53,11 +58,6 @@ module RuntimeForLogicAccum(
     else
       _GEN_13 <= _GEN_12;
   end
-  assign _GEN_4 = _GEN_7 ? {8{_GEN_10}} & wd | _GEN_8 : wd;
-  assign _GEN_3 =
-    _GEN_7
-      ? (_GEN_10 ? (_GEN_9 | wd_xz) & (_GEN_9 | ~_GEN_8) & (wd_xz | ~wd) : _GEN_9)
-      : wd_xz;
   assign _GEN_2 = ~_GEN_7 | ~_GEN_12;
   var logic [7:0]  _GEN_14 = 8'h0;
   always @(posedge clk) begin
@@ -99,15 +99,15 @@ module RuntimeWhileLogicAccum(
   wire      [7:0]  _GEN_0;
   wire      [7:0]  _GEN_1;
   wire             _GEN_2;
-  wire      [7:0]  _GEN_3;
+  wire      [63:0] _GEN_3;
   wire      [7:0]  _GEN_4;
-  wire      [63:0] _GEN_5;
+  wire      [7:0]  _GEN_5;
   var logic [63:0] _GEN_6 = 64'h0;
   always @(posedge clk) begin
     if (rst)
       _GEN_6 <= 64'h0;
     else
-      _GEN_6 <= _GEN_5;
+      _GEN_6 <= _GEN_3;
   end
   var logic        _GEN_7 = 1'h0;
   always @(posedge clk) begin
@@ -121,18 +121,23 @@ module RuntimeWhileLogicAccum(
     if (rst)
       _GEN_8 <= 8'h0;
     else
-      _GEN_8 <= _GEN_4;
+      _GEN_8 <= _GEN_5;
   end
   var logic [7:0]  _GEN_9 = 8'h0;
   always @(posedge clk) begin
     if (rst)
       _GEN_9 <= 8'h0;
     else
-      _GEN_9 <= _GEN_3;
+      _GEN_9 <= _GEN_4;
   end
   wire             _GEN_10 = _GEN_7 & _GEN_6 < count;
+  assign _GEN_5 = _GEN_7 ? {8{_GEN_10}} & wd | _GEN_8 : wd;
+  assign _GEN_4 =
+    _GEN_7
+      ? (_GEN_10 ? (_GEN_9 | wd_xz) & (_GEN_9 | ~_GEN_8) & (wd_xz | ~wd) : _GEN_9)
+      : wd_xz;
   wire      [63:0] _GEN_11 = _GEN_6 + 64'h1;
-  assign _GEN_5 = _GEN_10 ? _GEN_11 : 64'h0;
+  assign _GEN_3 = _GEN_10 ? _GEN_11 : 64'h0;
   wire             _GEN_12 = _GEN_10 & _GEN_11 == count;
   var logic        _GEN_13 = 1'h0;
   always @(posedge clk) begin
@@ -141,11 +146,6 @@ module RuntimeWhileLogicAccum(
     else
       _GEN_13 <= _GEN_12;
   end
-  assign _GEN_4 = _GEN_7 ? {8{_GEN_10}} & wd | _GEN_8 : wd;
-  assign _GEN_3 =
-    _GEN_7
-      ? (_GEN_10 ? (_GEN_9 | wd_xz) & (_GEN_9 | ~_GEN_8) & (wd_xz | ~wd) : _GEN_9)
-      : wd_xz;
   assign _GEN_2 = ~_GEN_7 | ~_GEN_12;
   var logic [7:0]  _GEN_14 = 8'h0;
   always @(posedge clk) begin

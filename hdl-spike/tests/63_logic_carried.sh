@@ -43,7 +43,7 @@ diff -u "$root/hdl-spike/expected/63_logic_carried.sv" \
 
 # The carried value reloads the pre-loop `wd`, accumulates under active, and
 # the mask follows the 4-state OR.
-[ "$(grep -c 'assign _GEN_4 = _GEN_7 ? {8{_GEN_10}} & wd | _GEN_8 : wd;' \
+[ "$(grep -c 'assign _GEN_5 = _GEN_7 ? {8{_GEN_10}} & wd | _GEN_8 : wd;' \
     "$out/63_logic_carried.sv")" = "2" ]
 [ "$(grep -c 'assign _GEN_2 = ~_GEN_7 | ~_GEN_12;' \
     "$out/63_logic_carried.sv")" = "2" ]

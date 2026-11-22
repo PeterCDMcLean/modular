@@ -1557,22 +1557,24 @@ CirctModuleEmitter::collectLoopCarriedSlots(Block &block,
     if (!llvm::is_contained(result, value))
       result.push_back(value);
   };
-  for (Operation &op : block.getOperations()) {
-    StringRef name = op.getName().getStringRef();
-    if (name == "pop.store" && op.getNumOperands() == 2) {
-      add(op.getOperand(1));
-      continue;
+  auto scan = [&](Operation *op) {
+    StringRef name = op->getName().getStringRef();
+    if (name == "pop.store" && op->getNumOperands() == 2) {
+      add(op->getOperand(1));
+      return;
     }
     if (name != "kgen.call")
-      continue;
-    StringRef callee = callCalleeName(&op);
+      return;
+    StringRef callee = callCalleeName(op);
     if ((callee.contains("Bits::copy") || callee.contains("Bits::__init__") ||
          callee.contains("Logic::copy") || callee.contains("Logic::__init__")) &&
-        op.getNumOperands() >= 2)
-      add(op.getOperand(op.getNumOperands() - 1));
-    else if (callee.contains("SIMD::__iadd__") && op.getNumOperands() == 2)
-      add(op.getOperand(0));
-  }
+        op->getNumOperands() >= 2)
+      add(op->getOperand(op->getNumOperands() - 1));
+    else if (callee.contains("SIMD::__iadd__") && op->getNumOperands() == 2)
+      add(op->getOperand(0));
+  };
+  for (Operation &op : block.getOperations())
+    op.walk(scan);
   return result;
 }
 
@@ -4629,10 +4631,41 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
   if (!sawIf)
     return loop->emitError()
            << "HDL lowering: runtime loop has no condition";
+  if (running) {
+    for (auto &[carriedSlot, reg] : loopCarriedRegs) {
+      Value bodyNext = loopCarriedNext[carriedSlot];
+      Value initial = loopCarriedInit[carriedSlot];
+      Value muxed =
+          comb::MuxOp::create(builder, loc, running, bodyNext, initial);
+      if (failed(setRegNext(reg, muxed)))
+        return loop->emitError()
+               << "HDL lowering: unsupported carried register form";
+    }
+    for (auto &[carriedSlot, regs] : loopCarriedLogicRegs) {
+      LogicValue bodyNext = loopCarriedLogicNext[carriedSlot];
+      LogicValue initial = loopCarriedLogicInit[carriedSlot];
+      Value valMuxed =
+          comb::MuxOp::create(builder, loc, running, bodyNext.val,
+                              initial.val);
+      Value xzMuxed = comb::MuxOp::create(builder, loc, running, bodyNext.xz,
+                                          initial.xz);
+      if (failed(setRegNext(regs.val, valMuxed)) ||
+          failed(setRegNext(regs.xz, xzMuxed)))
+        return loop->emitError()
+               << "HDL lowering: unsupported carried register form";
+    }
+    loopCarriedRegs.clear();
+    loopCarriedNext.clear();
+    loopCarriedInit.clear();
+    loopCarriedLogicRegs.clear();
+    loopCarriedLogicNext.clear();
+    loopCarriedLogicInit.clear();
+  }
   if (nestedLoopSeen) {
     // The nested loop handler advanced the outer counter and created the
     // combined done pulse.
     nestedLoopSeen = false;
+    loopRunning = Value();
     dynamicOuterCounter = Value();
     dynamicOuterBound = Value();
     return success();
@@ -4904,8 +4937,39 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
   inDynamicLoop = false;
   dynamicLoopSlot = Value();
   dynamicLoopOuterSlots.clear();
+  if (running) {
+    for (auto &[carriedSlot, reg] : loopCarriedRegs) {
+      Value bodyNext = loopCarriedNext[carriedSlot];
+      Value initial = loopCarriedInit[carriedSlot];
+      Value muxed =
+          comb::MuxOp::create(builder, loc, running, bodyNext, initial);
+      if (failed(setRegNext(reg, muxed)))
+        return loop->emitError()
+               << "HDL lowering: unsupported carried register form";
+    }
+    for (auto &[carriedSlot, regs] : loopCarriedLogicRegs) {
+      LogicValue bodyNext = loopCarriedLogicNext[carriedSlot];
+      LogicValue initial = loopCarriedLogicInit[carriedSlot];
+      Value valMuxed =
+          comb::MuxOp::create(builder, loc, running, bodyNext.val,
+                              initial.val);
+      Value xzMuxed = comb::MuxOp::create(builder, loc, running, bodyNext.xz,
+                                          initial.xz);
+      if (failed(setRegNext(regs.val, valMuxed)) ||
+          failed(setRegNext(regs.xz, xzMuxed)))
+        return loop->emitError()
+               << "HDL lowering: unsupported carried register form";
+    }
+    loopCarriedRegs.clear();
+    loopCarriedNext.clear();
+    loopCarriedInit.clear();
+    loopCarriedLogicRegs.clear();
+    loopCarriedLogicNext.clear();
+    loopCarriedLogicInit.clear();
+  }
   if (nestedLoopSeen) {
     nestedLoopSeen = false;
+    loopRunning = Value();
     dynamicOuterCounter = Value();
     dynamicOuterBound = Value();
     return success();
@@ -4986,10 +5050,6 @@ LogicalResult CirctModuleEmitter::emitNestedRangeLoop(
     return loop->emitError()
            << "HDL lowering: more than two nested runtime loops are not "
               "supported";
-  if (!loopCarriedRegs.empty() || !loopCarriedLogicRegs.empty())
-    return loop->emitError()
-           << "HDL lowering: loop-carried state in nested runtime loops is "
-              "not supported yet";
   if (loop->getNumRegions() != 1 || loop->getRegion(0).empty())
     return success();
   Block &block = loop->getRegion(0).front();
@@ -5051,10 +5111,12 @@ LogicalResult CirctModuleEmitter::emitNestedRangeLoop(
   }
   if (!loopIf)
     return success();
-  if (!collectLoopCarriedSlots(block, slot).empty())
-    return loop->emitError()
-           << "HDL lowering: loop-carried state in nested runtime loops is "
-              "not supported yet";
+  for (Value innerCarried : collectLoopCarriedSlots(block, slot))
+    if (!loopCarriedRegs.count(innerCarried) &&
+        !loopCarriedLogicRegs.count(innerCarried))
+      return loop->emitError()
+             << "HDL lowering: loop-carried local declared inside the outer "
+                "loop is not supported yet";
 
   handled = true;
   inNestedLoop = true;
@@ -5157,6 +5219,14 @@ LogicalResult CirctModuleEmitter::emitNestedRangeLoop(
   if (failed(setRegNext(done, outerLast)))
     return loop->emitError()
            << "HDL lowering: unsupported nested loop done form";
+  if (loopRunning) {
+    Value notLast = bitNot(outerLast);
+    Value runningNext = comb::MuxOp::create(
+        builder, loc, loopRunning, notLast, getConstant(true));
+    if (failed(setRegNext(loopRunning, runningNext)))
+      return loop->emitError()
+             << "HDL lowering: unsupported nested running form";
+  }
   if (loopStack.empty() && branchPath.empty())
     pendingLoopDone = done;
 
