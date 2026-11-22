@@ -59,14 +59,4 @@ grep -q 'wire      \[63:0\] _GEN_6 = _GEN_4 + 64.h1;' \
     "$out/60_runtime_range.sv"
 [ "$(grep -c 'var logic \[7:0\]  mem_0_' "$out/60_runtime_range.sv")" = "4" ]
 
-# Loop-carried locals are rejected the same way as in a while loop.
-if "$MOJO" build --emit=circt -o /dev/null "${inc[@]}" \
-    "$root/hdl-spike/designs/60_bad_runtime_range_accum.mojo" \
-    > "$out/60_bad_runtime_range_accum.out" 2>&1; then
-  echo "FAIL: a loop-carried local was accepted" >&2
-  exit 1
-fi
-grep -q "loop-carried local variable in a runtime-bounded loop" \
-    "$out/60_bad_runtime_range_accum.out"
-
 echo "60_runtime_range: ok"

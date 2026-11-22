@@ -856,6 +856,17 @@ private:
   // same block are gated by it, so post-loop code runs once per traversal.
   Value pendingLoopDone;
 
+  // Locals read and written across a runtime loop become registers. The value
+  // is loaded from the pre-loop source during the init/done cycle and updated
+  // under the loop's active condition.
+  DenseMap<Value, Value> loopCarriedRegs;
+  DenseMap<Value, Value> loopCarriedNext;
+  DenseMap<Value, Value> loopCarriedInit;
+  Value loopRunning;
+  SmallVector<Value> collectLoopCarriedSlots(Block &block,
+                                             Value inductionSlot);
+  bool storeLoopCarried(Value slot, Value value, Value condition);
+
   // Direct `self.child.<field>` accesses, diagnosed after every process has
   // been seen so the owning domain is known regardless of method order.
   struct ChildFieldAccess {
@@ -1520,6 +1531,49 @@ LogicalResult CirctModuleEmitter::collectProcesses(
     processes.push_back(methodNames[m]);
   }
   return success();
+}
+
+SmallVector<Value>
+CirctModuleEmitter::collectLoopCarriedSlots(Block &block,
+                                            Value inductionSlot) {
+  SmallVector<Value> result;
+  auto add = [&](Value value) {
+    if (!value || value == inductionSlot || fieldPtrs.count(value))
+      return;
+    if (!llvm::is_contained(stackSlots, value))
+      return;
+    if (!llvm::is_contained(result, value))
+      result.push_back(value);
+  };
+  for (Operation &op : block.getOperations()) {
+    StringRef name = op.getName().getStringRef();
+    if (name == "pop.store" && op.getNumOperands() == 2) {
+      add(op.getOperand(1));
+      continue;
+    }
+    if (name != "kgen.call")
+      continue;
+    StringRef callee = callCalleeName(&op);
+    if ((callee.contains("Bits::copy") || callee.contains("Bits::__init__") ||
+         callee.contains("Logic::copy") || callee.contains("Logic::__init__")) &&
+        op.getNumOperands() >= 2)
+      add(op.getOperand(op.getNumOperands() - 1));
+    else if (callee.contains("SIMD::__iadd__") && op.getNumOperands() == 2)
+      add(op.getOperand(0));
+  }
+  return result;
+}
+
+bool CirctModuleEmitter::storeLoopCarried(Value slot, Value value,
+                                          Value condition) {
+  auto next = loopCarriedNext.find(slot);
+  if (next == loopCarriedNext.end())
+    return false;
+  next->second = condition
+                     ? comb::MuxOp::create(builder, loc, condition, value,
+                                           next->second)
+                     : value;
+  return true;
 }
 
 bool CirctModuleEmitter::isLoopCarriedSlot(Value value) const {
@@ -3933,10 +3987,12 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         }
         if (callee.contains("Bits::__init__")) {
           // Move the computed value into a result slot or a state field.
+          if (storeLoopCarried(op->getOperand(1), source, condition))
+            return success();
           if (isLoopCarriedSlot(op->getOperand(1)))
             return op->emitError()
-                   << "HDL lowering: loop-carried local variable in a "
-                      "runtime-bounded loop; store it in a state field instead";
+                   << "HDL lowering: unsupported loop-carried local type in a "
+                      "runtime-bounded loop";
           if (op->getOperand(1) == resultPtr) {
             recordReturn(source);
           } else if (auto field = fieldPtrs.find(op->getOperand(1));
@@ -3948,10 +4004,12 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           return success();
         }
         if (callee.contains("Bits::copy")) {
+          if (storeLoopCarried(op->getOperand(1), source, condition))
+            return success();
           if (isLoopCarriedSlot(op->getOperand(1)))
             return op->emitError()
-                   << "HDL lowering: loop-carried local variable in a "
-                      "runtime-bounded loop; store it in a state field instead";
+                   << "HDL lowering: unsupported loop-carried local type in a "
+                      "runtime-bounded loop";
           if (op->getOperand(1) == resultPtr)
             recordReturn(source);
           else if (auto field = fieldPtrs.find(op->getOperand(1));
@@ -3995,6 +4053,16 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     // In-place SIMD increment, used by loop induction variables.
     if (callee.contains("SIMD::__iadd__") && op->getNumOperands() == 2) {
       Value dest = op->getOperand(0);
+      if (loopCarriedRegs.count(dest)) {
+        Value old = getValue(dest);
+        Value increment = getValue(op->getOperand(1));
+        if (!old || !increment)
+          return op->emitError()
+                 << "HDL lowering: in-place add operand was not lowered";
+        Value sum = comb::AddOp::create(builder, loc, old, increment);
+        storeLoopCarried(dest, sum, condition);
+        return success();
+      }
       if (inLoopUnroll) {
         if (auto current = resolveConstant(dest))
           if (auto increment = resolveConstant(op->getOperand(1))) {
@@ -4191,10 +4259,6 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
   }
 
   if (name == "pop.store") {
-    if (isLoopCarriedSlot(op->getOperand(1)))
-      return op->emitError()
-             << "HDL lowering: loop-carried local variable in a "
-                "runtime-bounded loop; store it in a state field instead";
     auto field = fieldPtrs.find(op->getOperand(1));
     if (field == fieldPtrs.end()) {
       // Remember integer constants and ranges held in stack slots so an
@@ -4219,6 +4283,12 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       return op->emitError() << "HDL lowering: stored value was not lowered";
     if (field != fieldPtrs.end())
       return storeField(field->second, stored, condition);
+    if (storeLoopCarried(op->getOperand(1), stored, condition))
+      return success();
+    if (isLoopCarriedSlot(op->getOperand(1)))
+      return op->emitError()
+             << "HDL lowering: unsupported loop-carried local type in a "
+                "runtime-bounded loop";
     values[op->getOperand(1)] = stored;
     return success();
   }
@@ -4411,9 +4481,54 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
   llvm::APInt zeroBits(width, 0);
   Value counter = createRegister(loopRegisterId++, counterType, zeroBits,
                                  zeroBits, resetStyle);
-  slotConstants.erase(slot);
-  rangeValues.erase(slot);
-  values[slot] = counter;
+  if (slot) {
+    slotConstants.erase(slot);
+    rangeValues.erase(slot);
+    values[slot] = counter;
+  }
+
+  auto setRegNext = [&](Value reg, Value next) -> LogicalResult {
+    if (auto cr = reg.getDefiningOp<seq::CompRegOp>()) {
+      cr->setOperand(0, next);
+      return success();
+    }
+    if (auto fr = reg.getDefiningOp<seq::FirRegOp>()) {
+      fr->setOperand(0, next);
+      return success();
+    }
+    return failure();
+  };
+  SmallVector<Value> carried = collectLoopCarriedSlots(block, slot);
+  Value running;
+  if (!carried.empty()) {
+    auto i1Type = builder.getI1Type();
+    llvm::APInt zeroBit(1, 0);
+    running = createRegister(loopRegisterId++, i1Type, zeroBit, zeroBit,
+                             resetStyle);
+    for (Value carriedSlot : carried) {
+      if (getLogicValue(carriedSlot))
+        return loop->emitError()
+               << "HDL lowering: loop-carried Logic state is not supported "
+                  "yet";
+      Value initial = getValue(carriedSlot);
+      if (!initial)
+        return loop->emitError()
+               << "HDL lowering: loop-carried local was not lowered";
+      unsigned carriedWidth = initial.getType().getIntOrFloatBitWidth();
+      auto carriedType =
+          IntegerType::get(builder.getContext(), carriedWidth);
+      llvm::APInt zeros(carriedWidth, 0);
+      Value reg = createRegister(loopRegisterId++, carriedType, zeros, zeros,
+                                 resetStyle);
+      values[carriedSlot] = reg;
+      slotConstants.erase(carriedSlot);
+      rangeValues.erase(carriedSlot);
+      loopCarriedRegs[carriedSlot] = reg;
+      loopCarriedNext[carriedSlot] = reg;
+      loopCarriedInit[carriedSlot] = initial;
+    }
+    loopRunning = running;
+  }
 
   Value active;
   bool sawIf = false;
@@ -4429,6 +4544,8 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
       if (!cond)
         return op.emitError() << "HDL lowering: loop condition was not lowered";
       active = breakInThen ? bitNot(cond) : cond;
+      if (running)
+        active = comb::AndOp::create(builder, loc, running, active);
       Region &keep = breakInThen ? op.getRegion(1) : op.getRegion(0);
       Value inner = outerCondition
                         ? comb::AndOp::create(builder, loc, outerCondition,
@@ -4496,6 +4613,28 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
     reg->setOperand(0, last);
   else if (auto reg = done.getDefiningOp<seq::FirRegOp>())
     reg->setOperand(0, last);
+  if (running) {
+    for (auto &[carriedSlot, reg] : loopCarriedRegs) {
+      Value bodyNext = loopCarriedNext[carriedSlot];
+      Value initial = loopCarriedInit[carriedSlot];
+      Value muxed =
+          comb::MuxOp::create(builder, loc, running, bodyNext, initial);
+      if (failed(setRegNext(reg, muxed)))
+        return loop->emitError()
+               << "HDL lowering: unsupported carried register form";
+    }
+    Value notLast = bitNot(last);
+    Value runningNext =
+        comb::MuxOp::create(builder, loc, running, notLast,
+                            getConstant(true));
+    if (failed(setRegNext(running, runningNext)))
+      return loop->emitError()
+             << "HDL lowering: unsupported running register form";
+    loopCarriedRegs.clear();
+    loopCarriedNext.clear();
+    loopCarriedInit.clear();
+    loopRunning = Value();
+  }
   if (loopStack.empty() && branchPath.empty())
     pendingLoopDone = done;
   return success();
@@ -4526,7 +4665,10 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
     return success();
   Value bound = range->runtimeBound;
 
-  // The value returned by `__next__` is stored into the loop variable slot.
+  // When the body reads the loop variable, `__next__`'s by-ref result is
+  // loaded and stored into a slot. A body that ignores the variable (for
+  // example `for _ in range(n)`) has no such store; the counter is then only
+  // internal state.
   Value byrefResult = nextOp->getOperand(nextOp->getNumOperands() - 1);
   Operation *indLoad = nullptr;
   for (Operation &op : block.getOperations())
@@ -4535,21 +4677,18 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
       indLoad = &op;
       break;
     }
-  if (!indLoad)
-    return success();
   Operation *indStore = nullptr;
   Value slot;
-  for (Operation &op : block.getOperations())
-    if (op.getName().getStringRef() == "pop.store" &&
-        op.getNumOperands() == 2 &&
-        op.getOperand(0) == indLoad->getResult(0) &&
-        !fieldPtrs.count(op.getOperand(1))) {
-      indStore = &op;
-      slot = op.getOperand(1);
-      break;
-    }
-  if (!indStore || !slot)
-    return success();
+  if (indLoad)
+    for (Operation &op : block.getOperations())
+      if (op.getName().getStringRef() == "pop.store" &&
+          op.getNumOperands() == 2 &&
+          op.getOperand(0) == indLoad->getResult(0) &&
+          !fieldPtrs.count(op.getOperand(1))) {
+        indStore = &op;
+        slot = op.getOperand(1);
+        break;
+      }
 
   Operation *loopIf = nullptr;
   for (Operation &op : block.getOperations()) {
@@ -4593,10 +4732,60 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
   slotConstants.erase(slot);
   rangeValues.erase(slot);
   values[slot] = counter;
+
+  auto setRegNext = [&](Value reg, Value next) -> LogicalResult {
+    if (auto cr = reg.getDefiningOp<seq::CompRegOp>()) {
+      cr->setOperand(0, next);
+      return success();
+    }
+    if (auto fr = reg.getDefiningOp<seq::FirRegOp>()) {
+      fr->setOperand(0, next);
+      return success();
+    }
+    return failure();
+  };
+  SmallVector<Value> carried = collectLoopCarriedSlots(block, slot);
+  Value running;
+  if (!carried.empty()) {
+    auto i1Type = builder.getI1Type();
+    llvm::APInt zeroBit(1, 0);
+    running = createRegister(loopRegisterId++, i1Type, zeroBit, zeroBit,
+                             resetStyle);
+    for (Value carriedSlot : carried) {
+      if (getLogicValue(carriedSlot))
+        return loop->emitError()
+               << "HDL lowering: loop-carried Logic state is not supported "
+                  "yet";
+      Value initial = getValue(carriedSlot);
+      if (!initial)
+        return loop->emitError()
+               << "HDL lowering: loop-carried local was not lowered";
+      unsigned carriedWidth = initial.getType().getIntOrFloatBitWidth();
+      auto carriedType =
+          IntegerType::get(builder.getContext(), carriedWidth);
+      llvm::APInt zeros(carriedWidth, 0);
+      Value reg = createRegister(loopRegisterId++, carriedType, zeros, zeros,
+                                 resetStyle);
+      values[carriedSlot] = reg;
+      slotConstants.erase(carriedSlot);
+      rangeValues.erase(carriedSlot);
+      loopCarriedRegs[carriedSlot] = reg;
+      loopCarriedNext[carriedSlot] = reg;
+      loopCarriedInit[carriedSlot] = initial;
+    }
+    loopRunning = running;
+  }
+
   Value active = comb::ICmpOp::create(
       builder, loc, comb::ICmpPredicate::ult, counter, boundValue);
+  if (running)
+    active = comb::AndOp::create(builder, loc, running, active);
 
-  SmallVector<Operation *> skipOps{nextOp, indLoad, indStore, loopIf};
+  SmallVector<Operation *> skipOps{nextOp, loopIf};
+  if (indLoad)
+    skipOps.push_back(indLoad);
+  if (indStore)
+    skipOps.push_back(indStore);
   inDynamicLoop = true;
   dynamicLoopSlot = slot;
   dynamicLoopOuterSlots = stackSlots;
@@ -4641,6 +4830,28 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
     reg->setOperand(0, last);
   else if (auto reg = done.getDefiningOp<seq::FirRegOp>())
     reg->setOperand(0, last);
+  if (running) {
+    for (auto &[carriedSlot, reg] : loopCarriedRegs) {
+      Value bodyNext = loopCarriedNext[carriedSlot];
+      Value initial = loopCarriedInit[carriedSlot];
+      Value muxed =
+          comb::MuxOp::create(builder, loc, running, bodyNext, initial);
+      if (failed(setRegNext(reg, muxed)))
+        return loop->emitError()
+               << "HDL lowering: unsupported carried register form";
+    }
+    Value notLast = bitNot(last);
+    Value runningNext =
+        comb::MuxOp::create(builder, loc, running, notLast,
+                            getConstant(true));
+    if (failed(setRegNext(running, runningNext)))
+      return loop->emitError()
+             << "HDL lowering: unsupported running register form";
+    loopCarriedRegs.clear();
+    loopCarriedNext.clear();
+    loopCarriedInit.clear();
+    loopRunning = Value();
+  }
   if (loopStack.empty() && branchPath.empty())
     pendingLoopDone = done;
   return success();

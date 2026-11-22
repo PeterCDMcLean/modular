@@ -58,14 +58,4 @@ grep -q 'else if (_GEN_5)' "$out/59_runtime_loop.sv"
 # The body is emitted once, not unrolled.
 [ "$(grep -c 'var logic \[7:0\]  mem_0_' "$out/59_runtime_loop.sv")" = "4" ]
 
-# A local carried across iterations is not representable yet.
-if "$MOJO" build --emit=circt -o /dev/null "${inc[@]}" \
-    "$root/hdl-spike/designs/59_bad_runtime_accum.mojo" \
-    > "$out/59_bad_runtime_accum.out" 2>&1; then
-  echo "FAIL: a loop-carried local was accepted" >&2
-  exit 1
-fi
-grep -q "loop-carried local variable in a runtime-bounded loop" \
-    "$out/59_bad_runtime_accum.out"
-
 echo "59_runtime_loop: ok"
