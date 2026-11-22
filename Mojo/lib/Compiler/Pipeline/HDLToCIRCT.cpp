@@ -1812,6 +1812,9 @@ bool CirctModuleEmitter::storeLoopCarriedLogic(Value slot, LogicValue value,
   } else {
     next->second = value;
   }
+  // Subsequent reads in this iteration see the composed update.
+  values[slot] = next->second.val;
+  logicValues[slot] = next->second;
   return true;
 }
 
@@ -1824,6 +1827,8 @@ bool CirctModuleEmitter::storeLoopCarried(Value slot, Value value,
                      ? comb::MuxOp::create(builder, loc, condition, value,
                                            next->second)
                      : value;
+  // Subsequent reads in this iteration see the composed update.
+  values[slot] = next->second;
   return true;
 }
 
@@ -5150,6 +5155,12 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
             entry.next = muxed;
       }
     }
+    for (auto &[slot, reg] : loopCarriedRegs)
+      values[slot] = reg;
+    for (auto &[slot, regs] : loopCarriedLogicRegs) {
+      values[slot] = regs.val;
+      logicValues[slot] = regs;
+    }
     loopCarriedRegs.clear();
     loopCarriedNext.clear();
     loopCarriedInit.clear();
@@ -5527,6 +5538,12 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
           if (entry.slot == carriedSlot)
             entry.next = muxed;
       }
+    }
+    for (auto &[slot, reg] : loopCarriedRegs)
+      values[slot] = reg;
+    for (auto &[slot, regs] : loopCarriedLogicRegs) {
+      values[slot] = regs.val;
+      logicValues[slot] = regs;
     }
     loopCarriedRegs.clear();
     loopCarriedNext.clear();
