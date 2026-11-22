@@ -869,7 +869,9 @@ private:
       structFieldInits;
   Value getStructFieldSlot(Operation *gep, Value base, unsigned index);
   Value resolveStructField(Value value) const;
-  LogicalResult emitStructConstructor(Operation *op, StringRef callee);
+  LogicalResult emitStructConstructor(Operation *op, StringRef callee,
+                                      Value condition,
+                                      Value &returnValue);
   LogicalResult emitStructMethod(Operation *op, StringRef callee,
                                 Value condition, Value &returnValue);
   Operation *findFunction(StringRef name);
@@ -1867,7 +1869,9 @@ Value CirctModuleEmitter::getStructFieldSlot(Operation *gep, Value base,
 }
 
 LogicalResult CirctModuleEmitter::emitStructConstructor(Operation *op,
-                                                        StringRef callee) {
+                                                        StringRef callee,
+                                                        Value condition,
+                                                        Value &returnValue) {
   Operation *calleeOp = nullptr;
   for (Operation &candidate : source.getBody()->getOperations()) {
     auto symbol =
@@ -1930,10 +1934,24 @@ LogicalResult CirctModuleEmitter::emitStructConstructor(Operation *op,
       continue;
     inits.push_back({field->second, o.getOperand(0)});
   }
-  if (inits.empty())
-    return op->emitError()
-           << "HDL lowering: struct constructor has no simple field "
-              "initializers";
+  // A constructor that computes field values is inlined like a method. The
+  // simple path only records direct argument/constant copies, which the
+  // caller applies lazily when each field slot is first needed.
+  auto isSimpleInitializer = [&](Value source) {
+    for (BlockArgument argument : body.getArguments())
+      if (source == argument)
+        return true;
+    if (Operation *defining = source.getDefiningOp())
+      if (getConstantInt(defining, &bindings))
+        return true;
+    return false;
+  };
+  bool computed = inits.empty();
+  for (auto &[field, source] : inits)
+    if (!isSimpleInitializer(source))
+      computed = true;
+  if (computed)
+    return emitStructMethod(op, callee, condition, returnValue);
   Value dest = op->getOperand(op->getNumOperands() - 1);
   for (auto &[field, source] : inits) {
     Value value;
@@ -4844,7 +4862,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     StringRef callName = callee.split('(').first;
     if (callName.ends_with("::__init__") && !callName.contains("hdl::") &&
         !callName.contains("std::"))
-      return emitStructConstructor(op, callee);
+      return emitStructConstructor(op, callee, condition, returnValue);
 
     return op->emitError() << "HDL lowering: unsupported call to '" << callee
                            << "'";
