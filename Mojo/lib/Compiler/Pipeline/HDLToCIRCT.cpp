@@ -764,6 +764,9 @@ private:
   LogicalResult collectResetValues();
   LogicalResult collectMethodDomains();
   LogicalResult findMethods();
+  /// The ambient clock name of a process domain, or "combinational" when the
+  /// method has no state of its own.
+  std::string domainName(unsigned method) const;
   LogicalResult emitOps(Operation *fn, Value &returnValue);
   LogicalResult emitBlock(Block &block, Value condition, Value &returnValue);
   LogicalResult emitOp(Operation *op, Value condition, Value &returnValue);
@@ -830,6 +833,13 @@ private:
     return false;
   }
   DenseMap<unsigned, InstanceCallState> instanceCalls;
+  // Direct `self.child.<field>` accesses, diagnosed after every process has
+  // been seen so the owning domain is known regardless of method order.
+  struct ChildFieldAccess {
+    unsigned member;
+    unsigned method;
+  };
+  DenseMap<unsigned, SmallVector<ChildFieldAccess>> childFieldAccesses;
   SmallVector<BranchLiteral> branchPath;
   // One result binding, in emission order. The condition is the branch path
   // that produced it; `xz` is set for a four-state result. Sites are folded
@@ -1488,6 +1498,16 @@ LogicalResult CirctModuleEmitter::collectProcesses(
   return success();
 }
 
+std::string CirctModuleEmitter::domainName(unsigned method) const {
+  if (method < methodHasState.size() && !methodHasState[method])
+    return "combinational";
+  if (methods.size() == 1)
+    return "clk";
+  if (method < methodNames.size())
+    return "clk_" + methodNames[method];
+  return "unknown";
+}
+
 LogicalResult CirctModuleEmitter::findMethods() {
   std::string prefixStr = (structName + "::").str();
   StringRef prefix = prefixStr;
@@ -1817,8 +1837,10 @@ LogicalResult CirctModuleEmitter::storeLogicField(unsigned fieldIndex,
     return source.emitError()
            << "HDL lowering: field '" << fieldNames[fieldIndex]
            << "' is driven from multiple processes ('"
-           << methodNames[writer->second] << "' and '"
-           << methodNames[currentMethod] << "')";
+           << methodNames[writer->second] << "' in domain '"
+           << domainName(writer->second) << "' and '"
+           << methodNames[currentMethod] << "' in domain '"
+           << domainName(currentMethod) << "')";
   fieldWriter[fieldIndex] = currentMethod;
 
   LogicValue regs =
@@ -1937,8 +1959,10 @@ LogicalResult CirctModuleEmitter::storeField(unsigned fieldIndex, Value value,
     return source.emitError()
            << "HDL lowering: field '" << fieldNames[fieldIndex]
            << "' is driven from multiple processes ('"
-           << methodNames[writer->second] << "' and '"
-           << methodNames[currentMethod] << "')";
+           << methodNames[writer->second] << "' in domain '"
+           << domainName(writer->second) << "' and '"
+           << methodNames[currentMethod] << "' in domain '"
+           << domainName(currentMethod) << "')";
   fieldWriter[fieldIndex] = currentMethod;
 
   Value reg = getOrCreateReg(fieldIndex, value.getType());
@@ -2168,6 +2192,16 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     auto arrayWrite = [&](unsigned field, Value index, Value data, Value dataXz,
                           bool isLogic, Value enable,
                           Value condition) -> LogicalResult {
+      if (auto writer = fieldWriter.find(field);
+          writer != fieldWriter.end() && writer->second != currentMethod)
+        return op->emitError()
+               << "HDL lowering: memory '" << fieldNames[field]
+               << "' is written from process '" << methodNames[currentMethod]
+               << "' (domain '" << domainName(currentMethod)
+               << "') but driven from '" << methodNames[writer->second]
+               << "' (domain '" << domainName(writer->second)
+               << "'); the access crosses clock domains";
+      fieldWriter[field] = currentMethod;
       auto &regs = getOrCreateArrayStorage(field);
       if (regs.empty())
         return op->emitError() << "HDL lowering: empty array storage";
@@ -2240,6 +2274,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
 
     auto arrayRead = [&](unsigned field, Value index, bool isLogic,
                          Value &resultXz) -> Value {
+      fieldReaders[field].insert(currentMethod);
       auto &regs = getOrCreateArrayStorage(field);
       if (regs.empty())
         return {};
@@ -2688,6 +2723,16 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       auto arrayType = hw::ArrayType::get(elementType, depth);
 
       if (callee.contains("ArrayRam::write")) {
+        if (auto writer = fieldWriter.find(field);
+            writer != fieldWriter.end() && writer->second != currentMethod)
+          return op->emitError()
+                 << "HDL lowering: memory '" << fieldNames[field]
+                 << "' is written from process '" << methodNames[currentMethod]
+                 << "' (domain '" << domainName(currentMethod)
+                 << "') but driven from '" << methodNames[writer->second]
+                 << "' (domain '" << domainName(writer->second)
+                 << "'); the access crosses clock domains";
+        fieldWriter[field] = currentMethod;
         if (arrayRamWritten.lookup(field))
           return op->emitError()
                  << "HDL lowering: multiple ArrayRam writes are not supported";
@@ -2710,6 +2755,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         return success();
       }
 
+      fieldReaders[field].insert(currentMethod);
       Value readData = hw::ArrayGetOp::create(builder, loc, reg, arrayIndex);
       Value dest = op->getOperand(2);
       values[dest] = readData;
@@ -2745,6 +2791,16 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       Value mem = getOrCreateHLMem(field);
 
       if (callee.contains("Ram::write")) {
+        if (auto writer = fieldWriter.find(field);
+            writer != fieldWriter.end() && writer->second != currentMethod)
+          return op->emitError()
+                 << "HDL lowering: memory '" << fieldNames[field]
+                 << "' is written from process '" << methodNames[currentMethod]
+                 << "' (domain '" << domainName(currentMethod)
+                 << "') but driven from '" << methodNames[writer->second]
+                 << "' (domain '" << domainName(writer->second)
+                 << "'); the access crosses clock domains";
+        fieldWriter[field] = currentMethod;
         Value data = getValue(op->getOperand(2));
         if (!data)
           return op->emitError()
@@ -2760,6 +2816,7 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         return success();
       }
 
+      fieldReaders[field].insert(currentMethod);
       Value readData = seq::ReadPortOp::create(
                             builder, loc, mem, {addr}, getConstant(true), 0)
                            .getReadData();
@@ -4036,9 +4093,38 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
 
   if (name == "kgen.struct.gep") {
     auto index = op->getAttrOfType<IntegerAttr>("index");
-    if (!index || op->getNumOperands() != 1 || op->getOperand(0) != selfPtr)
+    if (!index || op->getNumOperands() != 1)
       return op->emitError()
              << "HDL lowering: unsupported struct field access";
+    if (op->getOperand(0) != selfPtr) {
+      // `self.child.<field>`: a direct access into a child instance. Record
+      // it and bind a placeholder so lowering can finish; the diagnostic is
+      // emitted once every process (and therefore every owning domain) is
+      // known.
+      if (auto instance = instancePtrs.find(op->getOperand(0));
+          instance != instancePtrs.end()) {
+        unsigned field = instance->second;
+        bool childHasClock = false;
+        if (Operation *childOp = findBuiltModule(fieldModuleNames[field]))
+          for (hw::PortInfo port :
+               cast<hw::HWModuleOp>(childOp).getPortList())
+            if (port.dir == hw::ModulePort::Direction::Input &&
+                isa<seq::ClockType>(port.type))
+              childHasClock = true;
+        if (!childHasClock)
+          return op->emitError()
+                 << "HDL lowering: child instance '" << fieldNames[field]
+                 << "' has no directly accessible state; call a method "
+                    "instead";
+        childFieldAccesses[field].push_back(
+            {static_cast<unsigned>(index.getInt()), currentMethod});
+        values[op->getResult(0)] =
+            hw::ConstantOp::create(builder, loc, llvm::APInt(1, 0));
+        return success();
+      }
+      return op->emitError()
+             << "HDL lowering: unsupported struct field access";
+    }
     unsigned field = index.getInt();
     if (field < fieldIsInstance.size() && fieldIsInstance[field])
       instancePtrs[op->getResult(0)] = field;
@@ -4293,6 +4379,34 @@ LogicalResult CirctModuleEmitter::build() {
       outputValues.push_back(returnXz);
   }
 
+  // Report direct child-state accesses now that every process has a domain.
+  for (auto &[field, accesses] : childFieldAccesses) {
+    auto owner = instanceMethod.find(field);
+    for (const ChildFieldAccess &access : accesses) {
+      if (owner != instanceMethod.end() &&
+          owner->second != access.method)
+        return source.emitError()
+               << "HDL lowering: child instance '" << fieldNames[field]
+               << "' is ticked from process '" << methodNames[owner->second]
+               << "' (domain '" << domainName(owner->second)
+               << "') but its field " << access.member
+               << " is accessed from process '" << methodNames[access.method]
+               << "' (domain '" << domainName(access.method)
+               << "'); the access crosses clock domains";
+      if (owner == instanceMethod.end())
+        return source.emitError()
+               << "HDL lowering: child instance '" << fieldNames[field]
+               << "' is not ticked in process '" << methodNames[access.method]
+               << "'; access its state through a method instead of reading "
+               << "field " << access.member << " directly";
+      return source.emitError()
+             << "HDL lowering: child instance '" << fieldNames[field]
+             << "' is ticked from process '" << methodNames[access.method]
+             << "'; access its state through a method instead of reading "
+             << "field " << access.member << " directly";
+    }
+  }
+
   // Report cross-domain reads after every method has been seen, so method
   // order does not matter.
   for (auto &[field, readers] : fieldReaders) {
@@ -4304,7 +4418,10 @@ LogicalResult CirctModuleEmitter::build() {
         return source.emitError()
                << "HDL lowering: field '" << fieldNames[field]
                << "' is read from process '" << methodNames[reader]
-               << "' but driven from '" << methodNames[writer->second] << "'";
+               << "' (domain '" << domainName(reader)
+               << "') but driven from '" << methodNames[writer->second]
+               << "' (domain '" << domainName(writer->second)
+               << "'); the access crosses clock domains";
   }
 
   auto output = cast<hw::OutputOp>(body->getTerminator());
