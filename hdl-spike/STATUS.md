@@ -23,8 +23,8 @@ Build and test record:
 * `hdl-spike/tests/run_all.sh`: **green** in both `-c dbg` and `-c opt`
   (00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11, 12, 13, 14, 15, 16,
   17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
-  35, 36, 37, 38, 39, 40, 41, 42, 43, 44). `--emit=circt` and `--emit=sv` run
-  in-process.
+  35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45). `--emit=circt` and `--emit=sv`
+  run in-process.
 * Verilator lint: skipped (not installed).
 * CLI adaptation: the current compiler uses `-I <dir>`; the tests were updated
   from `-mojo-search-paths`.
@@ -48,6 +48,7 @@ Build and test record:
 | Typed Wire | **green (prototype)** | `designs/36_wire.mojo` | `Wire[W]` is a combinational field, not state: assignments define an SSA net and reads copy it. A module containing only wires has no clock or register (`36_wire`). |
 | Clock sources | **green (prototype)** | `designs/35_clock_source.mojo` | A no-hardware `ClockDivider[pow2]` field roots a sub-domain: the module's registers and child instances are clocked by `seq.clock_div ambient by pow2`. A child module can therefore root its own divided domain beneath the parent (`35_clock_source`). |
 | Processes/domains | **green (prototype)** | `designs/15_two_domains.mojo`, `designs/21_bad_multi_driver.mojo`, `designs/21_bad_cross_read.mojo` | The single-method restriction is removed. Each method is a process; every stateful method root gets its own `clk_<method>`/`rst_<method>` pair, its registers are clocked by that domain, and multi-method outputs default to `<method>_out`. Writing one state field from two processes, or reading a field from a process other than its driver, is a diagnostic (`21_domain_checks`). |
+| Direct array assignment | **green (prototype)** | `designs/45_direct_array.mojo` | `mem[i] = Reg[T](value)` lowers as a clocked element update. In practice the elaborator forwards the `Reg` construction into the element pointer; the pass also recognizes an explicit `Array::__setitem__` form and routes it through the same array-write helper. Dynamic and static indices work, and `T = Logic[W]` drives both the value and mask registers. |
 | Explicit RAM | **green (prototype)** | `designs/41_ram.mojo` | `Ram[T, N]` is an explicit memory helper over `Mem`. It lowers to `seq.hlmem` plus `seq.read`/`seq.write` ports, with the address truncated to `ceil(log2(N))` bits. `--emit=sv` runs a local `seq.hlmem`-to-`sv` lowering (the upstream `lib/Dialect/Seq/Transforms` rules are not built in this Bazel overlay), producing a real unpacked-array memory (`var logic [7:0] ram_0[0:3]`) with an `always_ff` write port and a combinational read. Memory contents have no reset/initialization yet; `Ram[Logic[W],N]` and nonzero read latency are rejected. |
 | Bare register arrays | **green (prototype)** | `designs/40_bare_array.mojo` | `Array[Reg[T], N]` fields are N storage slots. `mem[i].next(v)` and `mem[i].get()` lower through the same array-storage helpers as `Mem`: static indices select one slot, dynamic indices use `addr == k` enables for writes and a compare/mux tree for reads. `T = Logic[W]` creates value/mask pairs. `Mem[T, N]` is sugar over this storage; the pass no longer has a Mem-specific field kind. |
 | Memories | **green (prototype)** | `designs/25_mem.mojo`, `designs/27_mem_init.mojo`, `designs/28_async_mem.mojo`, `designs/30_mem_sequence.mojo`, `designs/31_mem_dual_read.mojo`, `designs/32_mem_two_writes.mojo`, `designs/34_mem_depth2.mojo`, `designs/38_logic_mem.mojo` | `Mem[T, N]` is a helper over `Array[Reg[T], N]`, an array of N typed registers. It lowers to N `seq.compreg.ce` entries plus a combinational read mux; a write drives entry `k` when `we && (addr == k)`, and a read selects the addressed entry. A constructor fill constant initializes every entry's reset and power-on (`Mem[Bits[8],4](5)`), a `PowerOn` marker overrides power-on (`27_mem_init`), and a variadic constructor initializes distinct entries for any depth (`Mem[Bits[8],4](1,2,3,4)`, `Mem[Bits[8],2](7,9)`) (`30`, `34`). Sync-style modules use `seq.compreg.ce`; async-style modules use `seq.firreg` with a per-entry input mux (`28_async_mem`). Multiple reads are independent muxes (`31_mem_dual_read`); multiple writes combine with a defined priority (later call wins) by muxing data and OR-ing per-entry enables (`32_mem_two_writes`). `T = Logic[W]` creates a value/mask register pair per entry: the value resets to the constructor constant, the mask resets to zero, and writes/reads drive both pairs; `designs/38_logic_mem.mojo` covers a four-entry 4-state memory. Packed arrays use `Packed[T,N]` (see the row above); making `Array[T,N]` itself an `HdlType` is a later revisit. |
@@ -56,7 +57,7 @@ Build and test record:
 
 `tests/run_all.sh` runs 00, 00b, 01, 02, 03, 04, 05, 06, 07, 08, 09, 10, 11,
 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, and 44; all pass.
+31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, and 45; all pass.
 
 **Second phase (combined CIRCT/LLVM lowering).** The compiler now builds *real*
 CIRCT ops. CIRCT is a **git submodule** at `third_party/circt` pointing at the

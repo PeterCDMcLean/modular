@@ -2019,6 +2019,41 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       return chain.back();
     };
 
+    // A direct `Array::__setitem__` writes one storage slot. In practice the
+    // elaborator often forwards a `Reg` construction into the element, but
+    // this handles the explicit setter form too.
+    if (callee.contains("Array::__setitem__")) {
+      if (op->getNumOperands() != 3)
+        return op->emitError()
+               << "HDL lowering: unexpected Array::__setitem__ form";
+      auto array = fieldPtrs.find(op->getOperand(0));
+      if (array == fieldPtrs.end() ||
+          array->second >= fieldIsArrayStorage.size() ||
+          !fieldIsArrayStorage[array->second])
+        return op->emitError()
+               << "HDL lowering: Array::__setitem__ on a non-array field";
+      unsigned field = array->second;
+      Value index = getValue(op->getOperand(1));
+      if (!index)
+        return op->emitError()
+               << "HDL lowering: array index was not lowered";
+      bool isLogic = arrayIsLogic.lookup(field);
+      if (isLogic) {
+        LogicValue value = getLogicValue(op->getOperand(2));
+        if (!value)
+          return op->emitError()
+                 << "HDL lowering: array element value was not lowered";
+        return arrayWrite(field, index, value.val, value.xz, true, Value(),
+                          condition);
+      }
+      Value value = getValue(op->getOperand(2));
+      if (!value)
+        return op->emitError()
+               << "HDL lowering: array element value was not lowered";
+      return arrayWrite(field, index, value, Value(), false, Value(),
+                        condition);
+    }
+
     // A constant-index access lowers to `__getitem_param__`; recover the
     // compile-time index and record the same element access.
     if (callee.contains("Array::__getitem_param__")) {
