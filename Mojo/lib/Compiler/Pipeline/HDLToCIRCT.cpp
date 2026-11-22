@@ -1567,9 +1567,16 @@ CirctModuleEmitter::collectLoopCarriedSlots(Block &block,
       return;
     StringRef callee = callCalleeName(op);
     if ((callee.contains("Bits::copy") || callee.contains("Bits::__init__") ||
-         callee.contains("Logic::copy") || callee.contains("Logic::__init__")) &&
+         callee.contains("Logic::copy") || callee.contains("Logic::__init__") ||
+         callee.contains("Array::copy") || callee.contains("Array::__init__") ||
+         callee.contains("Packed::copy") ||
+         callee.contains("Packed::__init__")) &&
         op->getNumOperands() >= 2)
       add(op->getOperand(op->getNumOperands() - 1));
+    else if ((callee.contains("Array::__setitem__") ||
+              callee.contains("Packed::__setitem__")) &&
+             op->getNumOperands() >= 1)
+      add(op->getOperand(0));
     else if (callee.contains("SIMD::__iadd__") && op->getNumOperands() == 2)
       add(op->getOperand(0));
   };
@@ -2658,6 +2665,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                    << "HDL lowering: Array element value was not lowered";
           LogicValue updated{insertLane(packed.val, value.val),
                              insertLane(packed.xz, value.xz)};
+          if (storeLoopCarriedLogic(self, updated, condition))
+            return success();
           if (array != fieldPtrs.end())
             return storeLogicField(array->second, updated, condition);
           values[self] = updated.val;
@@ -2670,6 +2679,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           return op->emitError()
                  << "HDL lowering: Array element operand was not lowered";
         Value updated = insertLane(packed, value);
+        if (storeLoopCarried(self, updated, condition))
+          return success();
         if (array != fieldPtrs.end())
           return storeField(array->second, updated, condition);
         values[self] = updated;
@@ -3472,6 +3483,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                    << "HDL lowering: Packed element operand was not lowered";
           LogicValue updated{insertLane(packed.val, value.val),
                              insertLane(packed.xz, value.xz)};
+          if (storeLoopCarriedLogic(self, updated, condition))
+            return success();
           values[self] = updated.val;
           logicValues[self] = updated;
           return success();
@@ -3483,6 +3496,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           return op->emitError()
                  << "HDL lowering: Packed element operand was not lowered";
         Value updated = insertLane(packed, value);
+        if (storeLoopCarried(self, updated, condition))
+          return success();
         values[self] = updated;
         return success();
       }
@@ -3494,6 +3509,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           if (!source)
             return op->emitError()
                    << "HDL lowering: Packed operand was not lowered";
+          if (storeLoopCarriedLogic(dest, source, condition))
+            return success();
           logicValues[dest] = source;
           if (dest == resultPtr)
             recordReturn(source.val, source.xz);
@@ -3502,6 +3519,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           if (!source)
             return op->emitError()
                    << "HDL lowering: Packed operand was not lowered";
+          if (storeLoopCarried(dest, source, condition))
+            return success();
           values[dest] = source;
           if (dest == resultPtr)
             recordReturn(source);
@@ -3529,6 +3548,10 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         unsigned laneWidth = getHdlWidth(elemType, &bindings);
         bool logicArray = elemType && isLogicType(elemType);
         auto writeValue = [&](Value value, Value xz) -> LogicalResult {
+          if (xz && storeLoopCarriedLogic(dest, {value, xz}, condition))
+            return success();
+          if (!xz && storeLoopCarried(dest, value, condition))
+            return success();
           if (auto field = fieldPtrs.find(dest); field != fieldPtrs.end()) {
             if (xz)
               return storeLogicField(field->second, {value, xz}, condition);
