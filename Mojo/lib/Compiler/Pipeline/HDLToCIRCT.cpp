@@ -766,6 +766,7 @@ private:
   Value getOrCreateReg(unsigned fieldIndex, Type type);
   SmallVector<Value> &getOrCreateArrayStorage(unsigned fieldIndex);
   Value getOrCreateHLMem(unsigned fieldIndex);
+  Value getOrCreateArrayRam(unsigned fieldIndex);
   Value createRegister(unsigned id, Type type, llvm::APInt resetValue,
                         llvm::APInt initialValue, int style);
 
@@ -818,7 +819,10 @@ private:
   DenseMap<unsigned, SmallVector<bool>> arrayWritten;
   DenseMap<unsigned, bool> arrayIsLogic;
   DenseMap<unsigned, bool> arrayIsExplicitRam;
+  DenseMap<unsigned, bool> arrayIsArrayRam;
   DenseMap<unsigned, Value> hlMemOps;
+  DenseMap<unsigned, Value> arrayRamRegs;
+  DenseMap<unsigned, bool> arrayRamWritten;
   DenseMap<unsigned, Value> wireValues;
   struct ArrayElementAccess {
     unsigned field;
@@ -1267,9 +1271,11 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
                     isPowerOn || isClockDivider;
     Type arrayPayload;
     unsigned arrayDepth = 0;
-    bool isRam = !isConfig && StringRef(typeName).ends_with("Ram");
-    bool isArrayStorage = isRam;
-    if (isRam) {
+    bool isArrayRam = !isConfig && StringRef(typeName).ends_with("ArrayRam");
+    bool isRam = !isConfig && !isArrayRam &&
+                 StringRef(typeName).ends_with("Ram");
+    bool isArrayStorage = isRam || isArrayRam;
+    if (isRam || isArrayRam) {
       arrayPayload = getDslTypeParam(fieldType, 0);
       if (auto depth = getDslTypeIntParam(fieldType, 1, &bindings))
         arrayDepth = depth->getZExtValue();
@@ -1334,6 +1340,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
       arrayIsLogic[fieldIsArrayStorage.size() - 1] =
           getDslTypeName(arrayPayload).contains("Logic");
       arrayIsExplicitRam[fieldIsArrayStorage.size() - 1] = isRam;
+      arrayIsArrayRam[fieldIsArrayStorage.size() - 1] = isArrayRam;
       continue;
     }
 
@@ -1482,6 +1489,30 @@ Value CirctModuleEmitter::getOrCreateHLMem(unsigned fieldIndex) {
       llvm::SmallVector<int64_t>{static_cast<int64_t>(depth)}, elementType);
   hlMemOps[fieldIndex] = memOp.getHandle();
   return memOp.getHandle();
+}
+
+Value CirctModuleEmitter::getOrCreateArrayRam(unsigned fieldIndex) {
+  auto found = arrayRamRegs.find(fieldIndex);
+  if (found != arrayRamRegs.end())
+    return found->second;
+  unsigned width = fieldArrayWidths[fieldIndex];
+  unsigned depth = fieldArrayDepths[fieldIndex];
+  auto type = IntegerType::get(builder.getContext(), width);
+  SmallVector<Value> zeros;
+  for (unsigned k = 0; k < depth; ++k)
+    zeros.push_back(hw::ConstantOp::create(builder, loc, type, 0));
+  auto arrayType = hw::ArrayType::get(type, depth);
+  ValueRange zeroInputs(zeros);
+  auto zeroArrayOp = hw::ArrayCreateOp::create(builder, loc, zeroInputs);
+  Value zeroArray = zeroArrayOp.getResult();
+  auto name = StringAttr::get(
+      builder.getContext(), "array_ram_" + std::to_string(fieldIndex));
+  auto reg = seq::FirRegOp::create(builder, loc, zeroArray, clk, name,
+                                   hw::InnerSymAttr(), Attribute{});
+  Value value = reg.getResult();
+  reg->setOperand(0, value);
+  arrayRamRegs[fieldIndex] = value;
+  return value;
 }
 
 Operation *CirctModuleEmitter::findBuiltModule(StringRef name) {
@@ -2190,6 +2221,76 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         return op->emitError()
                << "HDL lowering: array index was not lowered";
       arrayElements[op->getResult(0)] = {array->second, index};
+      return success();
+    }
+
+    // `ArrayRam[T, N]` lowers to one array-typed register plus
+    // `hw.array_get`/`hw.array_inject` and a write-enable mux. This is the
+    // form CIRCT's `seq-reg-of-vec-to-mem` recognizes.
+    if (callee.contains("ArrayRam::write") || callee.contains("ArrayRam::read")) {
+      if (op->getNumOperands() < 3)
+        return op->emitError() << "HDL lowering: malformed ArrayRam access";
+      auto array = fieldPtrs.find(op->getOperand(0));
+      if (array == fieldPtrs.end() ||
+          array->second >= fieldIsArrayStorage.size() ||
+          !arrayIsArrayRam.lookup(array->second))
+        return op->emitError()
+               << "HDL lowering: ArrayRam access on a non-ArrayRam field";
+      unsigned field = array->second;
+      if (arrayIsLogic.lookup(field))
+        return op->emitError()
+               << "HDL lowering: ArrayRam[Logic[W], N] is not supported yet";
+      Value index = getValue(op->getOperand(1));
+      if (!index)
+        return op->emitError() << "HDL lowering: ArrayRam index was not lowered";
+      unsigned depth = fieldArrayDepths[field];
+      unsigned indexWidth = 1;
+      while (indexWidth < 64 && (uint64_t(1) << indexWidth) < depth)
+        ++indexWidth;
+      Value arrayIndex = index;
+      unsigned valueWidth = index.getType().getIntOrFloatBitWidth();
+      if (valueWidth > indexWidth) {
+        arrayIndex = comb::ExtractOp::create(builder, loc, index, 0,
+                                             indexWidth);
+      } else if (valueWidth < indexWidth) {
+        Value zeros = hw::ConstantOp::create(
+            builder, loc, llvm::APInt(indexWidth - valueWidth, 0));
+        arrayIndex = comb::ConcatOp::create(
+            builder, loc, ArrayRef<Value>{zeros, arrayIndex});
+      }
+      Value reg = getOrCreateArrayRam(field);
+      unsigned width = fieldArrayWidths[field];
+      auto elementType = IntegerType::get(builder.getContext(), width);
+      auto arrayType = hw::ArrayType::get(elementType, depth);
+
+      if (callee.contains("ArrayRam::write")) {
+        if (arrayRamWritten.lookup(field))
+          return op->emitError()
+                 << "HDL lowering: multiple ArrayRam writes are not supported";
+        Value data = getValue(op->getOperand(2));
+        if (!data)
+          return op->emitError()
+                 << "HDL lowering: ArrayRam write data was not lowered";
+        Value enable = getConstant(true);
+        if (op->getNumOperands() > 3) {
+          enable = getValue(op->getOperand(3));
+          if (!enable)
+            return op->emitError()
+                   << "HDL lowering: ArrayRam write enable was not lowered";
+        }
+        Value injected = hw::ArrayInjectOp::create(
+            builder, loc, reg, arrayIndex, data);
+        Value next = comb::MuxOp::create(builder, loc, enable, injected, reg);
+        reg.getDefiningOp()->setOperand(0, next);
+        arrayRamWritten[field] = true;
+        return success();
+      }
+
+      Value readData = hw::ArrayGetOp::create(builder, loc, reg, arrayIndex);
+      Value dest = op->getOperand(2);
+      values[dest] = readData;
+      if (dest == resultPtr)
+        returnValue = readData;
       return success();
     }
 
@@ -3624,6 +3725,86 @@ std::unique_ptr<Pass> createHDLToCIRCTPass(const HDLEmitOptions &options) {
 
 std::unique_ptr<Pass> createHDLSeqToSVPass() {
   return circt::createLowerSeqToSVPass();
+}
+
+LogicalResult lowerHDLArrayRegToSV(ModuleOp module) {
+  module.getContext()->getOrLoadDialect<sv::SVDialect>();
+  SmallVector<seq::FirRegOp> regs;
+  module.walk([&](seq::FirRegOp reg) {
+    if (isa<hw::ArrayType>(reg.getType()))
+      regs.push_back(reg);
+  });
+
+  for (seq::FirRegOp reg : regs) {
+    auto arrayType = cast<hw::ArrayType>(reg.getType());
+    hw::ArrayInjectOp inject;
+    hw::ArrayGetOp get;
+    comb::MuxOp mux;
+    bool valid = true;
+    for (Operation *user : reg.getResult().getUsers()) {
+      if (auto op = dyn_cast<hw::ArrayInjectOp>(user)) {
+        if (inject) { valid = false; break; }
+        inject = op;
+      } else if (auto op = dyn_cast<hw::ArrayGetOp>(user)) {
+        if (get) { valid = false; break; }
+        get = op;
+      } else if (auto op = dyn_cast<comb::MuxOp>(user)) {
+        if (mux) { valid = false; break; }
+        mux = op;
+      } else {
+        valid = false;
+        break;
+      }
+    }
+    if (!valid || !inject || !get || !mux)
+      continue;
+    if (mux.getTrueValue() != inject.getResult() ||
+        mux.getFalseValue() != reg.getResult())
+      continue;
+
+    IRRewriter rewriter(module.getContext());
+    rewriter.setInsertionPoint(reg);
+    auto memType = hw::UnpackedArrayType::get(arrayType.getElementType(),
+                                              arrayType.getNumElements());
+    Value svMem =
+        sv::VarOp::create(rewriter, reg.getLoc(), memType,
+                          rewriter.getStringAttr(reg.getName()))
+            .getResult();
+    Value hwClk = seq::FromClockOp::create(rewriter, reg.getLoc(),
+                                           reg.getClk());
+    sv::AlwaysFFOp::create(
+        rewriter, reg.getLoc(), sv::EventControl::AtPosEdge, hwClk, [&] {
+          sv::IfOp::create(rewriter, reg.getLoc(), mux.getCond(), [&] {
+            Value memLoc = sv::ArrayIndexInOutOp::create(
+                rewriter, reg.getLoc(), svMem, inject.getIndex());
+            sv::PAssignOp::create(rewriter, reg.getLoc(), memLoc,
+                                  inject.getElement());
+          });
+        });
+
+    rewriter.setInsertionPointAfter(get);
+    Value memLoc = sv::ArrayIndexInOutOp::create(
+        rewriter, get.getLoc(), svMem, get.getIndex());
+    Value readData =
+        sv::ReadInOutOp::create(rewriter, get.getLoc(), memLoc);
+    get.getResult().replaceAllUsesWith(readData);
+    rewriter.eraseOp(get);
+    // The mux result feeds the register next operand; collapse that use
+    // before erasing the write cone.
+    mux.getResult().replaceAllUsesWith(reg.getResult());
+    rewriter.eraseOp(mux);
+    rewriter.eraseOp(inject);
+    SmallVector<Value> zeros;
+    for (unsigned k = 0; k < arrayType.getNumElements(); ++k)
+      zeros.push_back(hw::ConstantOp::create(
+          rewriter, reg.getLoc(), arrayType.getElementType(), 0));
+    ValueRange zeroInputs(zeros);
+    auto zeroArray =
+        hw::ArrayCreateOp::create(rewriter, reg.getLoc(), zeroInputs);
+    reg->setOperand(0, zeroArray.getResult());
+    rewriter.eraseOp(reg);
+  }
+  return success();
 }
 
 LogicalResult lowerHDLHLMemToSV(ModuleOp module) {

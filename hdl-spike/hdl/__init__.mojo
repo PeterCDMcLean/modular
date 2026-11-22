@@ -9,6 +9,8 @@ comptime Sig[T: AnyType] = T
 from .bits import Bits, mux
 from .logic import Logic, XMode, bit, logic, mux_logic
 from .mem import Mem
+from .array_ram import ArrayRam
+from .sim import SimState, commit_state
 from .packed import Packed
 from .ram import Ram
 from .wire import Wire

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Native Sim cycle history for delayed next and past.
+# Native Sim domain commit: process tree first, then commit_state.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -26,12 +26,9 @@ fi
 
 "$MOJO" run "${inc[@]}" "$root/hdl-spike/tests/12_sim_delay.mojo" \
     > "$out/12_sim_delay.txt"
-grep -q '^t0 0 0$' "$out/12_sim_delay.txt"
-grep -q '^t1 1 0 0$' "$out/12_sim_delay.txt"
-grep -q '^t2 1 1 0$' "$out/12_sim_delay.txt"
-grep -q '^t3 3 1 1 0$' "$out/12_sim_delay.txt"
-grep -q '^e0 0$' "$out/12_sim_delay.txt"
-grep -q '^e1 0$' "$out/12_sim_delay.txt"
-grep -q '^e2 9 0 0$' "$out/12_sim_delay.txt"
+grep -q '^s0 0$' "$out/12_sim_delay.txt"
+grep -q '^s1 0$' "$out/12_sim_delay.txt"
+grep -q '^s2 1 2 1 0$' "$out/12_sim_delay.txt"
+grep -q '^s3 2 3 2 1$' "$out/12_sim_delay.txt"
 
 echo "47_sim_delay: ok"

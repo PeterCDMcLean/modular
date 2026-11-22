@@ -17,13 +17,14 @@ reads the value `n` cycles ago. Native simulation advances cycles with
 from std.collections import Array
 
 from .hdl_type import HdlType
+from .sim import SimState
 
 
 struct Reg[
     T: HdlType & Deinitable & Defaultable,
     style: Int = 0,
     max_delay: Int = 8,
-](Copyable, Defaultable, Movable):
+](Copyable, Defaultable, Movable, SimState):
     """A typed register over `T` with native cycle history."""
 
     var inner: Self.T
@@ -106,8 +107,8 @@ struct Reg[
             index = Self.max_delay - 1
         return self.history[index].copy()
 
-    def tick(mut self):
-        """Advances one native-simulation cycle."""
+    def commit(mut self):
+        """Commits one native-simulation cycle."""
         for i in range(1, Self.max_delay):
             self.history[Self.max_delay - i] = self.history[
                 Self.max_delay - i - 1

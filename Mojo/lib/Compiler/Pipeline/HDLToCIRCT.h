@@ -79,6 +79,9 @@ std::unique_ptr<mlir::Pass> createHDLToCIRCTPass(const HDLEmitOptions &options);
 /// normal (non-nested) pass after the HDL lowering.
 std::unique_ptr<mlir::Pass> createHDLSeqToSVPass();
 
+/// Lower the array-register memory form to explicit `sv` memory ops.
+mlir::LogicalResult lowerHDLArrayRegToSV(mlir::ModuleOp module);
+
 /// Lower the `seq.hlmem` memory form to explicit `sv` memory ops.
 mlir::LogicalResult lowerHDLHLMemToSV(mlir::ModuleOp module);
 

@@ -1,4 +1,4 @@
-from hdl import Bits, Reg
+from hdl import Bits, Reg, commit_state
 
 
 struct SimDelay:
@@ -7,33 +7,31 @@ struct SimDelay:
     def __init__(out self):
         self.d = Reg[Bits[8]]()
 
-    def tick(mut self):
-        self.d.tick()
+    def process(mut self, din: Bits[8]) -> Bits[8]:
+        self.d.next(2) <= din
+        return self.d.get()
+
+    def step(mut self, din: Bits[8]) -> Bits[8]:
+        var y = self.process(din)
+        commit_state(self)
+        return y.copy()
 
 
 def main():
     var sim = SimDelay()
-    sim.d.next(1) <= Bits[8](1)
-    sim.d.next(3) <= Bits[8](3)
-
-    print("t0", sim.d.get().to_int(), sim.d.past(1).to_int())
-    sim.tick()
-    print("t1", sim.d.get().to_int(), sim.d.past(1).to_int(), sim.d.past(2).to_int())
-    sim.tick()
-    print("t2", sim.d.get().to_int(), sim.d.past(1).to_int(), sim.d.past(2).to_int())
-    sim.tick()
+    print("s0", sim.step(Bits[8](1)).to_int())
+    print("s1", sim.step(Bits[8](2)).to_int())
     print(
-        "t3",
+        "s2",
+        sim.step(Bits[8](3)).to_int(),
         sim.d.get().to_int(),
         sim.d.past(1).to_int(),
         sim.d.past(2).to_int(),
-        sim.d.past(3).to_int(),
     )
-
-    var e = Reg[Bits[8]]()
-    e.next(2) <= Bits[8](9)
-    print("e0", e.get().to_int())
-    e.tick()
-    print("e1", e.get().to_int())
-    e.tick()
-    print("e2", e.get().to_int(), e.past(1).to_int(), e.past(2).to_int())
+    print(
+        "s3",
+        sim.step(Bits[8](4)).to_int(),
+        sim.d.get().to_int(),
+        sim.d.past(1).to_int(),
+        sim.d.past(2).to_int(),
+    )

@@ -15,10 +15,11 @@ from std.collections import Array
 
 from .hdl_type import HdlType
 from .reg import Reg
+from .sim import SimState
 
 
 struct Mem[T: HdlType & Deinitable & Defaultable, N: Int = 4](
-    Copyable, Defaultable, Movable
+    Copyable, Defaultable, Movable, SimState
 ):
     """A synchronous-write, combinational-read memory over `Array[Reg[T], N]`."""
 
@@ -59,9 +60,16 @@ struct Mem[T: HdlType & Deinitable & Defaultable, N: Int = 4](
         if enable:
             var element = self.data[index].copy()
             element.next(1) <= value
-            element.tick()
+            element.commit()
             self.data[index] = element^
 
     def read(self, index: Int) -> Self.T:
         """Reads the current value at `index`."""
         return self.data[index].get()
+
+    def commit(mut self):
+        """Commits every entry once."""
+        for i in range(Self.N):
+            var element = self.data[i].copy()
+            element.commit()
+            self.data[i] = element^

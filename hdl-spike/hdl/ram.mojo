@@ -8,10 +8,11 @@ to a real memory array. It is sugar over `Mem`, which is itself sugar over
 
 from .hdl_type import HdlType
 from .mem import Mem
+from .sim import SimState
 
 
 struct Ram[T: HdlType & Deinitable & Defaultable, N: Int = 4](
-    Copyable, Defaultable, Movable
+    Copyable, Defaultable, Movable, SimState
 ):
     """A synchronous memory that lowers through `seq.hlmem`."""
 
@@ -47,3 +48,7 @@ struct Ram[T: HdlType & Deinitable & Defaultable, N: Int = 4](
     def read(self, index: Int) -> Self.T:
         """Reads the current value at `index`."""
         return self.mem.read(index)
+
+    def commit(mut self):
+        """Commits the memory state."""
+        self.mem.commit()
