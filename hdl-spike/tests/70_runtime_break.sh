@@ -33,11 +33,11 @@ diff -u "$root/hdl-spike/expected/70_runtime_break.mlir" \
 [ "$(grep -c 'hw.module' "$out/70_runtime_break.mlir")" = "2" ]
 # The break is `active & stop`, and it forces the done pulse.
 [ "$(grep -c 'comb.and %7, %stop : i1' "$out/70_runtime_break.mlir")" = "4" ]
-[ "$(grep -c 'comb.or %15, %13 : i1' "$out/70_runtime_break.mlir")" = "2" ]
+[ "$(grep -c 'comb.or %16, %14 : i1' "$out/70_runtime_break.mlir")" = "2" ]
 # On a break the counter holds at the bound so the next cycle is idle.
-[ "$(grep -c 'comb.mux %13, %count, %12 : i64' "$out/70_runtime_break.mlir")" = "2" ]
-[ "$(grep -c 'seq.compreg %16, %clk reset %rst' "$out/70_runtime_break.mlir")" = "2" ]
-[ "$(grep -c 'seq.compreg.ce sym @reg_0 %5, %clk, %20' \
+[ "$(grep -c 'comb.mux %14, %count, %13 : i64' "$out/70_runtime_break.mlir")" = "2" ]
+[ "$(grep -c 'seq.compreg %17, %clk reset %rst' "$out/70_runtime_break.mlir")" = "2" ]
+[ "$(grep -c 'seq.compreg.ce sym @reg_0 %5, %clk, %21' \
     "$out/70_runtime_break.mlir")" = "2" ]
 
 "$MOJO" build --emit=sv -o "$out/70_runtime_break.raw.sv" "${inc[@]}" "$design"

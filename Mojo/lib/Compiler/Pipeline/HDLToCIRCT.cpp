@@ -878,7 +878,10 @@ private:
   Value childLoopLast;
   bool childLoopRan = false;
   // A runtime `break` inside a conditional becomes a loop-exit condition.
+  // `loopRelativeCondition` is the AND of enclosing if conditions inside the
+  // current loop, excluding the loop's own active condition.
   Value dynamicBreakCond;
+  Value loopRelativeCondition;
   // True while emitting a runtime loop that is followed by another runtime
   // loop in the same block. Its carried state is kept for the next loop.
   bool loopFollowedByLoop = false;
@@ -2262,7 +2265,19 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     Region &thenRegion = op->getRegion(0);
     Region &elseRegion = op->getRegion(1);
 
+    Value savedRelative = loopRelativeCondition;
+    Value thenRelative;
+    Value elseRelative;
     if (inDynamicLoop) {
+      thenRelative = savedRelative
+                         ? comb::AndOp::create(builder, loc, savedRelative, cond)
+                         : cond;
+      Value notCondRelative = bitNot(cond);
+      elseRelative =
+          savedRelative
+              ? comb::AndOp::create(builder, loc, savedRelative,
+                                    notCondRelative)
+              : notCondRelative;
       auto regionHasBreak = [](Region &region) {
         if (region.empty())
           return false;
@@ -2271,13 +2286,18 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
             return true;
         return false;
       };
-      if (regionHasBreak(thenRegion) || regionHasBreak(elseRegion)) {
-        Value exitCond = cond ? cond : getConstant(true);
+      if (regionHasBreak(thenRegion))
         dynamicBreakCond =
             dynamicBreakCond
-                ? comb::OrOp::create(builder, loc, dynamicBreakCond, exitCond)
-                : exitCond;
-      }
+                ? comb::OrOp::create(builder, loc, dynamicBreakCond,
+                                     thenRelative)
+                : thenRelative;
+      if (regionHasBreak(elseRegion))
+        dynamicBreakCond =
+            dynamicBreakCond
+                ? comb::OrOp::create(builder, loc, dynamicBreakCond,
+                                     elseRelative)
+                : elseRelative;
     }
 
     // A constant condition in an unrolled loop selects one region directly.
@@ -2299,8 +2319,11 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       Value thenCond =
           condition ? comb::AndOp::create(builder, loc, condition, cond) : cond;
       branchPath.push_back({cond, true});
+      if (inDynamicLoop)
+        loopRelativeCondition = thenRelative;
       LogicalResult result = emitBlock(thenRegion.front(), thenCond, returnValue);
       branchPath.pop_back();
+      loopRelativeCondition = savedRelative;
       if (failed(result))
         return failure();
     }
@@ -2310,8 +2333,11 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                            ? comb::AndOp::create(builder, loc, condition, notCond)
                            : notCond;
       branchPath.push_back({cond, false});
+      if (inDynamicLoop)
+        loopRelativeCondition = elseRelative;
       LogicalResult result = emitBlock(elseRegion.front(), elseCond, returnValue);
       branchPath.pop_back();
+      loopRelativeCondition = savedRelative;
       if (failed(result))
         return failure();
     }
@@ -4589,6 +4615,8 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
   childLoopRan = false;
   childLoopLast = Value();
   dynamicBreakCond = Value();
+  Value savedRelative = loopRelativeCondition;
+  loopRelativeCondition = Value();
   bool sequenced = condition && condition == currentStartPulse;
   Value started;
   if (sequenced) {
@@ -4704,6 +4732,7 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
   inDynamicLoop = false;
   dynamicLoopSlot = Value();
   dynamicLoopOuterSlots.clear();
+  loopRelativeCondition = savedRelative;
   if (!sawIf)
     return loop->emitError()
            << "HDL lowering: runtime loop has no condition";
@@ -4945,6 +4974,8 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
   childLoopRan = false;
   childLoopLast = Value();
   dynamicBreakCond = Value();
+  Value savedRelative = loopRelativeCondition;
+  loopRelativeCondition = Value();
   bool sequenced = condition && condition == currentStartPulse;
   Value started;
   if (sequenced) {
@@ -5044,6 +5075,7 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
   inDynamicLoop = false;
   dynamicLoopSlot = Value();
   dynamicLoopOuterSlots.clear();
+  loopRelativeCondition = savedRelative;
   if (running) {
     for (auto &[carriedSlot, reg] : loopCarriedRegs) {
       Value bodyNext = loopCarriedNext[carriedSlot];
@@ -5279,9 +5311,11 @@ LogicalResult CirctModuleEmitter::emitNestedRangeLoop(
   Value active = comb::AndOp::create(builder, loc, run, innerActive);
 
   Value savedBreakCond = dynamicBreakCond;
+  Value savedRelative = loopRelativeCondition;
   childLoopRan = false;
   childLoopLast = Value();
   dynamicBreakCond = Value();
+  loopRelativeCondition = Value();
   SmallVector<Operation *> skipOps{nextOp, loopIf};
   if (indLoad)
     skipOps.push_back(indLoad);
@@ -5300,6 +5334,7 @@ LogicalResult CirctModuleEmitter::emitNestedRangeLoop(
 
   Value innerBreak = dynamicBreakCond;
   dynamicBreakCond = savedBreakCond;
+  loopRelativeCondition = savedRelative;
   Value breakNow =
       innerBreak
           ? comb::AndOp::create(builder, loc, active, innerBreak)
