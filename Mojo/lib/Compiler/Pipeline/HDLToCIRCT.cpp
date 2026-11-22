@@ -852,6 +852,9 @@ private:
   SmallVector<Value> stackSlots;
   SmallVector<Value> dynamicLoopOuterSlots;
   bool isLoopCarriedSlot(Value value) const;
+  // One-cycle pulse after a runtime loop completes. Subsequent ops in the
+  // same block are gated by it, so post-loop code runs once per traversal.
+  Value pendingLoopDone;
 
   // Direct `self.child.<field>` accesses, diagnosed after every process has
   // been seen so the owning domain is known regardless of method order.
@@ -4288,6 +4291,15 @@ LogicalResult CirctModuleEmitter::emitBlock(Block &block, Value condition,
       break;
     if (failed(emitOp(&op, condition, returnValue)))
       return failure();
+    // A completed runtime loop yields a one-cycle pulse. Ops after it in the
+    // same block only take effect on that pulse.
+    if (pendingLoopDone) {
+      condition = condition
+                      ? comb::AndOp::create(builder, loc, condition,
+                                            pendingLoopDone)
+                      : pendingLoopDone;
+      pendingLoopDone = Value();
+    }
   }
   return success();
 }
@@ -4458,6 +4470,34 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
     reg->setOperand(0, next);
   else
     return loop->emitError() << "HDL lowering: unsupported loop counter form";
+
+  // One-cycle done pulse: the clock edge after the final iteration.
+  Value boundValue = getValue(bound);
+  if (!boundValue)
+    return loop->emitError() << "HDL lowering: loop bound was not lowered";
+  unsigned boundWidth = boundValue.getType().getIntOrFloatBitWidth();
+  if (boundWidth > width)
+    boundValue = comb::ExtractOp::create(builder, loc, boundValue, 0, width);
+  else if (boundWidth < width) {
+    Value zeros = hw::ConstantOp::create(
+        builder, loc, llvm::APInt(width - boundWidth, 0));
+    boundValue = comb::ConcatOp::create(
+        builder, loc, ArrayRef<Value>{zeros, boundValue});
+  }
+  Value atEnd = comb::ICmpOp::create(
+      builder, loc, comb::ICmpPredicate::eq, incremented, boundValue);
+  Value last = comb::AndOp::create(builder, loc, active, atEnd);
+  auto i1Type = builder.getI1Type();
+  llvm::APInt oneBit(1, 1);
+  llvm::APInt zeroBit(1, 0);
+  Value done = createRegister(loopRegisterId++, i1Type, zeroBit, zeroBit,
+                              resetStyle);
+  if (auto reg = done.getDefiningOp<seq::CompRegOp>())
+    reg->setOperand(0, last);
+  else if (auto reg = done.getDefiningOp<seq::FirRegOp>())
+    reg->setOperand(0, last);
+  if (loopStack.empty() && branchPath.empty())
+    pendingLoopDone = done;
   return success();
 }
 
@@ -4589,6 +4629,20 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
     reg->setOperand(0, next);
   else
     return loop->emitError() << "HDL lowering: unsupported loop counter form";
+
+  Value atEnd = comb::ICmpOp::create(
+      builder, loc, comb::ICmpPredicate::eq, incremented, boundValue);
+  Value last = comb::AndOp::create(builder, loc, active, atEnd);
+  auto i1Type = builder.getI1Type();
+  llvm::APInt zeroBit(1, 0);
+  Value done = createRegister(loopRegisterId++, i1Type, zeroBit, zeroBit,
+                              resetStyle);
+  if (auto reg = done.getDefiningOp<seq::CompRegOp>())
+    reg->setOperand(0, last);
+  else if (auto reg = done.getDefiningOp<seq::FirRegOp>())
+    reg->setOperand(0, last);
+  if (loopStack.empty() && branchPath.empty())
+    pendingLoopDone = done;
   return success();
 }
 
@@ -4708,6 +4762,7 @@ LogicalResult CirctModuleEmitter::build() {
 
     Value returnValue;
     returnSites.clear();
+    pendingLoopDone = Value();
     if (failed(emitOps(methods[m], returnValue)))
       return failure();
     // Fold branch returns into one value. Later returns are fallbacks for

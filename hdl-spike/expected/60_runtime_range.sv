@@ -58,6 +58,14 @@ module RuntimeForFill(
     else if (_GEN_5)
       reg_1 <= wd;
   end
-  assign _GEN = _GEN_5 ? _GEN_4 + 64'h1 : 64'h0;
+  wire      [63:0] _GEN_6 = _GEN_4 + 64'h1;
+  assign _GEN = _GEN_5 ? _GEN_6 : 64'h0;
+  var logic        _GEN_7 = 1'h0;
+  always @(posedge clk) begin
+    if (rst)
+      _GEN_7 <= 1'h0;
+    else
+      _GEN_7 <= _GEN_5 & _GEN_6 == count;
+  end
   assign out = reg_1;
 endmodule

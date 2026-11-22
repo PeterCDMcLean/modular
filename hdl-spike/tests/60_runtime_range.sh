@@ -46,6 +46,8 @@ fi
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' \
     "$out/60_runtime_range.raw.sv" | grep -v '^$' \
     > "$out/60_runtime_range.sv"
+grep -q 'assign _GEN = _GEN_5 ? _GEN_6 : 64.h0;' \
+    "$out/60_runtime_range.sv"
 diff -u "$root/hdl-spike/expected/60_runtime_range.sv" \
     "$out/60_runtime_range.sv"
 
@@ -53,7 +55,7 @@ grep -q 'wire             _GEN_5 = _GEN_4 < count;' \
     "$out/60_runtime_range.sv"
 grep -q 'assign _GEN_3 = _GEN_5 & en & _GEN_4 == 64.h0;' \
     "$out/60_runtime_range.sv"
-grep -q 'assign _GEN = _GEN_5 ? _GEN_4 + 64.h1 : 64.h0;' \
+grep -q 'wire      \[63:0\] _GEN_6 = _GEN_4 + 64.h1;' \
     "$out/60_runtime_range.sv"
 [ "$(grep -c 'var logic \[7:0\]  mem_0_' "$out/60_runtime_range.sv")" = "4" ]
 

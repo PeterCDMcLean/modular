@@ -43,6 +43,8 @@ grep -q 'seq.compreg.ce sym @reg_1 %wd, %clk, %2' \
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' \
     "$out/59_runtime_loop.raw.sv" | grep -v '^$' \
     > "$out/59_runtime_loop.sv"
+grep -q 'assign _GEN = _GEN_5 ? _GEN_6 : 64.h0;' \
+    "$out/59_runtime_loop.sv"
 diff -u "$root/hdl-spike/expected/59_runtime_loop.sv" \
     "$out/59_runtime_loop.sv"
 
@@ -50,7 +52,7 @@ grep -q 'wire             _GEN_5 = _GEN_4 < count;' \
     "$out/59_runtime_loop.sv"
 grep -q 'assign _GEN_3 = _GEN_5 & en & _GEN_4 == 64.h0;' \
     "$out/59_runtime_loop.sv"
-grep -q 'assign _GEN = _GEN_5 ? _GEN_4 + 64.h1 : 64.h0;' \
+grep -q 'wire      \[63:0\] _GEN_6 = _GEN_4 + 64.h1;' \
     "$out/59_runtime_loop.sv"
 grep -q 'else if (_GEN_5)' "$out/59_runtime_loop.sv"
 # The body is emitted once, not unrolled.
