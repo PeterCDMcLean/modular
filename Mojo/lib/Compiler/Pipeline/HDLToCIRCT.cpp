@@ -855,6 +855,21 @@ private:
   SmallVector<Value> stackSlots;
   SmallVector<Value> dynamicLoopOuterSlots;
   bool isLoopCarriedSlot(Value value) const;
+
+  // Plain Mojo struct locals are memory-only. Each field GEP becomes a
+  // synthetic carried slot so the loop/register machinery can treat fields
+  // like scalar locals. Aliases canonicalize repeated GEPs to one slot.
+  struct StructFieldInit {
+    Value val;
+    Value xz;
+  };
+  DenseMap<Value, SmallVector<std::pair<unsigned, Value>>> structFieldsByBase;
+  DenseMap<Value, Value> structFieldAliases;
+  DenseMap<Value, SmallVector<std::pair<unsigned, StructFieldInit>>>
+      structFieldInits;
+  Value getStructFieldSlot(Operation *gep, Value base, unsigned index);
+  Value resolveStructField(Value value) const;
+  LogicalResult emitStructConstructor(Operation *op, StringRef callee);
   // One-cycle pulse after a runtime loop completes. Subsequent ops in the
   // same block are gated by it, so post-loop code runs once per traversal.
   Value pendingLoopDone;
@@ -1595,10 +1610,25 @@ CirctModuleEmitter::collectLoopCarriedSlots(Block &block,
     if (!llvm::is_contained(result, value))
       result.push_back(value);
   };
+  auto addPointer = [&](Value value) {
+    if (Operation *defining = value.getDefiningOp();
+        defining && defining->getName().getStringRef() == "kgen.struct.gep" &&
+        defining->getNumOperands() == 1) {
+      Value base = defining->getOperand(0);
+      if (base != selfPtr && llvm::is_contained(stackSlots, base))
+        if (auto index = defining->getAttrOfType<IntegerAttr>("index")) {
+          Value slot = getStructFieldSlot(defining, base, index.getInt());
+          structFieldAliases[value] = slot;
+          add(slot);
+          return;
+        }
+    }
+    add(value);
+  };
   auto scan = [&](Operation *op) {
     StringRef name = op->getName().getStringRef();
     if (name == "pop.store" && op->getNumOperands() == 2) {
-      add(op->getOperand(1));
+      addPointer(op->getOperand(1));
       return;
     }
     if (name != "kgen.call")
@@ -1610,7 +1640,7 @@ CirctModuleEmitter::collectLoopCarriedSlots(Block &block,
          callee.contains("Packed::copy") ||
          callee.contains("Packed::__init__")) &&
         op->getNumOperands() >= 2)
-      add(op->getOperand(op->getNumOperands() - 1));
+      addPointer(op->getOperand(op->getNumOperands() - 1));
     else if ((callee.contains("Array::__setitem__") ||
               callee.contains("Packed::__setitem__")) &&
              op->getNumOperands() >= 1)
@@ -1655,6 +1685,138 @@ bool CirctModuleEmitter::isLoopCarriedSlot(Value value) const {
   if (!inDynamicLoop || value == dynamicLoopSlot)
     return false;
   return llvm::is_contained(dynamicLoopOuterSlots, value);
+}
+
+Value CirctModuleEmitter::resolveStructField(Value value) const {
+  auto it = structFieldAliases.find(value);
+  return it != structFieldAliases.end() ? it->second : value;
+}
+
+Value CirctModuleEmitter::getStructFieldSlot(Operation *gep, Value base,
+                                             unsigned index) {
+  auto &fields = structFieldsByBase[base];
+  for (auto &[fieldIndex, slot] : fields)
+    if (fieldIndex == index)
+      return slot;
+  // The GEP pointer is only a map key: it is never emitted, so it is safe to
+  // reuse a source-region value as the canonical slot.
+  Value slot = gep->getResult(0);
+  fields.push_back({index, slot});
+  stackSlots.push_back(slot);
+  if (auto inits = structFieldInits.find(base);
+      inits != structFieldInits.end())
+    for (auto &[initIndex, init] : inits->second)
+      if (initIndex == index) {
+        values[slot] = init.val;
+        if (init.xz)
+          logicValues[slot] = {init.val, init.xz};
+        break;
+      }
+  return slot;
+}
+
+LogicalResult CirctModuleEmitter::emitStructConstructor(Operation *op,
+                                                        StringRef callee) {
+  Operation *calleeOp = nullptr;
+  for (Operation &candidate : source.getBody()->getOperations()) {
+    auto symbol =
+        candidate.getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName());
+    if (symbol && symbol.getValue() == callee) {
+      calleeOp = &candidate;
+      break;
+    }
+  }
+  if (!calleeOp)
+    return op->emitError()
+           << "HDL lowering: struct constructor '" << callee
+           << "' was not found";
+  auto func = dyn_cast<FunctionOpInterface>(calleeOp);
+  if (!func || func.getFunctionBody().empty())
+    return op->emitError()
+           << "HDL lowering: struct constructor has no body";
+  Block &body = func.getFunctionBody().front();
+  if (body.getNumArguments() < 1)
+    return op->emitError()
+           << "HDL lowering: struct constructor has no self argument";
+  Value self;
+  DenseMap<Value, unsigned> fieldOf;
+  for (Operation &o : body.getOperations()) {
+    if (o.getName().getStringRef() != "kgen.struct.gep" ||
+        o.getNumOperands() != 1)
+      continue;
+    Value base = o.getOperand(0);
+    bool isArgument = false;
+    for (BlockArgument argument : body.getArguments())
+      if (argument == base)
+        isArgument = true;
+    if (!isArgument)
+      continue;
+    auto index = o.getAttrOfType<IntegerAttr>("index");
+    if (!index)
+      continue;
+    self = base;
+    fieldOf[o.getResult(0)] = index.getInt();
+  }
+  if (!self)
+    return op->emitError()
+           << "HDL lowering: struct constructor has no field stores";
+  SmallVector<std::pair<unsigned, Value>> inits;
+  for (Operation &o : body.getOperations()) {
+    StringRef name = o.getName().getStringRef();
+    if (name == "pop.store" && o.getNumOperands() == 2) {
+      auto field = fieldOf.find(o.getOperand(1));
+      if (field != fieldOf.end())
+        inits.push_back({field->second, o.getOperand(0)});
+      continue;
+    }
+    if (name != "kgen.call" || o.getNumOperands() < 2)
+      continue;
+    StringRef inner = callCalleeName(&o);
+    if (!inner.contains("::copy") && !inner.contains("::__init__"))
+      continue;
+    auto field = fieldOf.find(o.getOperand(o.getNumOperands() - 1));
+    if (field == fieldOf.end())
+      continue;
+    inits.push_back({field->second, o.getOperand(0)});
+  }
+  if (inits.empty())
+    return op->emitError()
+           << "HDL lowering: struct constructor has no simple field "
+              "initializers";
+  Value dest = op->getOperand(op->getNumOperands() - 1);
+  for (auto &[field, source] : inits) {
+    Value value;
+    Value xz;
+    unsigned argumentIndex = ~0u;
+    for (unsigned i = 0; i < body.getNumArguments(); ++i)
+      if (source == body.getArgument(i)) {
+        argumentIndex = i;
+        break;
+      }
+    if (argumentIndex != ~0u) {
+      if (argumentIndex >= op->getNumOperands() - 1)
+        return op->emitError()
+               << "HDL lowering: struct constructor argument was not "
+                  "lowered";
+      Value argument = op->getOperand(argumentIndex);
+      if (auto logic = getLogicValue(argument)) {
+        value = logic.val;
+        xz = logic.xz;
+      } else {
+        value = getValue(argument);
+      }
+    } else if (Operation *defining = source.getDefiningOp()) {
+      if (auto constant = getConstantInt(defining, &bindings))
+        value = hw::ConstantOp::create(builder, loc, *constant);
+    }
+    if (!value)
+      return op->emitError()
+             << "HDL lowering: struct constructor field value was not "
+                "lowered";
+    structFieldInits[dest].push_back(
+        {field, StructFieldInit{value, xz}});
+  }
+  return success();
 }
 
 std::string CirctModuleEmitter::domainName(unsigned method) const {
@@ -1905,6 +2067,7 @@ CirctModuleEmitter::resolveRange(Value value) {
 }
 
 Value CirctModuleEmitter::getValue(Value value) {
+  value = resolveStructField(value);
   auto it = values.find(value);
   if (it != values.end())
     return it->second;
@@ -1938,6 +2101,7 @@ Value CirctModuleEmitter::getValue(Value value) {
 }
 
 CirctModuleEmitter::LogicValue CirctModuleEmitter::getLogicValue(Value value) {
+  value = resolveStructField(value);
   auto it = logicValues.find(value);
   if (it != logicValues.end())
     return it->second;
@@ -4133,36 +4297,38 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         }
         if (callee.contains("Bits::__init__")) {
           // Move the computed value into a result slot or a state field.
-          if (storeLoopCarried(op->getOperand(1), source, condition))
+          Value dest = resolveStructField(op->getOperand(1));
+          if (storeLoopCarried(dest, source, condition))
             return success();
-          if (isLoopCarriedSlot(op->getOperand(1)))
+          if (isLoopCarriedSlot(dest))
             return op->emitError()
                    << "HDL lowering: unsupported loop-carried local type in a "
                       "runtime-bounded loop";
-          if (op->getOperand(1) == resultPtr) {
+          if (dest == resultPtr) {
             recordReturn(source);
-          } else if (auto field = fieldPtrs.find(op->getOperand(1));
+          } else if (auto field = fieldPtrs.find(dest);
                      field != fieldPtrs.end()) {
             return storeField(field->second, source, condition);
           } else {
-            values[op->getOperand(1)] = source;
+            values[dest] = source;
           }
           return success();
         }
         if (callee.contains("Bits::copy")) {
-          if (storeLoopCarried(op->getOperand(1), source, condition))
+          Value dest = resolveStructField(op->getOperand(1));
+          if (storeLoopCarried(dest, source, condition))
             return success();
-          if (isLoopCarriedSlot(op->getOperand(1)))
+          if (isLoopCarriedSlot(dest))
             return op->emitError()
                    << "HDL lowering: unsupported loop-carried local type in a "
                       "runtime-bounded loop";
-          if (op->getOperand(1) == resultPtr)
+          if (dest == resultPtr)
             recordReturn(source);
-          else if (auto field = fieldPtrs.find(op->getOperand(1));
+          else if (auto field = fieldPtrs.find(dest);
                    field != fieldPtrs.end())
             return storeField(field->second, source, condition);
           else
-            values[op->getOperand(1)] = source;
+            values[dest] = source;
           return success();
         }
       }
@@ -4349,6 +4515,11 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       return success();
     }
 
+    StringRef callName = callee.split('(').first;
+    if (callName.ends_with("::__init__") && !callName.contains("hdl::") &&
+        !callName.contains("std::"))
+      return emitStructConstructor(op, callee);
+
     return op->emitError() << "HDL lowering: unsupported call to '" << callee
                            << "'";
   }
@@ -4372,7 +4543,14 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       // it and bind a placeholder so lowering can finish; the diagnostic is
       // emitted once every process (and therefore every owning domain) is
       // known.
-      if (auto instance = instancePtrs.find(op->getOperand(0));
+      Value base = op->getOperand(0);
+      if (!instancePtrs.count(base) && llvm::is_contained(stackSlots, base)) {
+        Value slot =
+            getStructFieldSlot(op, base, index.getInt());
+        structFieldAliases[op->getResult(0)] = slot;
+        return success();
+      }
+      if (auto instance = instancePtrs.find(base);
           instance != instancePtrs.end()) {
         unsigned field = instance->second;
         bool childHasClock = false;
@@ -4405,49 +4583,51 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
   }
 
   if (name == "pop.store") {
-    auto field = fieldPtrs.find(op->getOperand(1));
+    Value target = resolveStructField(op->getOperand(1));
+    auto field = fieldPtrs.find(target);
     if (field == fieldPtrs.end()) {
       // Remember integer constants and ranges held in stack slots so an
       // unrolled loop can evaluate its control path. A materialized constant
       // would only be dead state, so leave it symbolic until a load needs it.
       if (auto range = resolveRange(op->getOperand(0))) {
-        rangeValues[op->getOperand(1)] = *range;
-        slotConstants.erase(op->getOperand(1));
-        values.erase(op->getOperand(1));
+        rangeValues[target] = *range;
+        slotConstants.erase(target);
+        values.erase(target);
         return success();
       }
-      rangeValues.erase(op->getOperand(1));
+      rangeValues.erase(target);
       if (auto constant = resolveConstant(op->getOperand(0))) {
-        slotConstants[op->getOperand(1)] = *constant;
-        values.erase(op->getOperand(1));
+        slotConstants[target] = *constant;
+        values.erase(target);
         return success();
       }
-      slotConstants.erase(op->getOperand(1));
+      slotConstants.erase(target);
     }
     Value stored = getValue(op->getOperand(0));
     if (!stored)
       return op->emitError() << "HDL lowering: stored value was not lowered";
     if (field != fieldPtrs.end())
       return storeField(field->second, stored, condition);
-    if (storeLoopCarried(op->getOperand(1), stored, condition))
+    if (storeLoopCarried(target, stored, condition))
       return success();
-    if (isLoopCarriedSlot(op->getOperand(1)))
+    if (isLoopCarriedSlot(target))
       return op->emitError()
              << "HDL lowering: unsupported loop-carried local type in a "
                 "runtime-bounded loop";
-    values[op->getOperand(1)] = stored;
+    values[target] = stored;
     return success();
   }
 
   if (name == "pop.load") {
-    auto field = fieldPtrs.find(op->getOperand(0));
+    Value source = resolveStructField(op->getOperand(0));
+    auto field = fieldPtrs.find(source);
     if (field == fieldPtrs.end()) {
-      if (auto range = resolveRange(op->getOperand(0))) {
+      if (auto range = resolveRange(source)) {
         rangeValues[op->getResult(0)] = *range;
         values.erase(op->getResult(0));
         return success();
       }
-      auto slot = slotConstants.find(op->getOperand(0));
+      auto slot = slotConstants.find(source);
       if (slot != slotConstants.end()) {
         intConstants[op->getResult(0)] = slot->second;
         values.erase(op->getResult(0));
@@ -4461,12 +4641,12 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       values[op->getResult(0)] = getOrCreateReg(field->second, type);
       return success();
     }
-    if (auto logic = logicValues.find(op->getOperand(0));
+    if (auto logic = logicValues.find(source);
         logic != logicValues.end()) {
       logicValues[op->getResult(0)] = logic->second;
       return success();
     }
-    Value stored = getValue(op->getOperand(0));
+    Value stored = getValue(source);
     if (!stored)
       return op->emitError() << "HDL lowering: loaded value was not lowered";
     values[op->getResult(0)] = stored;
