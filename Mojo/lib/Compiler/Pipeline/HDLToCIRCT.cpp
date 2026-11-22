@@ -772,6 +772,9 @@ private:
   /// constant-unroll path can run.
   LogicalResult emitDynamicLoop(Operation *loop, Value condition,
                                 Value &returnValue, bool &handled);
+  /// Lower a runtime-bounded `for i in range(n)` loop one iteration per clock.
+  LogicalResult emitRuntimeRangeLoop(Operation *loop, Value condition,
+                                     Value &returnValue, bool &handled);
   LogicalResult emitOps(Operation *fn, Value &returnValue);
   LogicalResult emitBlock(Block &block, Value condition, Value &returnValue);
   LogicalResult emitOp(Operation *op, Value condition, Value &returnValue);
@@ -886,6 +889,7 @@ private:
   struct RangeValue {
     uint64_t start;
     uint64_t stop;
+    Value runtimeBound;
   };
   DenseMap<Value, RangeValue> rangeValues;
   DenseMap<Value, uint64_t> rangeNext;
@@ -2089,6 +2093,9 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       return op->emitError() << "HDL lowering: malformed loop";
     bool handled = false;
     if (failed(emitDynamicLoop(op, condition, returnValue, handled)))
+      return failure();
+    if (!handled &&
+        failed(emitRuntimeRangeLoop(op, condition, returnValue, handled)))
       return failure();
     if (handled)
       return success();
@@ -4092,17 +4099,25 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
         return success();
       }
       if (auto stop = resolveConstant(op->getOperand(0))) {
-        rangeValues[op->getResult(0)] = {0, stop->getZExtValue()};
+        rangeValues[op->getResult(0)] = {0, stop->getZExtValue(), Value()};
         return success();
       }
-      return op->emitError()
-             << "HDL lowering: loop range bound must be constant";
+      Value bound = getValue(op->getOperand(0));
+      if (!bound)
+        return op->emitError()
+               << "HDL lowering: loop range bound was not lowered";
+      rangeValues[op->getResult(0)] = {0, 0, bound};
+      return success();
     }
     if (callee.contains("::_ZeroStartingRange::__next__")) {
       auto range = resolveRange(op->getOperand(0));
       if (!range || op->getNumOperands() < 2)
         return op->emitError()
                << "HDL lowering: loop range iterator was not lowered";
+      if (range->runtimeBound)
+        return op->emitError()
+               << "HDL lowering: runtime range is only supported in a "
+                  "time-multiplexed loop";
       Value resultPtr = op->getOperand(op->getNumOperands() - 1);
       uint64_t &next = rangeNext[op->getOperand(0)];
       bool done = next >= range->stop;
@@ -4431,6 +4446,137 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
   if (!sawIf)
     return loop->emitError()
            << "HDL lowering: runtime loop has no condition";
+
+  Value one = hw::ConstantOp::create(builder, loc, counterType, 1);
+  Value incremented = comb::AddOp::create(builder, loc, counter, one);
+  Value zero = hw::ConstantOp::create(builder, loc, counterType, 0);
+  Value next =
+      comb::MuxOp::create(builder, loc, active, incremented, zero);
+  if (auto reg = counter.getDefiningOp<seq::CompRegOp>())
+    reg->setOperand(0, next);
+  else if (auto reg = counter.getDefiningOp<seq::FirRegOp>())
+    reg->setOperand(0, next);
+  else
+    return loop->emitError() << "HDL lowering: unsupported loop counter form";
+  return success();
+}
+
+LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
+    Operation *loop, Value condition, Value &returnValue, bool &handled) {
+  handled = false;
+  if (inDynamicLoop)
+    return success();
+  if (loop->getNumRegions() != 1 || loop->getRegion(0).empty())
+    return success();
+  Block &block = loop->getRegion(0).front();
+
+  Operation *nextOp = nullptr;
+  Value iterator;
+  for (Operation &op : block.getOperations())
+    if (op.getName().getStringRef() == "kgen.call" &&
+        callCalleeName(&op).contains("::_ZeroStartingRange::__next__")) {
+      nextOp = &op;
+      iterator = op.getOperand(0);
+      break;
+    }
+  if (!nextOp || nextOp->getNumOperands() < 2)
+    return success();
+  auto range = resolveRange(iterator);
+  if (!range || !range->runtimeBound)
+    return success();
+  Value bound = range->runtimeBound;
+
+  // The value returned by `__next__` is stored into the loop variable slot.
+  Value byrefResult = nextOp->getOperand(nextOp->getNumOperands() - 1);
+  Operation *indLoad = nullptr;
+  for (Operation &op : block.getOperations())
+    if (op.getName().getStringRef() == "pop.load" &&
+        op.getOperand(0) == byrefResult) {
+      indLoad = &op;
+      break;
+    }
+  if (!indLoad)
+    return success();
+  Operation *indStore = nullptr;
+  Value slot;
+  for (Operation &op : block.getOperations())
+    if (op.getName().getStringRef() == "pop.store" &&
+        op.getNumOperands() == 2 &&
+        op.getOperand(0) == indLoad->getResult(0) &&
+        !fieldPtrs.count(op.getOperand(1))) {
+      indStore = &op;
+      slot = op.getOperand(1);
+      break;
+    }
+  if (!indStore || !slot)
+    return success();
+
+  Operation *loopIf = nullptr;
+  for (Operation &op : block.getOperations()) {
+    if (op.getName().getStringRef() != "hlcf.if" || op.getNumOperands() != 1 ||
+        op.getOperand(0) != nextOp->getResult(0))
+      continue;
+    auto hasBreak = [](Region &region) {
+      if (region.empty())
+        return false;
+      for (Operation &inner : region.front())
+        if (inner.getName().getStringRef() == "hlcf.break")
+          return true;
+      return false;
+    };
+    if (hasBreak(op.getRegion(0)) != hasBreak(op.getRegion(1))) {
+      loopIf = &op;
+      break;
+    }
+  }
+  if (!loopIf)
+    return success();
+
+  handled = true;
+  unsigned width = 64;
+  if (auto intType = dyn_cast<IntegerType>(bound.getType()))
+    width = intType.getWidth();
+  auto counterType = IntegerType::get(builder.getContext(), width);
+  Value boundValue = bound;
+  unsigned boundWidth = bound.getType().getIntOrFloatBitWidth();
+  if (boundWidth > width) {
+    boundValue = comb::ExtractOp::create(builder, loc, bound, 0, width);
+  } else if (boundWidth < width) {
+    Value zeros = hw::ConstantOp::create(
+        builder, loc, llvm::APInt(width - boundWidth, 0));
+    boundValue = comb::ConcatOp::create(
+        builder, loc, ArrayRef<Value>{zeros, bound});
+  }
+  llvm::APInt zeroBits(width, 0);
+  Value counter = createRegister(loopRegisterId++, counterType, zeroBits,
+                                 zeroBits, resetStyle);
+  slotConstants.erase(slot);
+  rangeValues.erase(slot);
+  values[slot] = counter;
+  Value active = comb::ICmpOp::create(
+      builder, loc, comb::ICmpPredicate::ult, counter, boundValue);
+
+  SmallVector<Operation *> skipOps{nextOp, indLoad, indStore, loopIf};
+  inDynamicLoop = true;
+  dynamicLoopSlot = slot;
+  dynamicLoopOuterSlots = stackSlots;
+  for (Operation &op : block.getOperations()) {
+    if (llvm::is_contained(skipOps, &op))
+      continue;
+    StringRef name = op.getName().getStringRef();
+    if (name == "hlcf.continue" || name == "hlcf.yield" ||
+        name == "hlcf.break")
+      continue;
+    Value opCondition =
+        condition
+            ? comb::AndOp::create(builder, loc, condition, active)
+            : active;
+    if (failed(emitOp(&op, opCondition, returnValue)))
+      return failure();
+  }
+  inDynamicLoop = false;
+  dynamicLoopSlot = Value();
+  dynamicLoopOuterSlots.clear();
 
   Value one = hw::ConstantOp::create(builder, loc, counterType, 1);
   Value incremented = comb::AddOp::create(builder, loc, counter, one);
