@@ -40,14 +40,22 @@ if grep -q 'seq.hlmem' "$out/48_array_ram.mlir"; then
   exit 1
 fi
 
+MOJO_HDL_DUMP_MEMORY_IR=1 "$MOJO" build --emit=sv -o /dev/null "${inc[@]}" \
+    "$root/hdl-spike/designs/48_array_ram.mojo" 2> "$out/48_memory_ir.txt"
+grep -q 'seq.firmem 0, 1, undefined, undefined : <4 x 8, mask 1>' \
+    "$out/48_memory_ir.txt"
+grep -q 'seq.firmem.read_port' "$out/48_memory_ir.txt"
+grep -q 'seq.firmem.write_port' "$out/48_memory_ir.txt"
+
 "$MOJO" build --emit=sv -o "$out/48_array_ram.raw.sv" "${inc[@]}" \
     "$root/hdl-spike/designs/48_array_ram.mojo"
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' "$out/48_array_ram.raw.sv" \
     | grep -v '^$' > "$out/48_array_ram.sv"
 diff -u "$root/hdl-spike/expected/48_array_ram.sv" "$out/48_array_ram.sv"
-grep -q 'var logic \[7:0\] array_ram_0\[0:3\];' "$out/48_array_ram.sv"
-grep -q 'array_ram_0\[addr\[1:0\]\] <= wd;' "$out/48_array_ram.sv"
-grep -q 'assign out = array_ram_0\[addr\[1:0\]\];' "$out/48_array_ram.sv"
-grep -q 'always_ff @(posedge clk)' "$out/48_array_ram.sv"
+grep -q 'module mem_4x8(' "$out/48_array_ram.sv"
+grep -q 'var logic \[7:0\] Memory\[0:3\];' "$out/48_array_ram.sv"
+grep -q 'Memory\[W0_addr\] <= W0_data;' "$out/48_array_ram.sv"
+grep -q "assign R0_data = R0_en ? Memory\[R0_addr\] : 8'bx;" "$out/48_array_ram.sv"
+grep -q 'mem_4x8 mem_ext (' "$out/48_array_ram.sv"
 
 echo "48_array_ram: ok"

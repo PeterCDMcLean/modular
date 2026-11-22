@@ -31,6 +31,10 @@
 #include "Mojo/ToolCommon/KGENPasses.h"
 #include "Mojo/ToolCommon/PipelineTiming.h"
 #include "Mojo/TransformUtils/SlicingUtils.h"
+#include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/Seq/SeqPasses.h"
+
+#include <cstdlib>
 #include "ObjectCompiler/KGENToLLVMPipeline.h"
 #include "Pipeline/Pipeline.h"
 #include "Pipeline/HDLToCIRCT.h"
@@ -1165,12 +1169,20 @@ KGENCompiler::runKGENPipeline(ModuleOp theModule, TargetInfoAttr target,
     if (options.hdlEmitSV) {
       if (!hdlBuiltModule)
         return Error("HDL lowering produced no module");
+      mlir::PassManager memoryPM(&context);
+      memoryPM.addNestedPass<circt::hw::HWModuleOp>(
+          circt::seq::createRegOfVecToMem());
+      if (failed(memoryPM.run(*hdlBuiltModule)))
+        return Error("HDL memory inference failed");
+      if (std::getenv("MOJO_HDL_DUMP_MEMORY_IR"))
+        hdlBuiltModule->print(llvm::errs());
       if (failed(lowerHDLArrayRegToSV(*hdlBuiltModule)))
         return Error("HDL array-register memory lowering failed");
       if (failed(lowerHDLHLMemToSV(*hdlBuiltModule)))
         return Error("HDL hlmem lowering failed");
       mlir::PassManager circtPM(&context);
       circtPM.addPass(createHDLSeqToSVPass());
+      circtPM.addPass(circt::seq::createHWMemSimImpl());
       // `seq.initial` leaves a dead placeholder unrealized cast behind.
       circtPM.addPass(mlir::createCanonicalizerPass());
       if (failed(circtPM.run(*hdlBuiltModule)))
