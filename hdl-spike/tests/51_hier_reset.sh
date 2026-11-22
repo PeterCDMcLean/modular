@@ -33,6 +33,12 @@ grep -q 'hw.instance "a" @AsyncLowChild(clk: %clk: !seq.clock, rst_n: %rst_n' \
     "$out/51_hier_reset.mlir"
 grep -q 'hw.instance "b" @SyncHighChild(clk: %clk: !seq.clock, rst: %0' \
     "$out/51_hier_reset.mlir"
+grep -q 'hw.module @ResetParentHigh(in %clk : !seq.clock, in %rst : i1' \
+    "$out/51_hier_reset.mlir"
+grep -q 'hw.instance "a" @AsyncLowChild(clk: %clk: !seq.clock, rst_n: %0' \
+    "$out/51_hier_reset.mlir"
+grep -q 'hw.instance "b" @SyncHighChild(clk: %clk: !seq.clock, rst: %rst' \
+    "$out/51_hier_reset.mlir"
 grep -q 'seq.firreg.*reset async' "$out/51_hier_reset.mlir"
 grep -q 'seq.compreg.*reset %rst' "$out/51_hier_reset.mlir"
 
@@ -43,6 +49,8 @@ sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' "$out/51_hier_reset.raw.
 diff -u "$root/hdl-spike/expected/51_hier_reset.sv" "$out/51_hier_reset.sv"
 grep -q '.rst_n (rst_n)' "$out/51_hier_reset.sv"
 grep -q '.rst (~rst_n)' "$out/51_hier_reset.sv"
+grep -q '.rst_n (~rst)' "$out/51_hier_reset.sv"
+grep -q '.rst (rst)' "$out/51_hier_reset.sv"
 grep -q 'always @(posedge clk or posedge _GEN)' "$out/51_hier_reset.sv"
 grep -q 'always @(posedge clk)' "$out/51_hier_reset.sv"
 

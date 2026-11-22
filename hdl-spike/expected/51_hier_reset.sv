@@ -71,6 +71,25 @@ module SyncHighChild(
   assign _GEN = _GEN_0 + 8'h1;
   assign out = _GEN_0;
 endmodule
+module ResetParentHigh(
+  input        clk,
+               rst,
+  output [7:0] out
+);
+  wire [7:0] _b_out;
+  wire [7:0] _a_out;
+  AsyncLowChild a (
+    .clk   (clk),
+    .rst_n (~rst),
+    .out   (_a_out)
+  );
+  SyncHighChild b (
+    .clk (clk),
+    .rst (rst),
+    .out (_b_out)
+  );
+  assign out = _a_out ^ _b_out;
+endmodule
 module ResetParentLow(
   input        clk,
                rst_n,

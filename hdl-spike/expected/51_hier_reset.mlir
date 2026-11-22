@@ -20,6 +20,14 @@ hw.module @SyncHighChild(in %clk : !seq.clock, in %rst : i1, out out : i8) {
   %2 = comb.add %1, %c1_i8 : i8
   hw.output %1 : i8
 }
+hw.module @ResetParentHigh(in %clk : !seq.clock, in %rst : i1, out out : i8) {
+  %true = hw.constant true
+  %0 = comb.xor %rst, %true : i1
+  %a.out = hw.instance "a" @AsyncLowChild(clk: %clk: !seq.clock, rst_n: %0: i1) -> (out: i8)
+  %b.out = hw.instance "b" @SyncHighChild(clk: %clk: !seq.clock, rst: %rst: i1) -> (out: i8)
+  %1 = comb.xor %a.out, %b.out : i8
+  hw.output %1 : i8
+}
 hw.module @ResetParentLow(in %clk : !seq.clock, in %rst_n : i1, out out : i8) {
   %a.out = hw.instance "a" @AsyncLowChild(clk: %clk: !seq.clock, rst_n: %rst_n: i1) -> (out: i8)
   %true = hw.constant true

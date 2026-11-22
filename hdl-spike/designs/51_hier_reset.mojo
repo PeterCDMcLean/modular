@@ -42,3 +42,16 @@ struct ResetParentLow:
 
     def run(mut self) -> Bits[8]:
         return self.a.run() ^ self.b.run()
+
+
+@module
+struct ResetParentHigh:
+    var a: AsyncLowChild
+    var b: SyncHighChild
+
+    def __init__(out self):
+        self.a = AsyncLowChild()
+        self.b = SyncHighChild()
+
+    def run(mut self) -> Bits[8]:
+        return self.a.run() ^ self.b.run()
