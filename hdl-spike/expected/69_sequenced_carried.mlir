@@ -55,7 +55,7 @@ hw.module @SequencedAccum(in %n : i64, in %m : i64, in %wd : i8, in %clk : !seq.
   %c0_i64_7 = hw.constant 0 : i64
   %20 = comb.icmp eq %19, %n : i64
   %21 = comb.and %2, %20 : i1
-  %22 = comb.mux %2, %19, %c0_i64_7 : i64
+  %22 = comb.mux %2, %19, %1 : i64
   %false_8 = hw.constant false
   %false_9 = hw.constant false
   %23 = seq.initial() {
@@ -159,7 +159,7 @@ hw.module @SequencedLogicAccum(in %n : i64, in %m : i64, in %wd : i8, in %wd_xz 
   %c0_i64_2 = hw.constant 0 : i64
   %6 = comb.icmp eq %5, %n : i64
   %7 = comb.and %2, %6 : i1
-  %8 = comb.mux %2, %5, %c0_i64_2 : i64
+  %8 = comb.mux %2, %5, %1 : i64
   %false = hw.constant false
   %false_3 = hw.constant false
   %9 = seq.initial() {

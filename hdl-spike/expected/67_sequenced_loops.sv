@@ -91,7 +91,7 @@ module SequencedLoops(
       _GEN_13 <= wd;
   end
   wire      [63:0] _GEN_14 = _GEN_11 + 64'h1;
-  assign _GEN_10 = _GEN_12 ? _GEN_14 : 64'h0;
+  assign _GEN_10 = _GEN_12 ? _GEN_14 : _GEN_11;
   var logic        _GEN_15 = 1'h0;
   always @(posedge clk) begin
     if (rst)
@@ -236,7 +236,7 @@ module SequencedWhile(
       _GEN_13 <= wd;
   end
   wire      [63:0] _GEN_14 = _GEN_11 + 64'h1;
-  assign _GEN_10 = _GEN_12 ? _GEN_14 : 64'h0;
+  assign _GEN_10 = _GEN_12 ? _GEN_14 : _GEN_11;
   var logic        _GEN_15 = 1'h0;
   always @(posedge clk) begin
     if (rst)

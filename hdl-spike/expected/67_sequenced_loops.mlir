@@ -101,7 +101,7 @@ hw.module @SequencedLoops(in %n : i64, in %m : i64, in %wd : i8, in %en : i1, in
   %c0_i64_13 = hw.constant 0 : i64
   %38 = comb.icmp eq %37, %n : i64
   %39 = comb.and %2, %38 : i1
-  %40 = comb.mux %2, %37, %c0_i64_13 : i64
+  %40 = comb.mux %2, %37, %1 : i64
   %false_14 = hw.constant false
   %false_15 = hw.constant false
   %41 = seq.initial() {
@@ -305,7 +305,7 @@ hw.module @SequencedWhile(in %n : i64, in %m : i64, in %wd : i8, in %en : i1, in
   %c0_i64_13 = hw.constant 0 : i64
   %38 = comb.icmp eq %37, %n : i64
   %39 = comb.and %2, %38 : i1
-  %40 = comb.mux %2, %37, %c0_i64_13 : i64
+  %40 = comb.mux %2, %37, %1 : i64
   %false_14 = hw.constant false
   %false_15 = hw.constant false
   %41 = seq.initial() {

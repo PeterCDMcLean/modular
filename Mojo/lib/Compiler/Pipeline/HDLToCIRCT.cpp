@@ -879,6 +879,9 @@ private:
   bool childLoopRan = false;
   // A runtime `break` inside a conditional becomes a loop-exit condition.
   Value dynamicBreakCond;
+  // True while emitting a runtime loop that is followed by another runtime
+  // loop in the same block. Its carried state is kept for the next loop.
+  bool loopFollowedByLoop = false;
   SmallVector<Value> collectLoopCarriedSlots(Block &block,
                                              Value inductionSlot);
   bool storeLoopCarried(Value slot, Value value, Value condition);
@@ -4449,6 +4452,14 @@ LogicalResult CirctModuleEmitter::emitBlock(Block &block, Value condition,
     if (!loopStack.empty() && (loopStack.back().breakTaken ||
                                loopStack.back().continueTaken))
       break;
+    loopFollowedByLoop = false;
+    if (op.getName().getStringRef() == "hlcf.loop") {
+      for (auto it = std::next(op.getIterator()); it != block.end(); ++it)
+        if (it->getName().getStringRef() == "hlcf.loop") {
+          loopFollowedByLoop = true;
+          break;
+        }
+    }
     if (failed(emitOp(&op, condition, returnValue)))
       return failure();
     // A completed runtime loop yields a one-cycle pulse. Ops after it in the
@@ -4756,13 +4767,14 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
       breakNow ? comb::MuxOp::create(builder, loc, breakNow, boundValue,
                                      incremented)
                : incremented;
+  Value idle = loopFollowedByLoop ? counter : zero;
   Value next =
       childLoopRan
           ? comb::MuxOp::create(
                 builder, loc, childLoopLast,
                 comb::MuxOp::create(builder, loc, last, zero, incremented),
                 breakNow ? zero : counter)
-          : comb::MuxOp::create(builder, loc, active, step, zero);
+          : comb::MuxOp::create(builder, loc, active, step, idle);
   if (auto reg = counter.getDefiningOp<seq::CompRegOp>())
     reg->setOperand(0, next);
   else if (auto reg = counter.getDefiningOp<seq::FirRegOp>())
@@ -4815,9 +4827,11 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
         comb::MuxOp::create(builder, loc, running, notLast,
                             getConstant(true));
     Value runningNext =
-        started ? comb::MuxOp::create(builder, loc, started, runningBase,
-                                      getConstant(false))
-                : runningBase;
+        loopFollowedByLoop
+            ? getConstant(true)
+            : (started ? comb::MuxOp::create(builder, loc, started,
+                                             runningBase, getConstant(false))
+                       : runningBase);
     if (failed(setRegNext(running, runningNext)))
       return loop->emitError()
              << "HDL lowering: unsupported running register form";
@@ -5078,13 +5092,14 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
       breakNow ? comb::MuxOp::create(builder, loc, breakNow, boundValue,
                                      incremented)
                : incremented;
+  Value idle = loopFollowedByLoop ? counter : zero;
   Value next =
       childLoopRan
           ? comb::MuxOp::create(
                 builder, loc, childLoopLast,
                 comb::MuxOp::create(builder, loc, last, zero, incremented),
                 breakNow ? zero : counter)
-          : comb::MuxOp::create(builder, loc, active, step, zero);
+          : comb::MuxOp::create(builder, loc, active, step, idle);
   if (auto reg = counter.getDefiningOp<seq::CompRegOp>())
     reg->setOperand(0, next);
   else if (auto reg = counter.getDefiningOp<seq::FirRegOp>())
@@ -5136,9 +5151,11 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
         comb::MuxOp::create(builder, loc, running, notLast,
                             getConstant(true));
     Value runningNext =
-        started ? comb::MuxOp::create(builder, loc, started, runningBase,
-                                      getConstant(false))
-                : runningBase;
+        loopFollowedByLoop
+            ? getConstant(true)
+            : (started ? comb::MuxOp::create(builder, loc, started,
+                                             runningBase, getConstant(false))
+                       : runningBase);
     if (failed(setRegNext(running, runningNext)))
       return loop->emitError()
              << "HDL lowering: unsupported running register form";

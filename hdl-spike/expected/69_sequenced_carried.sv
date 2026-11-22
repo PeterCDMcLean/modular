@@ -57,7 +57,7 @@ module SequencedAccum(
   assign _GEN_6 = _GEN_10 & _GEN_9 == 64'h2;
   assign _GEN_5 = _GEN_10 & _GEN_9 == 64'h3;
   wire      [63:0] _GEN_11 = _GEN_9 + 64'h1;
-  assign _GEN_4 = _GEN_10 ? _GEN_11 : 64'h0;
+  assign _GEN_4 = _GEN_10 ? _GEN_11 : _GEN_9;
   var logic        _GEN_12 = 1'h0;
   always @(posedge clk) begin
     if (rst)
@@ -161,7 +161,7 @@ module SequencedLogicAccum(
   end
   assign _GEN_8 = reg_0 + 8'h1;
   wire      [63:0] _GEN_11 = _GEN_9 + 64'h1;
-  assign _GEN_7 = _GEN_10 ? _GEN_11 : 64'h0;
+  assign _GEN_7 = _GEN_10 ? _GEN_11 : _GEN_9;
   var logic        _GEN_12 = 1'h0;
   always @(posedge clk) begin
     if (rst)
