@@ -1,4 +1,4 @@
 [submodule "third_party/circt"]
 	path = third_party/circt
-	url = /home/pmclean/circt-fork.git
+	url = https://github.com/PeterCDMcLean/circt.git
 	branch = bazel-overlay
