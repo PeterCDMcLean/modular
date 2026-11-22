@@ -33,8 +33,8 @@ diff -u "$root/hdl-spike/expected/61_done_handshake.mlir" \
 [ "$(grep -c 'hw.module' "$out/61_done_handshake.mlir")" = "2" ]
 # A done pulse is the final-iteration condition delayed by one register.
 [ "$(grep -c 'comb.icmp eq %20, %count : i64' "$out/61_done_handshake.mlir")" = "2" ]
-[ "$(grep -c 'comb.and %2, %22 : i1' "$out/61_done_handshake.mlir")" = "2" ]
-[ "$(grep -c 'seq.compreg %23, %clk reset %rst' "$out/61_done_handshake.mlir")" = "2" ]
+[ "$(grep -c 'comb.and %2, %21 : i1' "$out/61_done_handshake.mlir")" = "2" ]
+[ "$(grep -c 'seq.compreg %22, %clk reset %rst' "$out/61_done_handshake.mlir")" = "2" ]
 # The post-loop counter is enabled by the done pulse, not by `active`.
 [ "$(grep -c 'seq.compreg.ce sym @reg_2 %27, %clk, %25' "$out/61_done_handshake.mlir")" = "2" ]
 

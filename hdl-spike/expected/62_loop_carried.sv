@@ -33,8 +33,8 @@ module RuntimeForAccum(
   wire             _GEN_6 = _GEN_4 & _GEN_3 < count;
   assign _GEN_2 = _GEN_4 ? (_GEN_6 ? _GEN_5 + wd : _GEN_5) : 8'h0;
   wire      [63:0] _GEN_7 = _GEN_3 + 64'h1;
-  assign _GEN_1 = _GEN_6 ? _GEN_7 : 64'h0;
   wire             _GEN_8 = _GEN_6 & _GEN_7 == count;
+  assign _GEN_1 = _GEN_6 ? _GEN_7 : 64'h0;
   var logic        _GEN_9 = 1'h0;
   always @(posedge clk) begin
     if (rst)
@@ -95,8 +95,8 @@ module RuntimeWhileAccum(
   wire             _GEN_6 = _GEN_4 & _GEN_3 < count;
   assign _GEN_2 = _GEN_4 ? (_GEN_6 ? _GEN_5 + wd : _GEN_5) : 8'h0;
   wire      [63:0] _GEN_7 = _GEN_3 + 64'h1;
-  assign _GEN_1 = _GEN_6 ? _GEN_7 : 64'h0;
   wire             _GEN_8 = _GEN_6 & _GEN_7 == count;
+  assign _GEN_1 = _GEN_6 ? _GEN_7 : 64'h0;
   var logic        _GEN_9 = 1'h0;
   always @(posedge clk) begin
     if (rst)

@@ -5,7 +5,7 @@ hw.module @RuntimeForLogicAccum(in %count : i64, in %wd : i8, in %wd_xz : i8, in
     %c0_i64_16 = hw.constant 0 : i64
     seq.yield %c0_i64_16 : i64
   } : () -> !seq.immutable<i64>
-  %1 = seq.compreg %23, %clk reset %rst, %c0_i64_0 initial %0 : i64  
+  %1 = seq.compreg %25, %clk reset %rst, %c0_i64_0 initial %0 : i64  
   %false = hw.constant false
   %false_1 = hw.constant false
   %2 = seq.initial() {
@@ -46,18 +46,18 @@ hw.module @RuntimeForLogicAccum(in %count : i64, in %wd : i8, in %wd_xz : i8, in
   %c1_i64 = hw.constant 1 : i64
   %22 = comb.add %1, %c1_i64 : i64
   %c0_i64_6 = hw.constant 0 : i64
-  %23 = comb.mux %9, %22, %c0_i64_6 : i64
-  %24 = comb.icmp eq %22, %count : i64
-  %25 = comb.and %9, %24 : i1
+  %23 = comb.icmp eq %22, %count : i64
+  %24 = comb.and %9, %23 : i1
+  %25 = comb.mux %9, %22, %c0_i64_6 : i64
   %false_7 = hw.constant false
   %false_8 = hw.constant false
   %26 = seq.initial() {
     %false_16 = hw.constant false
     seq.yield %false_16 : i1
   } : () -> !seq.immutable<i1>
-  %27 = seq.compreg %25, %clk reset %rst, %false_8 initial %26 : i1  
+  %27 = seq.compreg %24, %clk reset %rst, %false_8 initial %26 : i1  
   %true = hw.constant true
-  %28 = comb.xor %25, %true : i1
+  %28 = comb.xor %24, %true : i1
   %true_9 = hw.constant true
   %29 = comb.mux %3, %28, %true_9 : i1
   %c0_i8_10 = hw.constant 0 : i8
@@ -94,7 +94,7 @@ hw.module @RuntimeWhileLogicAccum(in %count : i64, in %wd : i8, in %wd_xz : i8, 
     %c0_i64_16 = hw.constant 0 : i64
     seq.yield %c0_i64_16 : i64
   } : () -> !seq.immutable<i64>
-  %1 = seq.compreg %23, %clk reset %rst, %c0_i64_0 initial %0 : i64  
+  %1 = seq.compreg %25, %clk reset %rst, %c0_i64_0 initial %0 : i64  
   %false = hw.constant false
   %false_1 = hw.constant false
   %2 = seq.initial() {
@@ -135,18 +135,18 @@ hw.module @RuntimeWhileLogicAccum(in %count : i64, in %wd : i8, in %wd_xz : i8, 
   %c1_i64 = hw.constant 1 : i64
   %22 = comb.add %1, %c1_i64 : i64
   %c0_i64_6 = hw.constant 0 : i64
-  %23 = comb.mux %9, %22, %c0_i64_6 : i64
-  %24 = comb.icmp eq %22, %count : i64
-  %25 = comb.and %9, %24 : i1
+  %23 = comb.icmp eq %22, %count : i64
+  %24 = comb.and %9, %23 : i1
+  %25 = comb.mux %9, %22, %c0_i64_6 : i64
   %false_7 = hw.constant false
   %false_8 = hw.constant false
   %26 = seq.initial() {
     %false_16 = hw.constant false
     seq.yield %false_16 : i1
   } : () -> !seq.immutable<i1>
-  %27 = seq.compreg %25, %clk reset %rst, %false_8 initial %26 : i1  
+  %27 = seq.compreg %24, %clk reset %rst, %false_8 initial %26 : i1  
   %true = hw.constant true
-  %28 = comb.xor %25, %true : i1
+  %28 = comb.xor %24, %true : i1
   %true_9 = hw.constant true
   %29 = comb.mux %3, %28, %true_9 : i1
   %c0_i8_10 = hw.constant 0 : i8

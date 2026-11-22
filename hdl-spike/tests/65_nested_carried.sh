@@ -41,15 +41,15 @@ diff -u "$root/hdl-spike/expected/65_nested_carried.sv" \
     "$out/65_nested_carried.sv"
 
 # Bits accumulator: running ? (both-active ? acc + wd : acc) : 0.
-grep -q 'assign _GEN_0 = _GEN_5 ? (_GEN_8 ? _GEN_6 + wd : _GEN_6) : 8.h0;' \
+grep -q 'assign _GEN_2 = _GEN_5 ? (_GEN_8 ? _GEN_6 + wd : _GEN_6) : 8.h0;' \
     "$out/65_nested_carried.sv"
-grep -q 'assign _GEN_1 = ~_GEN_5 | ~_GEN_12;' "$out/65_nested_carried.sv"
+grep -q 'assign _GEN_0 = ~_GEN_5 | ~_GEN_12;' "$out/65_nested_carried.sv"
 [ "$(grep -c 'else if (_GEN_13)' "$out/65_nested_carried.sv")" = "2" ]
 
 # Logic accumulator: value/mask pair, reloading the pre-loop wd on done.
-grep -q 'assign _GEN_3 = _GEN_8 ? {8{_GEN_12}} & wd | _GEN_9 : wd;' \
+grep -q 'assign _GEN_5 = _GEN_8 ? {8{_GEN_12}} & wd | _GEN_9 : wd;' \
     "$out/65_nested_carried.sv"
-grep -q 'assign _GEN_4 = ~_GEN_8 | ~_GEN_16;' "$out/65_nested_carried.sv"
+grep -q 'assign _GEN_2 = ~_GEN_8 | ~_GEN_16;' "$out/65_nested_carried.sv"
 grep -q 'assign _GEN_1 = _GEN_17 ? _GEN_9 : _GEN_18;' \
     "$out/65_nested_carried.sv"
 grep -q 'assign _GEN_0 = _GEN_17 ? _GEN_10 : _GEN_19;' \

@@ -32,7 +32,7 @@ diff -u "$root/hdl-spike/expected/60_runtime_range.mlir" \
 
 # The range iterator is replaced by a counter, an in-range compare, and a
 # wrapped update.
-grep -q 'seq.compreg %21, %clk reset %rst' "$out/60_runtime_range.mlir"
+grep -q 'seq.compreg %23, %clk reset %rst' "$out/60_runtime_range.mlir"
 grep -q 'comb.icmp ult %1, %count : i64' "$out/60_runtime_range.mlir"
 grep -q 'comb.mux %2, %20, %c0_i64_9 : i64' "$out/60_runtime_range.mlir"
 grep -q 'seq.compreg.ce sym @reg_1 %wd, %clk, %2' \

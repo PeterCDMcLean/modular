@@ -31,7 +31,7 @@ diff -u "$root/hdl-spike/expected/59_runtime_loop.mlir" \
     "$out/59_runtime_loop.mlir"
 
 # One 64-bit induction register, an in-range compare, and a wrapped update.
-grep -q 'seq.compreg %21, %clk reset %rst' "$out/59_runtime_loop.mlir"
+grep -q 'seq.compreg %23, %clk reset %rst' "$out/59_runtime_loop.mlir"
 grep -q 'comb.icmp ult %1, %count : i64' "$out/59_runtime_loop.mlir"
 grep -q 'comb.mux %2, %20, %c0_i64_9 : i64' "$out/59_runtime_loop.mlir"
 # Every memory entry and the state field update only while in range.

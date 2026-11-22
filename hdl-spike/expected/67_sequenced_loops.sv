@@ -123,8 +123,8 @@ module SequencedLoops(
   assign _GEN_3 = _GEN_12 & en & _GEN_11 == 64'h6 | _GEN_18 & en & _GEN_16 == 64'h6;
   assign _GEN_2 = _GEN_12 & en & _GEN_11 == 64'h7 | _GEN_18 & en & _GEN_16 == 64'h7;
   wire      [63:0] _GEN_19 = _GEN_16 + 64'h1;
-  assign _GEN_1 = _GEN_18 ? _GEN_19 : 64'h0;
   wire             _GEN_20 = _GEN_18 & _GEN_19 == m;
+  assign _GEN_1 = _GEN_18 ? _GEN_19 : 64'h0;
   assign _GEN_0 = _GEN_15 | ~_GEN_20 & _GEN_17;
   var logic        _GEN_21 = 1'h0;
   always @(posedge clk) begin
@@ -268,8 +268,8 @@ module SequencedWhile(
   assign _GEN_3 = _GEN_12 & en & _GEN_11 == 64'h6 | _GEN_18 & en & _GEN_16 == 64'h6;
   assign _GEN_2 = _GEN_12 & en & _GEN_11 == 64'h7 | _GEN_18 & en & _GEN_16 == 64'h7;
   wire      [63:0] _GEN_19 = _GEN_16 + 64'h1;
-  assign _GEN_1 = _GEN_18 ? _GEN_19 : 64'h0;
   wire             _GEN_20 = _GEN_18 & _GEN_19 == m;
+  assign _GEN_1 = _GEN_18 ? _GEN_19 : 64'h0;
   assign _GEN_0 = _GEN_15 | ~_GEN_20 & _GEN_17;
   var logic        _GEN_21 = 1'h0;
   always @(posedge clk) begin

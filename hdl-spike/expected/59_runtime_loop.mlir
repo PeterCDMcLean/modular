@@ -5,7 +5,7 @@ hw.module @RuntimeFill(in %count : i64, in %wd : i8, in %en : i1, in %clk : !seq
     %c0_i64_12 = hw.constant 0 : i64
     seq.yield %c0_i64_12 : i64
   } : () -> !seq.immutable<i64>
-  %1 = seq.compreg %21, %clk reset %rst, %c0_i64_0 initial %0 : i64  
+  %1 = seq.compreg %23, %clk reset %rst, %c0_i64_0 initial %0 : i64  
   %2 = comb.icmp ult %1, %count : i64
   %c0_i8 = hw.constant 0 : i8
   %false = hw.constant false
@@ -59,15 +59,15 @@ hw.module @RuntimeFill(in %count : i64, in %wd : i8, in %en : i1, in %clk : !seq
   %c1_i64_8 = hw.constant 1 : i64
   %20 = comb.add %1, %c1_i64_8 : i64
   %c0_i64_9 = hw.constant 0 : i64
-  %21 = comb.mux %2, %20, %c0_i64_9 : i64
-  %22 = comb.icmp eq %20, %count : i64
-  %23 = comb.and %2, %22 : i1
+  %21 = comb.icmp eq %20, %count : i64
+  %22 = comb.and %2, %21 : i1
+  %23 = comb.mux %2, %20, %c0_i64_9 : i64
   %false_10 = hw.constant false
   %false_11 = hw.constant false
   %24 = seq.initial() {
     %false_12 = hw.constant false
     seq.yield %false_12 : i1
   } : () -> !seq.immutable<i1>
-  %25 = seq.compreg %23, %clk reset %rst, %false_11 initial %24 : i1  
+  %25 = seq.compreg %22, %clk reset %rst, %false_11 initial %24 : i1  
   hw.output %reg_1 : i8
 }
