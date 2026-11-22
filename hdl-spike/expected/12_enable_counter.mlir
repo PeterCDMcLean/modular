@@ -18,12 +18,13 @@ hw.module @EnableIfElse(in %en : i1, in %clk : !seq.clock, in %rst : i1, out out
     %c0_i8_1 = hw.constant 0 : i8
     seq.yield %c0_i8_1 : i8
   } : () -> !seq.immutable<i8>
-  %1 = seq.compreg %5, %clk reset %rst, %c0_i8_0 initial %0 : i8  
-  %2 = comb.add %1, %c1_i8 : i8
+  %1 = comb.mux %en, %3, %2 : i8
+  %2 = seq.compreg %6, %clk reset %rst, %c0_i8_0 initial %0 : i8  
+  %3 = comb.add %2, %c1_i8 : i8
   %true = hw.constant true
-  %3 = comb.xor %en, %true : i1
+  %4 = comb.xor %en, %true : i1
   %c2_i8 = hw.constant 2 : i8
-  %4 = comb.add %1, %c2_i8 : i8
-  %5 = comb.mux %3, %4, %2 : i8
-  hw.output %1 : i8
+  %5 = comb.add %2, %c2_i8 : i8
+  %6 = comb.mux %4, %5, %1 : i8
+  hw.output %2 : i8
 }

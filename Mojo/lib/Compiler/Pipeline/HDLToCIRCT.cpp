@@ -782,7 +782,7 @@ private:
   LogicalResult emitBlock(Block &block, Value condition, Value &returnValue);
   LogicalResult emitOp(Operation *op, Value condition, Value &returnValue);
   LogicalResult storeField(unsigned fieldIndex, Value value, Value condition);
-  void convertCEToPlain(unsigned fieldIndex);
+  void convertCEToPlain(unsigned fieldIndex, bool preserveEnable = true);
   Operation *findBuiltModule(StringRef name);
   Value getValue(Value value);
   LogicValue getLogicValue(Value value);
@@ -2406,7 +2406,8 @@ Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
   return reg;
 }
 
-void CirctModuleEmitter::convertCEToPlain(unsigned fieldIndex) {
+void CirctModuleEmitter::convertCEToPlain(unsigned fieldIndex,
+                                          bool preserveEnable) {
   Value reg = fieldRegs.lookup(fieldIndex);
   auto ce = reg ? reg.getDefiningOp<seq::CompRegClockEnabledOp>() : nullptr;
   if (!ce)
@@ -2414,6 +2415,13 @@ void CirctModuleEmitter::convertCEToPlain(unsigned fieldIndex) {
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPoint(ce);
   Value input = fieldNext.lookup(fieldIndex);
+  // Dropping the clock enable must keep its update path: gate the pending
+  // value with the enable and use the current register as the hold value.
+  Value enable = preserveEnable ? fieldEnable.lookup(fieldIndex) : Value();
+  if (enable && input) {
+    input = comb::MuxOp::create(builder, loc, enable, input, ce.getResult());
+    fieldNext[fieldIndex] = input;
+  }
   auto plain = seq::CompRegOp::create(builder, loc, input, clk, ce.getReset(),
                                       ce.getResetValue(),
                                       ce.getInitialValue());
@@ -2455,7 +2463,7 @@ LogicalResult CirctModuleEmitter::storeField(unsigned fieldIndex, Value value,
         fieldNext[fieldIndex] = value;
         return success();
       }
-      convertCEToPlain(fieldIndex);
+      convertCEToPlain(fieldIndex, /*preserveEnable=*/true);
       reg = fieldRegs[fieldIndex];
       muxed = true;
       fieldMuxed[fieldIndex] = true;
@@ -2481,7 +2489,7 @@ LogicalResult CirctModuleEmitter::storeField(unsigned fieldIndex, Value value,
   // An unconditional write disables any clock enable established earlier.
   if (!condition) {
     if (auto ce = reg.getDefiningOp<seq::CompRegClockEnabledOp>()) {
-      convertCEToPlain(fieldIndex);
+      convertCEToPlain(fieldIndex, /*preserveEnable=*/false);
       fieldEnable.erase(fieldIndex);
       fieldMuxed[fieldIndex] = true;
       reg = fieldRegs[fieldIndex];

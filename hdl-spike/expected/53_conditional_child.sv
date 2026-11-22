@@ -45,7 +45,7 @@ module ConditionalChain(
   wire            _GEN_3 = _GEN_2 & sel_b;
   wire            _GEN_4 = _GEN_2 & ~sel_b;
   assign _GEN_0 = _GEN_4 ? c : _GEN_3 ? b : a;
-  assign _GEN = _GEN_4 | _GEN_3 | sel_a ? _cell_out : 8'h0;
+  assign _GEN = _GEN_4 | _GEN_3 | sel_a ? _cell_out : _GEN_1;
   assign out = _GEN_1;
 endmodule
 module ConditionalTick(

@@ -33,14 +33,14 @@ diff -u "$root/hdl-spike/expected/67_sequenced_loops.mlir" \
 [ "$(grep -c 'hw.module' "$out/67_sequenced_loops.mlir")" = "2" ]
 # First-loop done, second-loop started flag, second-loop done.
 [ "$(grep -c 'seq.compreg %40, %clk reset %rst' "$out/67_sequenced_loops.mlir")" = "2" ]
-[ "$(grep -c 'seq.compreg %95, %clk reset %rst' "$out/67_sequenced_loops.mlir")" = "2" ]
+[ "$(grep -c 'seq.compreg %94, %clk reset %rst' "$out/67_sequenced_loops.mlir")" = "2" ]
 [ "$(grep -c 'seq.compreg %93, %clk reset %rst' "$out/67_sequenced_loops.mlir")" = "2" ]
 # The second loop body runs on started && in-range, not on the start pulse.
-grep -q 'comb.and %46, %47 : i1' "$out/67_sequenced_loops.mlir"
+grep -q 'comb.and %47, %48 : i1' "$out/67_sequenced_loops.mlir"
 # Writes from the two loops combine per entry.
-[ "$(grep -c 'comb.or %13, %51 : i1' "$out/67_sequenced_loops.mlir")" = "2" ]
+[ "$(grep -c 'comb.or %13, %52 : i1' "$out/67_sequenced_loops.mlir")" = "2" ]
 # Post-loop state is gated by the second loop's done.
-[ "$(grep -c 'seq.compreg.ce sym @reg_2 %99, %clk, %97' \
+[ "$(grep -c 'seq.compreg.ce sym @reg_2 %100, %clk, %98' \
     "$out/67_sequenced_loops.mlir")" = "2" ]
 
 "$MOJO" build --emit=sv -o "$out/67_sequenced_loops.raw.sv" "${inc[@]}" "$design"
@@ -51,8 +51,8 @@ diff -u "$root/hdl-spike/expected/67_sequenced_loops.sv" \
     "$out/67_sequenced_loops.sv"
 
 # started next = firstDone | (~secondLast & started)
-[ "$(grep -c 'assign _GEN_0 = _GEN_15 | ~_GEN_20 & _GEN_17;' \
+[ "$(grep -c 'assign _GEN_0 = _GEN_16 | ~_GEN_21 & _GEN_18;' \
     "$out/67_sequenced_loops.sv")" = "2" ]
-[ "$(grep -c 'else if (_GEN_21)' "$out/67_sequenced_loops.sv")" = "2" ]
+[ "$(grep -c 'else if (_GEN_22)' "$out/67_sequenced_loops.sv")" = "2" ]
 
 echo "67_sequenced_loops: ok"

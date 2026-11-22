@@ -32,11 +32,11 @@ diff -u "$root/hdl-spike/expected/53_conditional_child.mlir" \
 # One instance per module, even though each branch ticks it.
 [[ "$(grep -c 'hw.instance "cell" @AccCell' "$out/53_conditional_child.mlir")" == 2 ]]
 grep -q 'hw.module @ConditionalTick' "$out/53_conditional_child.mlir"
-grep -q 'comb.mux %3, %b, %a : i8' "$out/53_conditional_child.mlir"
+grep -q 'comb.mux %5, %b, %a : i8' "$out/53_conditional_child.mlir"
 grep -q 'comb.mux %sel, %cell.out, %c0_i8 : i8' \
     "$out/53_conditional_child.mlir"
-grep -q 'comb.and %3, %sel_b : i1' "$out/53_conditional_child.mlir"
-grep -q 'comb.mux %9, %c, %5 : i8' "$out/53_conditional_child.mlir"
+grep -q 'comb.and %4, %sel_b : i1' "$out/53_conditional_child.mlir"
+grep -q 'comb.mux %10, %c, %6 : i8' "$out/53_conditional_child.mlir"
 
 "$MOJO" build --emit=sv -o "$out/53_conditional_child.raw.sv" "${inc[@]}" \
     "$root/hdl-spike/designs/53_conditional_child.mojo"
