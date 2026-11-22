@@ -1310,15 +1310,37 @@ LogicalResult CirctModuleEmitter::emitStructMethod(Operation *op,
 
     Operation *cloned = inner.clone();
     scratch.push_back(cloned);
-    for (unsigned i = 0; i < cloned->getNumOperands(); ++i) {
-      auto value = subst.find(cloned->getOperand(i));
-      if (value == subst.end()) {
-        inner.emitError()
-            << "HDL lowering: struct method operand was not lowered";
-        cleanup();
-        return failure();
+    // Substitute operands throughout the cloned body, including nested
+    // regions (for example an `hlcf.if` inside the method). Values defined
+    // inside the clone stay bound to their cloned definitions.
+    bool substituted = true;
+    cloned->walk([&](Operation *nested) {
+      if (!substituted)
+        return;
+      for (unsigned i = 0; i < nested->getNumOperands(); ++i) {
+        Value operand = nested->getOperand(i);
+        if (Operation *defining = operand.getDefiningOp()) {
+          if (defining == cloned || cloned->isProperAncestor(defining))
+            continue;
+        } else if (auto argument = dyn_cast<BlockArgument>(operand)) {
+          Operation *parent = argument.getOwner()->getParentOp();
+          if (parent == cloned ||
+              (parent && cloned->isProperAncestor(parent)))
+            continue;
+        }
+        auto value = subst.find(operand);
+        if (value == subst.end()) {
+          substituted = false;
+          return;
+        }
+        nested->setOperand(i, value->second);
       }
-      cloned->setOperand(i, value->second);
+    });
+    if (!substituted) {
+      inner.emitError()
+          << "HDL lowering: struct method operand was not lowered";
+      cleanup();
+      return failure();
     }
     if (failed(emitOp(cloned, condition, returnValue))) {
       cleanup();
@@ -1795,24 +1817,24 @@ CirctModuleEmitter::collectLoopCarriedSlots(Block &block,
         return;
       Value calleeSelf = methodBody.getArgument(0);
       Value callerSelf = op->getOperand(0);
-      for (Operation &inner : methodBody.getOperations()) {
-        StringRef innerName = inner.getName().getStringRef();
-        if (innerName == "kgen.struct.gep" && inner.getNumOperands() == 1) {
-          Value base = inner.getOperand(0);
+      methodBody.walk([&](Operation *inner) {
+        StringRef innerName = inner->getName().getStringRef();
+        if (innerName == "kgen.struct.gep" && inner->getNumOperands() == 1) {
+          Value base = inner->getOperand(0);
           if (base == calleeSelf)
             base = callerSelf;
-          if (auto index = inner.getAttrOfType<IntegerAttr>("index"))
+          if (auto index = inner->getAttrOfType<IntegerAttr>("index"))
             if (auto path = resolveStructFieldPath(base, index.getInt()))
-              structFieldPaths[inner.getResult(0)] = *path;
-          continue;
+              structFieldPaths[inner->getResult(0)] = *path;
+          return;
         }
-        if (innerName == "pop.store" && inner.getNumOperands() == 2) {
-          addPointer(inner.getOperand(1), calleeSelf, callerSelf);
-          continue;
+        if (innerName == "pop.store" && inner->getNumOperands() == 2) {
+          addPointer(inner->getOperand(1), calleeSelf, callerSelf);
+          return;
         }
-        if (innerName != "kgen.call" || inner.getNumOperands() < 2)
-          continue;
-        StringRef innerCallee = callCalleeName(&inner);
+        if (innerName != "kgen.call" || inner->getNumOperands() < 2)
+          return;
+        StringRef innerCallee = callCalleeName(inner);
         if ((innerCallee.contains("Bits::copy") ||
              innerCallee.contains("Bits::__init__") ||
              innerCallee.contains("Logic::copy") ||
@@ -1821,9 +1843,9 @@ CirctModuleEmitter::collectLoopCarriedSlots(Block &block,
              innerCallee.contains("Array::__init__") ||
              innerCallee.contains("Packed::copy") ||
              innerCallee.contains("Packed::__init__")))
-          addPointer(inner.getOperand(inner.getNumOperands() - 1),
+          addPointer(inner->getOperand(inner->getNumOperands() - 1),
                      calleeSelf, callerSelf);
-      }
+      });
     }
   };
   // Register every GEP chain first, so a nested field store can resolve its
@@ -1984,7 +2006,12 @@ LogicalResult CirctModuleEmitter::emitStructConstructor(Operation *op,
   // fields get values directly instead of a lazy init on the root slot.
   if (structFieldPaths.count(dest))
     return emitStructMethod(op, callee, condition, returnValue);
-  SmallVector<std::pair<unsigned, Value>> inits;
+  struct CtorInit {
+    unsigned field;
+    Value source;
+    unsigned width;
+  };
+  SmallVector<CtorInit> inits;
   bool forceInline = false;
   auto isPayloadCopy = [](StringRef name) {
     return name.contains("Bits::copy") || name.contains("Bits::__init__") ||
@@ -1997,7 +2024,7 @@ LogicalResult CirctModuleEmitter::emitStructConstructor(Operation *op,
     if (name == "pop.store" && o.getNumOperands() == 2) {
       auto field = fieldOf.find(o.getOperand(1));
       if (field != fieldOf.end())
-        inits.push_back({field->second, o.getOperand(0)});
+        inits.push_back({field->second, o.getOperand(0), 0});
       else if (Operation *target = o.getOperand(1).getDefiningOp();
                target &&
                target->getName().getStringRef() == "kgen.struct.gep")
@@ -2023,7 +2050,10 @@ LogicalResult CirctModuleEmitter::emitStructConstructor(Operation *op,
         forceInline = true;
       continue;
     }
-    inits.push_back({field->second, o.getOperand(0)});
+    unsigned width = 0;
+    if (inner.contains("Bits::__init__") || inner.contains("Logic::__init__"))
+      width = getCallParamWidth(&o, &bindings);
+    inits.push_back({field->second, o.getOperand(0), width});
   }
   // A constructor that computes field values is inlined like a method. The
   // simple path only records direct argument/constant copies, which the
@@ -2038,12 +2068,12 @@ LogicalResult CirctModuleEmitter::emitStructConstructor(Operation *op,
     return false;
   };
   bool computed = inits.empty() || forceInline;
-  for (auto &[field, source] : inits)
+  for (auto &[field, source, width] : inits)
     if (!isSimpleInitializer(source))
       computed = true;
   if (computed)
     return emitStructMethod(op, callee, condition, returnValue);
-  for (auto &[field, source] : inits) {
+  for (auto &[field, source, width] : inits) {
     Value value;
     Value xz;
     unsigned argumentIndex = ~0u;
@@ -2065,8 +2095,12 @@ LogicalResult CirctModuleEmitter::emitStructConstructor(Operation *op,
         value = getValue(argument);
       }
     } else if (Operation *defining = source.getDefiningOp()) {
-      if (auto constant = getConstantInt(defining, &bindings))
-        value = hw::ConstantOp::create(builder, loc, *constant);
+      if (auto constant = getConstantInt(defining, &bindings)) {
+        llvm::APInt bits = *constant;
+        if (width && bits.getBitWidth() != width)
+          bits = bits.zextOrTrunc(width);
+        value = hw::ConstantOp::create(builder, loc, bits);
+      }
     }
     if (!value)
       return op->emitError()
@@ -2993,6 +3027,15 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
   if (name == "kgen.call") {
     StringRef callee = callCalleeName(op);
     StringRef userCallName = callee.split('(').first;
+    if (!userCallName.contains("hdl::") && !userCallName.contains("std::") &&
+        userCallName.ends_with("::__init__") && op->getNumOperands() >= 2) {
+      // A constructor of a struct local: dispatch before the generic binary
+      // call path, which would treat a two-operand constructor as arithmetic.
+      Value destination = op->getOperand(op->getNumOperands() - 1);
+      if (llvm::is_contained(stackSlots, destination) ||
+          structFieldPaths.count(destination))
+        return emitStructConstructor(op, callee, condition, returnValue);
+    }
     if (!userCallName.contains("hdl::") && !userCallName.contains("std::") &&
         !userCallName.ends_with("::__init__") &&
         !userCallName.ends_with("::__copyinit__") &&
