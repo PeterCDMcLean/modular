@@ -781,6 +781,11 @@ private:
   SmallVector<Value> &getOrCreateArrayStorage(unsigned fieldIndex);
   Value getOrCreateHLMem(unsigned fieldIndex);
   Value getOrCreateArrayRam(unsigned fieldIndex);
+  /// Fill per-entry reset and power-on values for a memory field. Returns true
+  /// when any value is nonzero (and therefore needs explicit initialization).
+  bool collectMemoryInit(unsigned fieldIndex, unsigned width, unsigned depth,
+                         SmallVectorImpl<llvm::APInt> &reset,
+                         SmallVectorImpl<llvm::APInt> &poweron);
   Value createRegister(unsigned id, Type type, llvm::APInt resetValue,
                         llvm::APInt initialValue, int style);
 
@@ -1146,11 +1151,18 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
         continue;
 
       StringRef callee = callCalleeName(&op);
+      // `Ram` and `ArrayRam` forward their constructors to an inner `Mem`, but
+      // the module-level `__init__` only shows the outer call.
+      auto isMemoryInit = [](StringRef name) {
+        return (name.contains("Mem::__init__") ||
+                name.contains("Ram::__init__") ||
+                name.contains("ArrayRam::__init__")) &&
+               !name.contains("__init__(move:");
+      };
       if (!callee.contains("Bits::__init__") &&
           !callee.contains("Logic::__init__") &&
           !callee.contains("Reg::__init__") &&
-          !callee.contains("Packed::__init__") &&
-          !callee.contains("Mem::__init__"))
+          !callee.contains("Packed::__init__") && !isMemoryInit(callee))
         continue;
       // A packed constructor writes its integer constant through a
       // destination pointer; remember it so a following `Reg[Packed]`
@@ -1166,8 +1178,7 @@ LogicalResult CirctModuleEmitter::collectResetValues() {
       // A memory constructor can carry one constant per entry. The variadic
       // form builds a VariadicList over a `pop.array.create` whose elements
       // are pointers to stored constants.
-      if (callee.contains("Mem::__init__") &&
-          !callee.contains("__init__(move:")) {
+      if (isMemoryInit(callee)) {
         Value dest = op.getOperand(op.getNumOperands() - 1);
         auto field = fieldIndexes.find(dest);
         if (field == fieldIndexes.end())
@@ -1549,6 +1560,31 @@ CirctModuleEmitter::getOrCreateArrayStorage(unsigned fieldIndex) {
   return regs;
 }
 
+bool CirctModuleEmitter::collectMemoryInit(
+    unsigned fieldIndex, unsigned width, unsigned depth,
+    SmallVectorImpl<llvm::APInt> &reset,
+    SmallVectorImpl<llvm::APInt> &poweron) {
+  reset.assign(depth, llvm::APInt(width, 0));
+  auto sequence = arrayResetSequences.find(fieldIndex);
+  auto fill = resetValues.find(fieldIndex);
+  for (unsigned k = 0; k < depth; ++k) {
+    if (sequence != arrayResetSequences.end() && k < sequence->second.size())
+      reset[k] = sequence->second[k].zextOrTrunc(width);
+    else if (fill != resetValues.end())
+      reset[k] = fill->second.zextOrTrunc(width);
+  }
+  poweron.assign(reset.begin(), reset.end());
+  bool nonzero = false;
+  if (powerOnValue) {
+    for (unsigned k = 0; k < depth; ++k)
+      poweron[k] = powerOnValue->zextOrTrunc(width);
+    nonzero = !powerOnValue->isZero();
+  }
+  for (const llvm::APInt &value : reset)
+    nonzero |= !value.isZero();
+  return nonzero;
+}
+
 Value CirctModuleEmitter::getOrCreateHLMem(unsigned fieldIndex) {
   auto found = hlMemOps.find(fieldIndex);
   if (found != hlMemOps.end())
@@ -1557,9 +1593,24 @@ Value CirctModuleEmitter::getOrCreateHLMem(unsigned fieldIndex) {
   unsigned depth = fieldArrayDepths[fieldIndex];
   auto elementType = IntegerType::get(builder.getContext(), width);
   auto name = "ram_" + std::to_string(fieldIndex);
+  Value reset = (resetStyle & 1) ? bitNot(resetSignal) : resetSignal;
   auto memOp = seq::HLMemOp::create(
-      builder, loc, clk, resetSignal, name,
+      builder, loc, clk, reset, name,
       llvm::SmallVector<int64_t>{static_cast<int64_t>(depth)}, elementType);
+  SmallVector<llvm::APInt> resetBits, powerOnBits;
+  if (collectMemoryInit(fieldIndex, width, depth, resetBits, powerOnBits)) {
+    auto toAttr = [&](ArrayRef<llvm::APInt> values) {
+      SmallVector<Attribute> attrs;
+      for (const llvm::APInt &value : values)
+        attrs.push_back(IntegerAttr::get(elementType, value));
+      return ArrayAttr::get(builder.getContext(), attrs);
+    };
+    memOp->setAttr("hdl.reset", toAttr(resetBits));
+    memOp->setAttr("hdl.poweron", toAttr(powerOnBits));
+    if (resetStyle >= 2)
+      memOp->setAttr("hdl.reset_async",
+                     UnitAttr::get(builder.getContext()));
+  }
   hlMemOps[fieldIndex] = memOp.getHandle();
   return memOp.getHandle();
 }
@@ -1580,8 +1631,32 @@ Value CirctModuleEmitter::getOrCreateArrayRam(unsigned fieldIndex) {
   Value zeroArray = zeroArrayOp.getResult();
   auto name = StringAttr::get(
       builder.getContext(), "array_ram_" + std::to_string(fieldIndex));
-  auto reg = seq::FirRegOp::create(builder, loc, zeroArray, clk, name,
-                                   hw::InnerSymAttr(), Attribute{});
+
+  SmallVector<llvm::APInt> resetBits, powerOnBits;
+  bool initialized =
+      collectMemoryInit(fieldIndex, width, depth, resetBits, powerOnBits);
+  seq::FirRegOp reg;
+  if (initialized) {
+    SmallVector<Value> resetElements;
+    for (unsigned k = 0; k < depth; ++k)
+      resetElements.push_back(
+          hw::ConstantOp::create(builder, loc, resetBits[k]));
+    ValueRange resetInputs(resetElements);
+    Value resetArray =
+        hw::ArrayCreateOp::create(builder, loc, resetInputs).getResult();
+    llvm::APInt preset(depth * width, 0);
+    for (unsigned k = 0; k < depth; ++k)
+      preset.insertBits(powerOnBits[k], k * width);
+    auto presetAttr = IntegerAttr::get(
+        IntegerType::get(builder.getContext(), depth * width), preset);
+    Value reset = (resetStyle & 1) ? bitNot(resetSignal) : resetSignal;
+    reg = seq::FirRegOp::create(builder, loc, zeroArray, clk, name, reset,
+                                resetArray, hw::InnerSymAttr(),
+                                /*isAsync=*/resetStyle >= 2, presetAttr);
+  } else {
+    reg = seq::FirRegOp::create(builder, loc, zeroArray, clk, name,
+                                hw::InnerSymAttr(), Attribute{});
+  }
   Value value = reg.getResult();
   reg->setOperand(0, value);
   arrayRamRegs[fieldIndex] = value;
@@ -4072,17 +4147,63 @@ LogicalResult lowerHDLArrayRegToSV(ModuleOp module) {
         sv::VarOp::create(rewriter, reg.getLoc(), memType,
                           rewriter.getStringAttr(reg.getName()))
             .getResult();
+    unsigned depth = arrayType.getNumElements();
+    unsigned width = arrayType.getElementType().getIntOrFloatBitWidth();
+    auto indexType = IntegerType::get(
+        module.getContext(), std::max(1U, llvm::Log2_64_Ceil(depth)));
+    auto indexConstant = [&](unsigned index) -> Value {
+      return hw::ConstantOp::create(rewriter, reg.getLoc(), indexType, index);
+    };
+    auto assignElement = [&](Value memory, Value index, Value value,
+                             bool blocking = false) {
+      Value memLoc = sv::ArrayIndexInOutOp::create(
+          rewriter, reg.getLoc(), memory, index);
+      if (blocking)
+        sv::BPAssignOp::create(rewriter, reg.getLoc(), memLoc, value);
+      else
+        sv::PAssignOp::create(rewriter, reg.getLoc(), memLoc, value);
+    };
+
+    // Power-on contents from the register preset (`PowerOn` or constructor
+    // fill). Individual entries are unpacked from the packed APInt.
+    if (IntegerAttr preset = reg.getPresetAttr()) {
+      llvm::APInt bits = preset.getValue();
+      sv::InitialOp::create(rewriter, reg.getLoc(), [&] {
+        for (unsigned k = 0; k < depth; ++k) {
+          Value value = hw::ConstantOp::create(
+              rewriter, reg.getLoc(), bits.extractBits(width, k * width));
+          assignElement(svMem, indexConstant(k), value, /*blocking=*/true);
+        }
+      });
+    }
+
+    // Reset contents from the array-typed reset value.
+    SmallVector<Value> resetValues;
+    if (Value resetValue = reg.getResetValue())
+      if (auto create = resetValue.getDefiningOp<hw::ArrayCreateOp>())
+        llvm::append_range(resetValues, create.getInputs());
+
     Value hwClk = seq::FromClockOp::create(rewriter, reg.getLoc(),
                                            reg.getClk());
-    sv::AlwaysFFOp::create(
-        rewriter, reg.getLoc(), sv::EventControl::AtPosEdge, hwClk, [&] {
-          sv::IfOp::create(rewriter, reg.getLoc(), mux.getCond(), [&] {
-            Value memLoc = sv::ArrayIndexInOutOp::create(
-                rewriter, reg.getLoc(), svMem, inject.getIndex());
-            sv::PAssignOp::create(rewriter, reg.getLoc(), memLoc,
-                                  inject.getElement());
-          });
-        });
+    auto body = [&] {
+      sv::IfOp::create(rewriter, reg.getLoc(), mux.getCond(), [&] {
+        assignElement(svMem, inject.getIndex(), inject.getElement());
+      });
+    };
+    if (Value reset = reg.getReset()) {
+      auto resetBody = [&] {
+        for (unsigned k = 0; k < resetValues.size(); ++k)
+          assignElement(svMem, indexConstant(k), resetValues[k]);
+      };
+      sv::AlwaysFFOp::create(
+          rewriter, reg.getLoc(), sv::EventControl::AtPosEdge, hwClk,
+          reg.getIsAsync() ? sv::ResetType::AsyncReset
+                           : sv::ResetType::SyncReset,
+          sv::EventControl::AtPosEdge, reset, body, resetBody);
+    } else {
+      sv::AlwaysFFOp::create(rewriter, reg.getLoc(),
+                             sv::EventControl::AtPosEdge, hwClk, body);
+    }
 
     rewriter.setInsertionPointAfter(get);
     Value memLoc = sv::ArrayIndexInOutOp::create(
@@ -4164,19 +4285,62 @@ LogicalResult lowerHDLHLMemToSV(ModuleOp module) {
                           rewriter.getStringAttr(mem.getName()))
             .getResult();
 
+    unsigned addrWidth = std::max(1U, llvm::Log2_64_Ceil(depth));
+    auto indexType = IntegerType::get(module.getContext(), addrWidth);
+    auto assignElement = [&](Value index, Value value,
+                             bool blocking = false) {
+      Value memLoc = sv::ArrayIndexInOutOp::create(
+          rewriter, mem.getLoc(), svMem, index);
+      if (blocking)
+        sv::BPAssignOp::create(rewriter, mem.getLoc(), memLoc, value);
+      else
+        sv::PAssignOp::create(rewriter, mem.getLoc(), memLoc, value);
+    };
+    auto emitAssignments = [&](ArrayAttr values) {
+      for (auto [k, attr] : llvm::enumerate(values)) {
+        Value index = hw::ConstantOp::create(
+            rewriter, mem.getLoc(), indexType, static_cast<unsigned>(k));
+        Value value = hw::ConstantOp::create(
+            rewriter, mem.getLoc(), cast<IntegerAttr>(attr).getValue());
+        assignElement(index, value);
+      }
+    };
+    auto emitInitialValues = [&](ArrayAttr values) {
+      for (auto [k, attr] : llvm::enumerate(values)) {
+        Value index = hw::ConstantOp::create(
+            rewriter, mem.getLoc(), indexType, static_cast<unsigned>(k));
+        Value value = hw::ConstantOp::create(
+            rewriter, mem.getLoc(), cast<IntegerAttr>(attr).getValue());
+        assignElement(index, value, /*blocking=*/true);
+      }
+    };
+    ArrayAttr powerOn = mem->getAttrOfType<ArrayAttr>("hdl.poweron");
+    ArrayAttr resetValues = mem->getAttrOfType<ArrayAttr>("hdl.reset");
+    if (powerOn) {
+      rewriter.setInsertionPoint(mem);
+      sv::InitialOp::create(rewriter, mem.getLoc(),
+                            [&] { emitInitialValues(powerOn); });
+    }
+
     Value hwClk = seq::FromClockOp::create(rewriter, mem.getLoc(), clk);
+    auto body = [&] {
+      for (WritePort &write : writes) {
+        sv::IfOp::create(rewriter, mem.getLoc(), write.enable, [&] {
+          Value memLoc = sv::ArrayIndexInOutOp::create(
+              rewriter, mem.getLoc(), svMem, write.address);
+          sv::PAssignOp::create(rewriter, mem.getLoc(), memLoc, write.data);
+        });
+      }
+    };
+    auto resetBody = [&] {
+      if (resetValues)
+        emitAssignments(resetValues);
+    };
+    bool asyncReset = mem->hasAttr("hdl.reset_async");
     sv::AlwaysFFOp::create(
         rewriter, mem.getLoc(), sv::EventControl::AtPosEdge, hwClk,
-        sv::ResetType::SyncReset, sv::EventControl::AtPosEdge, rst, [&] {
-          for (WritePort &write : writes) {
-            sv::IfOp::create(rewriter, mem.getLoc(), write.enable, [&] {
-              Value memLoc = sv::ArrayIndexInOutOp::create(
-                  rewriter, mem.getLoc(), svMem, write.address);
-              sv::PAssignOp::create(rewriter, mem.getLoc(), memLoc,
-                                    write.data);
-            });
-          }
-        });
+        asyncReset ? sv::ResetType::AsyncReset : sv::ResetType::SyncReset,
+        sv::EventControl::AtPosEdge, rst, body, resetBody);
 
     for (WritePort &write : writes)
       rewriter.eraseOp(write.op);
