@@ -2657,9 +2657,80 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       return success();
     }
 
-    if (hasBody(thenRegion)) {
+    bool hasThen = hasBody(thenRegion);
+    bool hasElse = hasBody(elseRegion);
+
+    // A runtime loop inside a branch is branch-local: its done pulse gates
+    // the rest of that branch and must not leak out of the `if`. Values of
+    // locals that existed before the `if` are merged at the join so a loop's
+    // carried result participates in the ordinary branch mux.
+    auto regionHasRuntimeLoop = [](Region &region) {
+      if (region.empty())
+        return false;
+      bool found = false;
+      region.front().walk([&](Operation *inner) {
+        if (inner->getName().getStringRef() == "hlcf.loop")
+          found = true;
+      });
+      return found;
+    };
+    bool mergeBranchValues =
+        regionHasRuntimeLoop(thenRegion) || regionHasRuntimeLoop(elseRegion);
+
+    SmallVector<Value> localSlots;
+    DenseMap<Value, Value> savedValues, thenValues, elseValues;
+    DenseMap<Value, LogicValue> savedLogic, thenLogic, elseLogic;
+    Value thenBranchCond;
+    Value elseBranchCond;
+    if (mergeBranchValues) {
+      localSlots = stackSlots;
+      for (Value slot : localSlots) {
+        if (auto it = values.find(slot); it != values.end())
+          savedValues[slot] = it->second;
+        if (auto it = logicValues.find(slot); it != logicValues.end())
+          savedLogic[slot] = it->second;
+      }
+      if (hasThen)
+        thenBranchCond = condition
+                             ? comb::AndOp::create(builder, loc, condition, cond)
+                             : cond;
+      if (hasElse) {
+        Value notCond = bitNot(cond);
+        elseBranchCond =
+            condition ? comb::AndOp::create(builder, loc, condition, notCond)
+                      : notCond;
+      }
+    }
+    auto captureLocals = [&](DenseMap<Value, Value> &outValues,
+                             DenseMap<Value, LogicValue> &outLogic) {
+      for (Value slot : localSlots) {
+        if (auto it = values.find(slot); it != values.end())
+          outValues[slot] = it->second;
+        if (auto it = logicValues.find(slot); it != logicValues.end())
+          outLogic[slot] = it->second;
+      }
+    };
+    auto restoreLocals = [&]() {
+      for (Value slot : localSlots) {
+        values.erase(slot);
+        logicValues.erase(slot);
+        if (auto it = savedValues.find(slot); it != savedValues.end())
+          values[slot] = it->second;
+        if (auto it = savedLogic.find(slot); it != savedLogic.end())
+          logicValues[slot] = it->second;
+      }
+    };
+
+    Value savedPendingDone = pendingLoopDone;
+    Value savedStartPulse = currentStartPulse;
+
+    if (hasThen) {
       Value thenCond =
-          condition ? comb::AndOp::create(builder, loc, condition, cond) : cond;
+          mergeBranchValues
+              ? thenBranchCond
+              : (condition
+                     ? comb::AndOp::create(builder, loc, condition, cond)
+                     : cond);
       branchPath.push_back({cond, true});
       if (inDynamicLoop)
         loopRelativeCondition = thenRelative;
@@ -2668,12 +2739,22 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       loopRelativeCondition = savedRelative;
       if (failed(result))
         return failure();
+      if (mergeBranchValues)
+        captureLocals(thenValues, thenLogic);
     }
-    if (hasBody(elseRegion)) {
-      Value notCond = bitNot(cond);
-      Value elseCond = condition
-                           ? comb::AndOp::create(builder, loc, condition, notCond)
-                           : notCond;
+    pendingLoopDone = savedPendingDone;
+    currentStartPulse = savedStartPulse;
+    if (mergeBranchValues)
+      restoreLocals();
+
+    if (hasElse) {
+      Value elseCond =
+          mergeBranchValues
+              ? elseBranchCond
+              : (condition
+                     ? comb::AndOp::create(
+                           builder, loc, condition, bitNot(cond))
+                     : bitNot(cond));
       branchPath.push_back({cond, false});
       if (inDynamicLoop)
         loopRelativeCondition = elseRelative;
@@ -2682,6 +2763,84 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       loopRelativeCondition = savedRelative;
       if (failed(result))
         return failure();
+      if (mergeBranchValues)
+        captureLocals(elseValues, elseLogic);
+    }
+    pendingLoopDone = savedPendingDone;
+    currentStartPulse = savedStartPulse;
+
+    if (mergeBranchValues) {
+      for (Value slot : localSlots) {
+        auto beforeV = savedValues.find(slot);
+        auto thenV = thenValues.find(slot);
+        auto elseV = elseValues.find(slot);
+        auto beforeL = savedLogic.find(slot);
+        auto thenL = thenLogic.find(slot);
+        auto elseL = elseLogic.find(slot);
+        bool bitsChanged =
+            (hasThen && thenV != thenValues.end() &&
+             (beforeV == savedValues.end() ||
+              thenV->second != beforeV->second)) ||
+            (hasElse && elseV != elseValues.end() &&
+             (beforeV == savedValues.end() ||
+              elseV->second != beforeV->second));
+        bool logicChanged =
+            (hasThen && thenL != thenLogic.end() &&
+             (beforeL == savedLogic.end() ||
+              thenL->second.val != beforeL->second.val ||
+              thenL->second.xz != beforeL->second.xz)) ||
+            (hasElse && elseL != elseLogic.end() &&
+             (beforeL == savedLogic.end() ||
+              elseL->second.val != beforeL->second.val ||
+              elseL->second.xz != beforeL->second.xz));
+        if (logicChanged) {
+          LogicValue merged;
+          if (beforeL != savedLogic.end())
+            merged = beforeL->second;
+          if (hasElse && elseL != elseLogic.end()) {
+            merged.val =
+                merged.val ? comb::MuxOp::create(builder, loc, elseBranchCond,
+                                                 elseL->second.val, merged.val)
+                           : elseL->second.val;
+            merged.xz =
+                merged.xz ? comb::MuxOp::create(builder, loc, elseBranchCond,
+                                                elseL->second.xz, merged.xz)
+                          : elseL->second.xz;
+          }
+          if (hasThen && thenL != thenLogic.end()) {
+            merged.val =
+                merged.val ? comb::MuxOp::create(builder, loc, thenBranchCond,
+                                                 thenL->second.val, merged.val)
+                           : thenL->second.val;
+            merged.xz =
+                merged.xz ? comb::MuxOp::create(builder, loc, thenBranchCond,
+                                                thenL->second.xz, merged.xz)
+                          : thenL->second.xz;
+          }
+          logicValues[slot] = merged;
+          values[slot] = merged.val;
+          continue;
+        }
+        if (!bitsChanged)
+          continue;
+        Value merged;
+        if (beforeV != savedValues.end())
+          merged = beforeV->second;
+        if (hasElse && elseV != elseValues.end())
+          merged =
+              merged ? comb::MuxOp::create(builder, loc, elseBranchCond,
+                                           elseV->second, merged)
+                     : elseV->second;
+        if (hasThen && thenV != thenValues.end())
+          merged =
+              merged ? comb::MuxOp::create(builder, loc, thenBranchCond,
+                                           thenV->second, merged)
+                     : thenV->second;
+        if (merged)
+          values[slot] = merged;
+        else
+          values.erase(slot);
+      }
     }
     return success();
   }
@@ -5184,14 +5343,20 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
     boundValue = comb::ConcatOp::create(
         builder, loc, ArrayRef<Value>{zeros, boundValue});
   }
+  // A loop inside a conditional branch only runs while that branch is
+  // active. Gate its control (counter, break, done) by the branch condition.
+  Value loopEnabled = active;
+  if (!sequenced && outerCondition)
+    loopEnabled =
+        comb::AndOp::create(builder, loc, outerCondition, active);
   Value breakNow =
       dynamicBreakCond
-          ? comb::AndOp::create(builder, loc, active, dynamicBreakCond)
+          ? comb::AndOp::create(builder, loc, loopEnabled, dynamicBreakCond)
           : Value();
   Value atEnd = comb::ICmpOp::create(
       builder, loc, comb::ICmpPredicate::eq, incremented, boundValue);
   Value inRangeLast = comb::AndOp::create(
-      builder, loc, childLoopRan ? childLoopLast : active, atEnd);
+      builder, loc, childLoopRan ? childLoopLast : loopEnabled, atEnd);
   Value last = breakNow ? comb::OrOp::create(builder, loc, inRangeLast, breakNow)
                         : inRangeLast;
   Value step =
@@ -5205,7 +5370,7 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
                 builder, loc, childLoopLast,
                 comb::MuxOp::create(builder, loc, last, zero, incremented),
                 breakNow ? zero : counter)
-          : comb::MuxOp::create(builder, loc, active, step, idle);
+          : comb::MuxOp::create(builder, loc, loopEnabled, step, idle);
   if (auto reg = counter.getDefiningOp<seq::CompRegOp>())
     reg->setOperand(0, next);
   else if (auto reg = counter.getDefiningOp<seq::FirRegOp>())
@@ -5244,6 +5409,9 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
             : (started ? comb::MuxOp::create(builder, loc, started,
                                              runningBase, getConstant(false))
                        : runningBase);
+    if (!sequenced && condition)
+      runningNext = comb::MuxOp::create(builder, loc, condition, runningNext,
+                                        getConstant(false));
     if (failed(setRegNext(running, runningNext)))
       return loop->emitError()
              << "HDL lowering: unsupported running register form";
@@ -5282,7 +5450,7 @@ LogicalResult CirctModuleEmitter::emitDynamicLoop(Operation *loop,
     }
     sequence = SequenceState();
   }
-  if (loopStack.empty() && branchPath.empty())
+  if (loopStack.empty())
     pendingLoopDone = done;
   return success();
 }
@@ -5556,14 +5724,19 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
   Value one = hw::ConstantOp::create(builder, loc, counterType, 1);
   Value incremented = comb::AddOp::create(builder, loc, counter, one);
   Value zero = hw::ConstantOp::create(builder, loc, counterType, 0);
+  // A loop inside a conditional branch only runs while that branch is
+  // active. Gate its control (counter, break, done) by the branch condition.
+  Value loopEnabled = active;
+  if (!sequenced && condition)
+    loopEnabled = comb::AndOp::create(builder, loc, condition, active);
   Value breakNow =
       dynamicBreakCond
-          ? comb::AndOp::create(builder, loc, active, dynamicBreakCond)
+          ? comb::AndOp::create(builder, loc, loopEnabled, dynamicBreakCond)
           : Value();
   Value atEnd = comb::ICmpOp::create(
       builder, loc, comb::ICmpPredicate::eq, incremented, boundValue);
   Value inRangeLast = comb::AndOp::create(
-      builder, loc, childLoopRan ? childLoopLast : active, atEnd);
+      builder, loc, childLoopRan ? childLoopLast : loopEnabled, atEnd);
   Value last = breakNow ? comb::OrOp::create(builder, loc, inRangeLast, breakNow)
                         : inRangeLast;
   Value step =
@@ -5577,7 +5750,7 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
                 builder, loc, childLoopLast,
                 comb::MuxOp::create(builder, loc, last, zero, incremented),
                 breakNow ? zero : counter)
-          : comb::MuxOp::create(builder, loc, active, step, idle);
+          : comb::MuxOp::create(builder, loc, loopEnabled, step, idle);
   if (auto reg = counter.getDefiningOp<seq::CompRegOp>())
     reg->setOperand(0, next);
   else if (auto reg = counter.getDefiningOp<seq::FirRegOp>())
@@ -5615,6 +5788,9 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
             : (started ? comb::MuxOp::create(builder, loc, started,
                                              runningBase, getConstant(false))
                        : runningBase);
+    if (!sequenced && condition)
+      runningNext = comb::MuxOp::create(builder, loc, condition, runningNext,
+                                        getConstant(false));
     if (failed(setRegNext(running, runningNext)))
       return loop->emitError()
              << "HDL lowering: unsupported running register form";
@@ -5653,7 +5829,7 @@ LogicalResult CirctModuleEmitter::emitRuntimeRangeLoop(
     }
     sequence = SequenceState();
   }
-  if (loopStack.empty() && branchPath.empty())
+  if (loopStack.empty())
     pendingLoopDone = done;
   return success();
 }
