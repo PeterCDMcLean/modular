@@ -1,7 +1,8 @@
 """Direct array element assignment: mem[i] = Reg[T](value)."""
 
-from hdl import Bits, Logic, Reg
-from std.collections import Array
+
+
+from hdl import Bits, Logic, Reg, Array
 
 
 @module

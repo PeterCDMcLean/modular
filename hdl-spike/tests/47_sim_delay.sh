@@ -29,5 +29,7 @@ fi
 grep -q '^c0 1 0$' "$out/12_sim_delay.txt"
 grep -q '^c1 2 1$' "$out/12_sim_delay.txt"
 grep -q '^c2 3 2$' "$out/12_sim_delay.txt"
+grep -q '^a0 1 0 1 0$' "$out/12_sim_delay.txt"
+grep -q '^a1 2 1 2 1$' "$out/12_sim_delay.txt"
 
 echo "47_sim_delay: ok"
