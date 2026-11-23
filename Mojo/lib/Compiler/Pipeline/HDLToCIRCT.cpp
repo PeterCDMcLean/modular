@@ -52,6 +52,7 @@
 #include "Mojo/KGENDialect/KGENAttrs.h"
 #include "Mojo/KGENDialect/KGENDialect.h"
 #include "Mojo/KGENDialect/KGENOps.h"
+#include "Mojo/Interpreter/InterpreterAttrs.h"
 #include "Mojo/KGENDialect/KGENTypes.h"
 #include "Mojo/LITDialect/LITDialect.h"
 #include "Mojo/LITDialect/LITOps.h"
@@ -736,7 +737,8 @@ static bool isSimpleParametricStruct(ModuleOp source, StringRef name,
                                      ArrayAttr modules);
 static std::optional<std::string>
 emitParamFunctionText(ModuleOp source, StringRef symbol,
-                      ArrayRef<std::string> arguments, std::string &svName);
+                      ArrayRef<std::string> arguments, std::string &svName,
+                      std::set<std::string> &helperTexts);
 
 /// Emits one `hw.module` per `@module` struct by building real CIRCT ops.
 class CirctModuleEmitter {
@@ -893,6 +895,7 @@ private:
   DenseMap<Value, SmallVector<std::pair<unsigned, StructFieldInit>>>
       structFieldInits;
   std::optional<std::string> getParamOperandText(TypedAttr attr);
+  std::optional<std::string> getParamStructText(TypedAttr value, bool packed);
   std::optional<TypedAttr> getPortWidthAttr(TypedAttr attr);
   Type getPortType(Type sourceType, bool &isLogic);
   Value getStructFieldSlot(Operation *gep, Value root,
@@ -1081,6 +1084,62 @@ private:
   hw::HWModuleOp builtModule;
 };
 
+static unsigned paramFieldBits(Type type) {
+  unsigned width = getBitWidth(type);
+  return width ? width : 64;
+}
+
+static std::string paramStructName(ArrayRef<Type> elements) {
+  std::string name = "hdl_param_struct";
+  for (Type element : elements)
+    name += "_" + std::to_string(paramFieldBits(element));
+  return name;
+}
+
+static std::string paramStructTypedef(ArrayRef<Type> elements,
+                                      const std::string &name, bool packed) {
+  std::string text = packed ? "typedef struct packed {\n"
+                            : "typedef struct {\n";
+  for (size_t i = elements.size(); i-- > 0;) {
+    unsigned width = paramFieldBits(elements[i]);
+    auto simd = dyn_cast<KGEN::SIMDType>(elements[i]);
+    if (width == 64 && simd && simd.isScalar())
+      text += "  integer f" + std::to_string(i) + ";\n";
+    else if (width == 1)
+      text += "  logic f" + std::to_string(i) + ";\n";
+    else
+      text += "  logic [" + std::to_string(width - 1) + ":0] f" +
+              std::to_string(i) + ";\n";
+  }
+  text += "} " + name + ";\n";
+  return text;
+}
+
+/// Derive a readable struct name from the constructor operand of a parameter
+/// expression, e.g. `@"pkg::Limits::__init__(...)"` yields `Limits`.
+static std::string paramStructLeafName(TypedAttr constructor) {
+  if (!constructor)
+    return "";
+  std::string printed;
+  llvm::raw_string_ostream stream(printed);
+  constructor.print(stream);
+  auto at = printed.find("@\"");
+  if (at == std::string::npos)
+    return "";
+  auto end = printed.find('"', at + 2);
+  if (end == std::string::npos)
+    return "";
+  StringRef symbol(printed.data() + at + 2, end - at - 2);
+  StringRef base = symbol.split('(').first;
+  StringRef owner = base.rsplit("::").first;
+  StringRef leaf = owner.rsplit("::").second;
+  std::string name = leaf.str();
+  for (char &c : name)
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_')
+      c = '_';
+  return name;
+}
+
 std::optional<std::string>
 CirctModuleEmitter::getParamOperandText(TypedAttr attr) {
   if (!attr)
@@ -1103,7 +1162,50 @@ CirctModuleEmitter::getParamOperandText(TypedAttr attr) {
     return declRef.getName().getValue().str();
   if (auto verbatim = dyn_cast<hw::ParamVerbatimAttr>(attr))
     return verbatim.getValue().getValue().str();
+  // Struct-valued operand.  A memory-only struct is passed through stack
+  // memory (`#interp.store_to_mem`), while a register-passable one is an
+  // `apply` producing a struct value directly.
+  if (auto store = dyn_cast<StoreToMemAttr>(attr))
+    return getParamStructText(store.getValue(), /*packed=*/false);
+  if (isa<KGEN::ParamOperatorAttr>(attr))
+    if (isa<KGEN::StructType>(attr.getType()))
+      return getParamStructText(attr, /*packed=*/true);
   return std::nullopt;
+}
+
+std::optional<std::string>
+CirctModuleEmitter::getParamStructText(TypedAttr value, bool packed) {
+  auto expr = dyn_cast<KGEN::ParamOperatorAttr>(value);
+  auto structType = dyn_cast<KGEN::StructType>(value.getType());
+  if (!expr || !structType ||
+      (expr.getOpcode() != KGEN::POC::Apply &&
+       expr.getOpcode() != KGEN::POC::ApplyResultSlot))
+    return std::nullopt;
+  auto elements = structType.getElementTypes();
+  if (!elements)
+    return std::nullopt;
+  ArrayRef<TypedAttr> operands = expr.getOperands();
+  SmallVector<std::string> fields;
+  for (TypedAttr operand : operands.drop_front()) {
+    auto text = getParamOperandText(operand);
+    if (!text)
+      return std::nullopt;
+    fields.push_back(*text);
+  }
+  if (fields.size() != elements->size())
+    return std::nullopt;
+  std::string name = "hdl_" + paramStructLeafName(operands.front());
+  if (name == "hdl_")
+    name = paramStructName(*elements);
+  paramHelperTexts.insert(paramStructTypedef(*elements, name, packed));
+  std::string literal = name + "'{";
+  for (unsigned i = 0; i < fields.size(); ++i) {
+    if (i)
+      literal += ", ";
+    literal += "f" + std::to_string(i) + ": " + fields[i];
+  }
+  literal += "}";
+  return literal;
 }
 
 std::optional<TypedAttr>
@@ -1163,8 +1265,8 @@ CirctModuleEmitter::getPortWidthAttr(TypedAttr attr) {
           arguments.size() == expr.getOperands().size() - 1) {
         StringRef symbol = StringRef(callee).slice(at + 2, quote);
         std::string svName;
-        if (auto text =
-                emitParamFunctionText(source, symbol, arguments, svName)) {
+        if (auto text = emitParamFunctionText(source, symbol, arguments,
+                                             svName, paramHelperTexts)) {
           paramHelperTexts.insert(*text);
           std::string call = svName + "(";
           for (unsigned i = 0; i < arguments.size(); ++i) {
@@ -2218,9 +2320,23 @@ static Operation *findFunctionInModule(ModuleOp source, StringRef name) {
   return result;
 }
 
+/// Return the struct type name used in a literal argument such as
+/// `hdl_Limits'{f0: 16, f1: 64}`, falling back to a layout-derived name.
+static std::string paramStructArgName(StringRef argument,
+                                      ArrayRef<Type> elements) {
+  auto literal = argument.find("'{");
+  if (literal != StringRef::npos) {
+    StringRef name = argument.take_front(literal);
+    if (!name.empty())
+      return name.str();
+  }
+  return paramStructName(elements);
+}
+
 static std::optional<std::string>
 emitParamFunctionText(ModuleOp source, StringRef symbol,
-                      ArrayRef<std::string> arguments, std::string &svName) {
+                      ArrayRef<std::string> arguments, std::string &svName,
+                      std::set<std::string> &helperTexts) {
   Operation *fn = findFunctionInModule(source, symbol);
   if (!fn || fn->getNumRegions() == 0 || fn->getRegion(0).empty())
     return std::nullopt;
@@ -2235,14 +2351,34 @@ emitParamFunctionText(ModuleOp source, StringRef symbol,
   svName = "hdl_" + leaf.str();
 
   DenseMap<Value, std::string> values;
-  for (unsigned i = 0; i < arguments.size(); ++i)
-    values[body.getArgument(i)] = "a" + std::to_string(i);
+  DenseMap<Value, std::string> structArgs;
+  DenseMap<Value, std::string> fieldPointers;
+  SmallVector<std::string> argTypes;
+  for (unsigned i = 0; i < arguments.size(); ++i) {
+    Value arg = body.getArgument(i);
+    values[arg] = "a" + std::to_string(i);
+    Type type = arg.getType();
+    bool byValue = false;
+    if (auto pointer = dyn_cast<KGEN::PointerType>(type))
+      type = pointer.getElementType();
+    else
+      byValue = true;
+    if (auto structType = dyn_cast<KGEN::StructType>(type))
+      if (auto elements = structType.getElementTypes()) {
+        std::string name = paramStructArgName(arguments[i], *elements);
+        helperTexts.insert(paramStructTypedef(*elements, name, byValue));
+        argTypes.push_back(name);
+        structArgs[arg] = "a" + std::to_string(i);
+        continue;
+      }
+    argTypes.push_back("integer");
+  }
 
   std::string text = "function automatic integer " + svName + "(";
   for (unsigned i = 0; i < arguments.size(); ++i) {
     if (i)
       text += ", ";
-    text += "input integer a" + std::to_string(i);
+    text += "input " + argTypes[i] + " a" + std::to_string(i);
   }
   text += ");\n";
 
@@ -2292,6 +2428,31 @@ emitParamFunctionText(ModuleOp source, StringRef symbol,
             return false;
         }
         text += pad(indent) + "end\n";
+        continue;
+      }
+      if (name == "kgen.struct.gep" && op.getNumOperands() == 1) {
+        auto base = structArgs.find(op.getOperand(0));
+        auto index = op.getAttrOfType<IntegerAttr>("index");
+        if (base == structArgs.end() || !index)
+          return false;
+        fieldPointers[op.getResult(0)] =
+            base->second + ".f" + std::to_string(index.getInt());
+        continue;
+      }
+      if (name == "kgen.struct.extract" && op.getNumOperands() == 1) {
+        auto base = structArgs.find(op.getOperand(0));
+        auto index = op.getAttrOfType<IntegerAttr>("index");
+        if (base == structArgs.end() || !index)
+          return false;
+        values[op.getResult(0)] =
+            base->second + ".f" + std::to_string(index.getInt());
+        continue;
+      }
+      if (name == "pop.load" && op.getNumOperands() == 1) {
+        auto field = fieldPointers.find(op.getOperand(0));
+        if (field == fieldPointers.end())
+          return false;
+        values[op.getResult(0)] = field->second;
         continue;
       }
       if (name == "kgen.param.constant" || name == "pop.constant") {
@@ -7383,9 +7544,17 @@ LogicalResult exportHDLSystemVerilog(ModuleOp module, raw_ostream &os) {
             "  return (a < b) ? a : b;\n"
             "endfunction\n";
   if (auto texts =
-          module->getAttrOfType<ArrayAttr>("hdl.param_helper_texts"))
-    for (Attribute attr : texts)
-      text += cast<StringAttr>(attr).getValue().str();
+          module->getAttrOfType<ArrayAttr>("hdl.param_helper_texts")) {
+    std::string typedefs, functions;
+    for (Attribute attr : texts) {
+      std::string helper = cast<StringAttr>(attr).getValue().str();
+      if (StringRef(helper).starts_with("typedef "))
+        typedefs += helper;
+      else
+        functions += helper;
+    }
+    text += typedefs + functions;
+  }
   if (!text.empty()) {
     OpBuilder builder(module.getContext());
     builder.setInsertionPointToStart(module.getBody());
