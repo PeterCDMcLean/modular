@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Parameters/generate: one generic module specialized at two widths.
+# Parameters/generate: one generic stateful module parameterized once.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -27,19 +27,27 @@ fi
 "$MOJO" build --emit=circt -o "$out/16_params.mlir" "${inc[@]}" \
     "$root/hdl-spike/designs/16_params.mojo"
 diff -u "$root/hdl-spike/expected/16_params.mlir" "$out/16_params.mlir"
-grep -q 'hw.module @ParamCounter_8' "$out/16_params.mlir"
-grep -q 'hw.module @ParamCounter_16' "$out/16_params.mlir"
-grep -q 'hw.instance "narrow" @ParamCounter_8' "$out/16_params.mlir"
-grep -q 'hw.instance "wide" @ParamCounter_16' "$out/16_params.mlir"
+# One generic module carries the parameter; its state uses symbolic widths.
+grep -q 'hw.module @ParamCounter<W: i32 = 8>' "$out/16_params.mlir"
+grep -q '!hw.int<#hw.param.decl.ref<"W">>' "$out/16_params.mlir"
+grep -q 'seq.compreg %1, %clk reset %rst, %W_1 : !hw.int<#hw.param.decl.ref<"W">>' \
+    "$out/16_params.mlir"
+grep -q 'comb.add %0, %W : !hw.int<#hw.param.decl.ref<"W">>' "$out/16_params.mlir"
+grep -q 'hw.instance "narrow" @ParamCounter<W: i32 = 8>' "$out/16_params.mlir"
+grep -q 'hw.instance "wide" @ParamCounter<W: i32 = 16>' "$out/16_params.mlir"
+! grep -q 'ParamCounter_8\|ParamCounter_16' "$out/16_params.mlir"
 
 "$MOJO" build --emit=sv -o "$out/16_params.raw.sv" "${inc[@]}" \
     "$root/hdl-spike/designs/16_params.mojo"
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' "$out/16_params.raw.sv" \
     | grep -v '^$' > "$out/16_params.sv"
 diff -u "$root/hdl-spike/expected/16_params.sv" "$out/16_params.sv"
-grep -q 'module ParamCounter_8' "$out/16_params.sv"
-grep -q 'module ParamCounter_16' "$out/16_params.sv"
-grep -q 'ParamCounter_8 narrow' "$out/16_params.sv"
-grep -q 'ParamCounter_16 wide' "$out/16_params.sv"
+grep -q '^module ParamCounter$' "$out/16_params.sv"
+grep -q '^  #(parameter W = 8) ($' "$out/16_params.sv"
+grep -q 'output wire \[W - 1:0\] out' "$out/16_params.sv"
+grep -q "_GEN_0 <= W'(0);" "$out/16_params.sv"
+grep -q "assign _GEN = _GEN_0 + W'(1);" "$out/16_params.sv"
+grep -q '^  ParamCounter narrow ($' "$out/16_params.sv"
+grep -q '^    .W(16)$' "$out/16_params.sv"
 
 echo "16_params: ok"

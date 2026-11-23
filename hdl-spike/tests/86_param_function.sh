@@ -33,7 +33,7 @@ diff -u "$root/hdl-spike/expected/86_param_function.mlir" \
 # The width expression is opaque parameter-time text, not a 2-state value.
 grep -q '#hw.param.verbatim<"hdl_max(W, 16)">' \
     "$out/86_param_function.mlir"
-grep -q 'hw.module @MaxWidth<W: i32>' "$out/86_param_function.mlir"
+grep -q 'hw.module @MaxWidth<W: i32 = 8>' "$out/86_param_function.mlir"
 
 "$MOJO" build --emit=sv -o "$out/86_param_function.raw.sv" "${inc[@]}" "$design"
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' \
@@ -48,7 +48,7 @@ grep -q 'function automatic integer hdl_max(input integer a, input integer b);' 
     "$out/86_param_function.sv"
 grep -q 'return (a > b) ? a : b;' "$out/86_param_function.sv"
 grep -q 'endfunction' "$out/86_param_function.sv"
-grep -q '#(parameter /\*integer\*/ W)' "$out/86_param_function.sv"
+grep -q '#(parameter W = 8)' "$out/86_param_function.sv"
 grep -q 'input  wire \[hdl_max(W, 16) - 1:0\] a' \
     "$out/86_param_function.sv"
 grep -q 'output wire \[hdl_max(W, 16) - 1:0\] out' \

@@ -8,7 +8,7 @@ function automatic integer hdl_clamp(input integer a0, input integer a1, input i
   return a0;
 endfunction
 module Clamped
-  #(parameter /*integer*/ W) (
+  #(parameter W = 8) (
   input  wire [hdl_clamp(W, 16, 64) - 1:0] a,
   output wire [hdl_clamp(W, 16, 64) - 1:0] out
 );

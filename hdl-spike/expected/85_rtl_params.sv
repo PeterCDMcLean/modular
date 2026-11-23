@@ -1,12 +1,12 @@
 module Passthrough
-  #(parameter /*integer*/ W) (
+  #(parameter W = 8) (
   input  wire [W - 1:0] a,
   output wire [W - 1:0] out
 );
   assign out = a;
 endmodule
 module Scaled
-  #(parameter /*integer*/ W) (
+  #(parameter W = 8) (
   input  wire [W:0] a,
   output wire [W:0] out
 );
@@ -18,9 +18,7 @@ module ScaledUsers(
   output wire [8:0]  run_small_out,
   output wire [16:0] run_large_out
 );
-  Scaled #(
-    .W(8)
-  ) small_0 (
+  Scaled small_0 (
     .a   (si),
     .out (run_small_out)
   );
@@ -37,9 +35,7 @@ module TwoWidths(
   output wire [7:0]  run_narrow_out,
   output wire [15:0] run_wide_out
 );
-  Passthrough #(
-    .W(8)
-  ) narrow (
+  Passthrough narrow (
     .a   (ni),
     .out (run_narrow_out)
   );

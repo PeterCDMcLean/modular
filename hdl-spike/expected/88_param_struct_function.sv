@@ -25,14 +25,14 @@ function automatic integer hdl_clamp_to(input integer a0, input hdl_Limits a1);
   return a0;
 endfunction
 module ClampedPacked
-  #(parameter /*integer*/ W) (
+  #(parameter W = 8) (
   input  wire [hdl_clamp_packed(W, hdl_PackedLimits'{f0: 4, f1: 32}) - 1:0] a,
   output wire [hdl_clamp_packed(W, hdl_PackedLimits'{f0: 4, f1: 32}) - 1:0] out
 );
   assign out = a;
 endmodule
 module ClampedUnpacked
-  #(parameter /*integer*/ W) (
+  #(parameter W = 8) (
   input  wire [hdl_clamp_to(W, hdl_Limits'{f0: 16, f1: 64}) - 1:0] a,
   output wire [hdl_clamp_to(W, hdl_Limits'{f0: 16, f1: 64}) - 1:0] out
 );

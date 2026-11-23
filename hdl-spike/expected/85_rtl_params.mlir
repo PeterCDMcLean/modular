@@ -1,7 +1,7 @@
-hw.module @Passthrough<W: i32>(in %a : !hw.int<#hw.param.decl.ref<"W">>, out out : !hw.int<#hw.param.decl.ref<"W">>) {
+hw.module @Passthrough<W: i32 = 8>(in %a : !hw.int<#hw.param.decl.ref<"W">>, out out : !hw.int<#hw.param.decl.ref<"W">>) {
   hw.output %a : !hw.int<#hw.param.decl.ref<"W">>
 }
-hw.module @Scaled<W: i32>(in %a : !hw.int<#hw.param.expr.add<#hw.param.decl.ref<"W">, 1>>, out out : !hw.int<#hw.param.expr.add<#hw.param.decl.ref<"W">, 1>>) {
+hw.module @Scaled<W: i32 = 8>(in %a : !hw.int<#hw.param.expr.add<#hw.param.decl.ref<"W">, 1>>, out out : !hw.int<#hw.param.expr.add<#hw.param.decl.ref<"W">, 1>>) {
   hw.output %a : !hw.int<#hw.param.expr.add<#hw.param.decl.ref<"W">, 1>>
 }
 hw.module @ScaledUsers(in %si : i9, in %li : i17, out run_small_out : i9, out run_large_out : i17) {

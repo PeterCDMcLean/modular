@@ -82,6 +82,7 @@ namespace {
 constexpr llvm::StringLiteral kHdlModulesAttr = "hdl_modules";
 constexpr llvm::StringLiteral kHdlReturnNamesAttr = "hdl_return_names";
 constexpr llvm::StringLiteral kHdlArgNamesAttr = "hdl_arg_names";
+constexpr llvm::StringLiteral kHdlParamDefaultsAttr = "hdl_param_defaults";
 constexpr llvm::StringLiteral kHdlModuleMarker = "hdl_module";
 
 using ParamBindings = llvm::StringMap<llvm::APInt>;
@@ -182,14 +183,26 @@ void HDLCaptureNamesPass::runOnOperation() {
   ModuleOp module = getOperation();
   MLIRContext *ctx = module.getContext();
 
-  // 1. Structs marked `@module`.
+  // 1. Structs marked `@module`, together with their parameter defaults.
   SmallVector<Attribute> moduleNames;
   llvm::StringSet<> moduleStructNames;
+  NamedAttrList paramDefaults;
   module.walk([&](LIT::StructDeclOp decl) {
     if (decl->hasAttr(kHdlModuleMarker)) {
       std::string name = qualify(decl, decl.getSymName());
       moduleNames.push_back(StringAttr::get(ctx, name));
       moduleStructNames.insert(name);
+
+      auto signature = dyn_cast<LIT::TypeSignatureType>(decl.getSignature());
+      if (!signature)
+        return;
+      NamedAttrList defaults;
+      for (auto pog : signature.getParamListAttrs().getPogs())
+        if (auto value = pog.getDefaultValue())
+          defaults.append(pog.getName(), value);
+      if (!defaults.empty())
+        paramDefaults.append(StringAttr::get(ctx, name),
+                             defaults.getDictionary(ctx));
     }
   });
 
@@ -241,6 +254,7 @@ void HDLCaptureNamesPass::runOnOperation() {
   module->setAttr(kHdlModulesAttr, ArrayAttr::get(ctx, moduleNames));
   module->setAttr(kHdlReturnNamesAttr, returnNames.getDictionary(ctx));
   module->setAttr(kHdlArgNamesAttr, argNames.getDictionary(ctx));
+  module->setAttr(kHdlParamDefaultsAttr, paramDefaults.getDictionary(ctx));
 }
 
 //===----------------------------------------------------------------------===//
@@ -603,6 +617,19 @@ getDslTypeBindings(Type type, const ParamBindings *bindings = nullptr) {
   return result;
 }
 
+/// Return the raw `index`th parameter attribute of a DSL type reference.
+static TypedAttr getDslTypeParamAttr(Type type, unsigned index) {
+  if (auto ptr = dyn_cast<KGEN::PointerType>(type))
+    type = ptr.getElementType();
+  auto typeValue = dyn_cast<KGEN::TypeValueType>(type);
+  if (!typeValue)
+    return {};
+  auto ref = dyn_cast<KGEN::TypeGeneratorRefAttr>(typeValue.getTypeValue());
+  if (!ref || index >= ref.getParamValues().size())
+    return {};
+  return ref.getParamValues()[index];
+}
+
 /// Return the type bound to DSL reference parameter `index`, if it is a type.
 static Type getDslTypeParam(Type type, unsigned index) {
   if (auto ptr = dyn_cast<KGEN::PointerType>(type))
@@ -735,6 +762,8 @@ static KGEN::StructInstanceType getStructInstanceType(ModuleOp source,
                                                       StringRef name);
 static bool isSimpleParametricStruct(ModuleOp source, StringRef name,
                                      ArrayAttr modules);
+static bool isGenericParametricStruct(ModuleOp source, StringRef name,
+                                      ArrayAttr modules);
 static std::optional<std::string>
 emitParamFunctionText(ModuleOp source, StringRef symbol,
                       ArrayRef<std::string> arguments, std::string &svName,
@@ -801,6 +830,10 @@ private:
   void convertCEToPlain(unsigned fieldIndex, bool preserveEnable = true);
   Operation *findBuiltModule(StringRef name);
   Value getValue(Value value);
+  Type fieldType(unsigned index);
+  std::string widthAttrText(TypedAttr attr);
+  Value constantOfType(Type type, const llvm::APInt &value);
+  Type callWidthType(Operation *op);
   LogicValue getLogicValue(Value value);
   LogicValue getOrCreateLogicReg(unsigned fieldIndex, unsigned width);
   LogicalResult storeLogicField(unsigned fieldIndex, LogicValue value,
@@ -1022,6 +1055,9 @@ private:
   unsigned currentMethod = 0;
   DenseMap<unsigned, llvm::APInt> resetValues;
   SmallVector<unsigned> fieldWidths;
+  /// The value type of each field (the element type for `Reg[T]`), used to
+  /// recover a symbolic width when the concrete width is unknown.
+  SmallVector<Type> fieldValueTypes;
   SmallVector<unsigned> methodOutputCounts;
   SmallVector<bool> methodHasState;
   SmallVector<std::string> methodNames;
@@ -1992,6 +2028,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
           resetStyle = static_cast<int>(value->getZExtValue());
       }
       fieldWidths.push_back(0);
+      fieldValueTypes.push_back({});
       fieldIsInstance.push_back(false);
       fieldIsLogic.push_back(false);
       fieldModuleNames.push_back({});
@@ -2001,6 +2038,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     if (isReg) {
       Type element = getDslTypeParam(fieldType, 0);
       fieldWidths.push_back(element ? getHdlWidth(element, &bindings) : 0);
+      fieldValueTypes.push_back(element);
       if (auto style = getDslTypeIntParam(fieldType, 1, &bindings))
         fieldResetStyle.back() = style->getZExtValue();
       fieldIsInstance.push_back(false);
@@ -2012,6 +2050,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     if (isWire) {
       auto params = getDslTypeBindings(fieldType, &bindings);
       fieldWidths.push_back(params.empty() ? 0 : params[0].getZExtValue());
+      fieldValueTypes.push_back(fieldType);
       fieldIsInstance.push_back(false);
       fieldIsLogic.push_back(false);
       fieldModuleNames.push_back({});
@@ -2022,6 +2061,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
       fieldArrayWidths.back() = getHdlWidth(arrayPayload, &bindings);
       fieldArrayDepths.back() = arrayDepth;
       fieldWidths.push_back(0);
+      fieldValueTypes.push_back({});
       fieldIsInstance.push_back(false);
       fieldIsLogic.push_back(false);
       fieldModuleNames.push_back({});
@@ -2033,6 +2073,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     }
 
     fieldWidths.push_back(getHdlWidth(fieldType, &bindings));
+    fieldValueTypes.push_back(fieldType);
     bool isInstance = false;
     if (!typeName.empty())
       for (Attribute module : hdlModules)
@@ -2048,7 +2089,7 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
       bool genericChild =
           childGenerator &&
           !childGenerator.getInputParams().empty() &&
-          isSimpleParametricStruct(source, typeName, hdlModules);
+          isGenericParametricStruct(source, typeName, hdlModules);
       auto childParams = genericChild ? childGenerator.getInputParams()
                                       : ArrayRef<KGEN::ParamDeclAttr>();
       auto childBindings = getDslTypeBindings(fieldType, &bindings);
@@ -2955,7 +2996,7 @@ Value CirctModuleEmitter::getValue(Value value) {
   auto field = fieldPtrs.find(value);
   if (field != fieldPtrs.end()) {
     unsigned index = field->second;
-    if (index >= fieldWidths.size() || !fieldWidths[index])
+    if (index >= fieldWidths.size())
       return {};
     if (index < fieldIsLogic.size() && fieldIsLogic[index])
       return {};
@@ -2963,8 +3004,10 @@ Value CirctModuleEmitter::getValue(Value value) {
       return {};
     if (index < fieldIsWire.size() && fieldIsWire[index])
       return wireValues.lookup(index);
+    Type type = fieldType(index);
+    if (!type)
+      return {};
     fieldReaders[index].insert(currentMethod);
-    auto type = IntegerType::get(value.getContext(), fieldWidths[index]);
     return getOrCreateReg(index, type);
   }
   return {};
@@ -3070,21 +3113,31 @@ Value CirctModuleEmitter::getConstant(bool value) {
 Value CirctModuleEmitter::createRegister(unsigned id, Type type,
                                          llvm::APInt resetValue,
                                          llvm::APInt initialValue, int style) {
-  auto zero = hw::ConstantOp::create(builder, loc, type, 0);
-  auto resetConstant = hw::ConstantOp::create(builder, loc, resetValue);
+  bool concrete = type.isIntOrIndex();
+  unsigned bits = concrete ? type.getIntOrFloatBitWidth() : 64;
+  Value zero = constantOfType(type, llvm::APInt(bits, 0));
+  Value resetConstant = constantOfType(type, resetValue);
+  if (!zero || !resetConstant)
+    return {};
   bool activeLow = (style & 1) != 0;
   Value reset = activeLow ? bitNot(resetSignal) : resetSignal;
   bool async = style >= 2;
   if (async) {
     auto name =
         StringAttr::get(builder.getContext(), "reg_" + std::to_string(id));
-    return seq::FirRegOp::create(
-        builder, loc, zero, clk, name, reset, resetConstant,
-        hw::InnerSymAttr(), /*isAsync=*/true,
-        /*preset=*/IntegerAttr::get(type, initialValue));
+    IntegerAttr preset =
+        concrete ? IntegerAttr::get(type, initialValue) : IntegerAttr();
+    return seq::FirRegOp::create(builder, loc, zero, clk, name, reset,
+                                 resetConstant, hw::InnerSymAttr(),
+                                 /*isAsync=*/true, /*preset=*/preset);
   }
   // Power-on value: the same constructor-derived constant, wrapped in
   // `seq.initial` so it is a true initializer rather than reset logic.
+  // Parameterized widths cannot be spelled as an integer attribute, so those
+  // registers rely on reset only.
+  if (!concrete)
+    return seq::CompRegOp::create(builder, loc, zero, clk, reset,
+                                  resetConstant);
   auto initial = seq::createConstantInitialValue(
       builder, loc, IntegerAttr::get(type, initialValue));
   return seq::CompRegOp::create(builder, loc, zero, clk, reset, resetConstant,
@@ -3108,7 +3161,7 @@ Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
   auto found = fieldRegs.find(fieldIndex);
   if (found != fieldRegs.end())
     return found->second;
-  unsigned width = type.getIntOrFloatBitWidth();
+  unsigned width = type.isIntOrIndex() ? type.getIntOrFloatBitWidth() : 64;
   llvm::APInt resetValue(width, 0);
   if (auto value = resetValues.find(fieldIndex); value != resetValues.end())
     resetValue = value->second.zextOrTrunc(width);
@@ -3123,6 +3176,91 @@ Value CirctModuleEmitter::getOrCreateReg(unsigned fieldIndex, Type type) {
   fieldRegs[fieldIndex] = reg;
   fieldNext[fieldIndex] = reg;
   return reg;
+}
+
+/// The lowerer's integer type for a state field: concrete when the width is
+/// known, otherwise `!hw.int<#hw.param...>` recovered from the DSL type.
+Type CirctModuleEmitter::fieldType(unsigned index) {
+  if (index < fieldWidths.size() && fieldWidths[index])
+    return IntegerType::get(builder.getContext(), fieldWidths[index]);
+  if (index >= fieldValueTypes.size() || !fieldValueTypes[index])
+    return {};
+  TypedAttr width = getDslTypeParamAttr(fieldValueTypes[index], 0);
+  if (!width)
+    return {};
+  if (auto converted = getPortWidthAttr(width))
+    return hw::IntType::get(*converted);
+  return {};
+}
+
+/// SystemVerilog text for a parameter width attribute, e.g. `W` or `(W + 1)`.
+std::string CirctModuleEmitter::widthAttrText(TypedAttr attr) {
+  if (!attr)
+    return {};
+  if (auto declRef = dyn_cast<hw::ParamDeclRefAttr>(attr))
+    return declRef.getName().getValue().str();
+  if (auto verbatim = dyn_cast<hw::ParamVerbatimAttr>(attr))
+    return verbatim.getValue().getValue().str();
+  if (auto expr = dyn_cast<hw::ParamExprAttr>(attr)) {
+    StringRef op;
+    switch (expr.getOpcode()) {
+    case hw::PEO::Add: op = " + "; break;
+    case hw::PEO::Mul: op = " * "; break;
+    case hw::PEO::And: op = " & "; break;
+    case hw::PEO::Or: op = " | "; break;
+    case hw::PEO::Xor: op = " ^ "; break;
+    case hw::PEO::Shl: op = " << "; break;
+    case hw::PEO::ShrU:
+    case hw::PEO::ShrS: op = " >> "; break;
+    case hw::PEO::DivU:
+    case hw::PEO::DivS: op = " / "; break;
+    case hw::PEO::ModU:
+    case hw::PEO::ModS: op = " % "; break;
+    default: return {};
+    }
+    std::string text = "(";
+    for (unsigned i = 0; i < expr.getOperands().size(); ++i) {
+      std::string operand = widthAttrText(expr.getOperands()[i]);
+      if (operand.empty())
+        return {};
+      if (i)
+        text += op.str();
+      text += operand;
+    }
+    text += ")";
+    return text;
+  }
+  return {};
+}
+
+/// Materialize a constant of `type`. Concrete widths use `hw.constant`;
+/// parameterized widths emit an explicit SystemVerilog size cast.
+Value CirctModuleEmitter::constantOfType(Type type, const llvm::APInt &value) {
+  if (type.isIntOrIndex())
+    return hw::ConstantOp::create(builder, loc,
+                                  builder.getIntegerAttr(type, value));
+  auto intType = dyn_cast<hw::IntType>(type);
+  if (!intType)
+    return {};
+  std::string width = widthAttrText(intType.getWidth());
+  if (width.empty())
+    return {};
+  SmallString<32> text;
+  value.toString(text, 10, /*signed=*/false);
+  return sv::VerbatimExprOp::create(builder, loc, type,
+                                    (width + "'(" + text + ")").str());
+}
+
+/// The symbolic integer type of a `Bits[W]`/`Logic[W]` call's first type
+/// parameter, used when the width is not concrete.
+Type CirctModuleEmitter::callWidthType(Operation *op) {
+  auto symbol = KGEN::FuncSymbolGenerator::dynCast(op->getAttr("callee"));
+  if (!symbol || symbol.getParamValues().empty())
+    return {};
+  auto converted = getPortWidthAttr(symbol.getParamValues().front());
+  if (!converted)
+    return {};
+  return hw::IntType::get(*converted);
 }
 
 void CirctModuleEmitter::convertCEToPlain(unsigned fieldIndex,
@@ -3769,8 +3907,11 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                << "HDL lowering: multiple delayed next on field '"
                << fieldNames[field] << "'";
 
-      unsigned width = fieldWidths[field];
-      auto type = IntegerType::get(builder.getContext(), width);
+      unsigned width = fieldWidths[field] ? fieldWidths[field] : 64;
+      Type type = fieldType(field);
+      if (!type)
+        return op->emitError()
+               << "HDL lowering: unsupported delayed register type";
       llvm::APInt resetBits(width, 0);
       if (auto value = resetValues.find(field); value != resetValues.end())
         resetBits = value->second.zextOrTrunc(width);
@@ -3794,8 +3935,10 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     };
 
     auto pastValue = [&](unsigned field, unsigned delay) -> Value {
-      unsigned width = fieldWidths[field];
-      auto type = IntegerType::get(builder.getContext(), width);
+      unsigned width = fieldWidths[field] ? fieldWidths[field] : 64;
+      Type type = fieldType(field);
+      if (!type)
+        return {};
       Value current = getOrCreateReg(field, type);
       if (!current || delay == 0)
         return current;
@@ -5304,11 +5447,14 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           unsigned width = getCallParamWidth(op, &bindings);
           Operation *valueOp = op->getOperand(0).getDefiningOp();
           auto value = valueOp ? getConstantInt(valueOp, &bindings) : std::nullopt;
-          if (!width || !value)
+          Type constantType =
+              width ? IntegerType::get(builder.getContext(), width)
+                    : callWidthType(op);
+          if (!constantType || !value)
             return op->emitError()
                    << "HDL lowering: unsupported Bits constructor argument";
-          Value constant = hw::ConstantOp::create(
-              builder, loc, value->zextOrTrunc(width));
+          Value constant = constantOfType(
+              constantType, value->zextOrTrunc(width ? width : 64));
           values[op->getOperand(1)] = constant;
           if (op->getOperand(1) == resultPtr)
             recordReturn(constant);
@@ -5702,7 +5848,9 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
       }
     }
     if (field != fieldPtrs.end()) {
-      auto type = getHwType(op->getResult(0).getType());
+      Type type = fieldType(field->second);
+      if (!type)
+        type = getHwType(op->getResult(0).getType());
       if (!type)
         return op->emitError() << "HDL lowering: unsupported state type";
       values[op->getResult(0)] = getOrCreateReg(field->second, type);
@@ -6805,8 +6953,24 @@ LogicalResult CirctModuleEmitter::build() {
 
   SmallVector<Attribute> moduleParams;
   auto paramType = IntegerType::get(ctx, 32);
-  for (KGEN::ParamDeclAttr param : params)
-    moduleParams.push_back(hw::ParamDeclAttr::get(param.getName(), paramType));
+  DictionaryAttr defaults;
+  if (auto allDefaults =
+          source->getAttrOfType<DictionaryAttr>(kHdlParamDefaultsAttr))
+    defaults = dyn_cast_or_null<DictionaryAttr>(
+        allDefaults.get(structName.str()));
+  for (KGEN::ParamDeclAttr param : params) {
+    Attribute defaultValue =
+        defaults ? defaults.get(param.getName().getValue()) : Attribute();
+    if (auto typed = dyn_cast_or_null<TypedAttr>(defaultValue))
+      if (auto value = getTypedAttrInt(typed, &bindings)) {
+        moduleParams.push_back(hw::ParamDeclAttr::get(
+            param.getName(), paramType,
+            IntegerAttr::get(paramType, value->zextOrTrunc(32))));
+        continue;
+      }
+    moduleParams.push_back(
+        hw::ParamDeclAttr::get(param.getName(), paramType));
+  }
 
   builder.setInsertionPointToEnd(scratch.getBody());
   builtModule = hw::HWModuleOp::create(
@@ -7014,6 +7178,84 @@ static bool isSimpleParametricStruct(ModuleOp source, StringRef name,
   return true;
 }
 
+/// True when a width attribute can be printed as a SystemVerilog width without
+/// any parameter-expression rewriting: an integer literal or a direct
+/// reference to a parameter.
+static bool isDirectParamWidth(TypedAttr attr) {
+  return isa<IntegerAttr>(attr) || isa<KGEN::SIMDAttr>(attr) ||
+         isa<KGEN::ParamDeclRefAttr>(attr) ||
+         isa<KGEN::ParamIndexRefAttr>(attr);
+}
+
+/// True when a parameterized module can be emitted once with symbolic widths.
+/// Stateless modules always can.  Stateful ones qualify when every field is
+/// plain 2-state `Bits` state (optionally wrapped in `Reg`) whose width is a
+/// literal or a direct parameter reference, and every constructor constant is
+/// an integer literal, so the body needs no specialization.
+static bool isGenericParametricStruct(ModuleOp source, StringRef name,
+                                      ArrayAttr modules) {
+  if (isSimpleParametricStruct(source, name, modules))
+    return true;
+  auto type = getStructInstanceType(source, name);
+  if (!type)
+    return false;
+  llvm::StringSet<> known;
+  for (Attribute attr : modules)
+    known.insert(cast<StringAttr>(attr).getValue());
+  for (StructDefFieldAttr field : type.getFields()) {
+    Type fieldType = getTypeFromAttr(field.getTypeValue());
+    StringRef typeName = getDslTypeName(fieldType);
+    if (typeName.empty())
+      return false;
+    if (known.contains(typeName))
+      continue; // A generic child instance.
+    if (typeName.contains("ResetStyle") || typeName.contains("PowerOn") ||
+        typeName.contains("ClockDivider"))
+      continue; // Compile-time configuration markers.
+    if (typeName.contains("Logic") || typeName.contains("Wire") ||
+        typeName.contains("Array") || typeName.contains("Ram") ||
+        typeName.contains("Mem") || typeName.contains("Packed"))
+      return false;
+    Type valueType = fieldType;
+    if (typeName.ends_with("Reg")) {
+      valueType = getDslTypeParam(fieldType, 0);
+      StringRef elementName =
+          valueType ? getDslTypeName(valueType) : StringRef();
+      if (!valueType || elementName.contains("Logic") ||
+          elementName.contains("Array") || elementName.contains("Packed"))
+        return false;
+    }
+    if (StringRef(getDslTypeName(valueType)).contains("Bits") &&
+        !isDirectParamWidth(getDslTypeParamAttr(valueType, 0)))
+      return false;
+  }
+  // The shared body can only spell constructor constants that are literals.
+  std::string prefix = (name + "::").str();
+  bool literals = true;
+  source.walk([&](Operation *fn) {
+    if (!literals)
+      return;
+    auto symbol =
+        fn->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName());
+    if (!symbol || !symbol.getValue().starts_with(prefix))
+      return;
+    fn->walk([&](Operation *op) {
+      if (!literals || op->getName().getStringRef() != "kgen.call")
+        return;
+      StringRef callee = callCalleeName(op);
+      if (!callee.contains("Bits::__init__") ||
+          callee.contains("__init__(move:"))
+        return;
+      if (op->getNumOperands() != 2)
+        return;
+      Operation *valueOp = op->getOperand(0).getDefiningOp();
+      if (!valueOp || !getConstantInt(valueOp, nullptr))
+        literals = false;
+    });
+  });
+  return literals;
+}
+
 struct ModuleSpec {
   std::string structName;
   std::string displayName;
@@ -7074,9 +7316,9 @@ static SmallVector<ModuleSpec> collectModuleSpecs(ModuleOp source,
       specs[unqualified] = ModuleSpec{name, unqualified, ParamBindings(), {}};
       continue;
     }
-    if (isSimpleParametricStruct(source, name, modules)) {
-      // A parameterized module with no state is emitted once. Concrete values
-      // are supplied at each instance site, not by specializing the body.
+    if (isGenericParametricStruct(source, name, modules)) {
+      // A parameterized module whose body needs no specialization is emitted
+      // once. Concrete values are supplied at each instance site.
       ModuleSpec spec;
       spec.structName = name;
       spec.displayName = unqualified;
@@ -7115,7 +7357,7 @@ static SmallVector<ModuleSpec> collectModuleSpecs(ModuleOp source,
       std::string childDisplay = StringRef(child).rsplit("::").second.str();
       auto childGenerator = findStructGenerator(source, child);
       if (childGenerator && !childGenerator.getInputParams().empty() &&
-          isSimpleParametricStruct(source, child, modules)) {
+          isGenericParametricStruct(source, child, modules)) {
         // Parameterized children have one generic module definition.
       } else {
         for (auto binding : getDslTypeBindings(fieldType, &spec.bindings))
@@ -7159,6 +7401,10 @@ public:
     return "Lower HDL @module structs to CIRCT hw/comb ops";
   }
 
+  void getDependentDialects(DialectRegistry &registry) const override {
+    registry.insert<sv::SVDialect>();
+  }
+
   void runOnOperation() override {
     ModuleOp module = getOperation();
     raw_ostream &os = options.output ? *options.output : llvm::outs();
@@ -7173,6 +7419,7 @@ public:
     // unloaded dialect's ops in generic form.
     module.getContext()->getOrLoadDialect<hw::HWDialect>();
     module.getContext()->getOrLoadDialect<comb::CombDialect>();
+    module.getContext()->getOrLoadDialect<sv::SVDialect>();
 
     auto modules = module->getAttrOfType<ArrayAttr>(kHdlModulesAttr);
     if (!modules || modules.empty()) {
