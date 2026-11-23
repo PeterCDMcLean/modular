@@ -818,6 +818,7 @@ private:
   std::string moduleName;
   ParamBindings bindings;
   SmallVector<KGEN::ParamDeclAttr> params;
+  std::set<std::string> paramHelpers;
   ModuleOp scratch;
   ArrayAttr hdlModules;
   OpBuilder builder;
@@ -886,6 +887,7 @@ private:
   DenseMap<Value, Value> structFieldAliases;
   DenseMap<Value, SmallVector<std::pair<unsigned, StructFieldInit>>>
       structFieldInits;
+  std::optional<std::string> getParamOperandText(TypedAttr attr);
   std::optional<TypedAttr> getPortWidthAttr(TypedAttr attr);
   Type getPortType(Type sourceType, bool &isLogic);
   Value getStructFieldSlot(Operation *gep, Value root,
@@ -1074,6 +1076,31 @@ private:
   hw::HWModuleOp builtModule;
 };
 
+std::optional<std::string>
+CirctModuleEmitter::getParamOperandText(TypedAttr attr) {
+  if (!attr)
+    return std::nullopt;
+  if (auto integer = dyn_cast<IntegerAttr>(attr)) {
+    SmallString<16> text;
+    integer.getValue().toString(text, 10, /*signed=*/false);
+    return text.str().str();
+  }
+  if (auto simd = dyn_cast<KGEN::SIMDAttr>(attr))
+    if (simd.getValues().size() == 1) {
+      SmallString<16> text;
+      simd.getValues()[0].getIntVal().toString(text, 10, false);
+      return text.str().str();
+    }
+  if (auto index = dyn_cast<KGEN::ParamIndexRefAttr>(attr);
+      index && index.getDepth() == 0 && index.getIndex() < params.size())
+    return params[index.getIndex()].getName().getValue().str();
+  if (auto declRef = dyn_cast<KGEN::ParamDeclRefAttr>(attr))
+    return declRef.getName().getValue().str();
+  if (auto verbatim = dyn_cast<hw::ParamVerbatimAttr>(attr))
+    return verbatim.getValue().getValue().str();
+  return std::nullopt;
+}
+
 std::optional<TypedAttr>
 CirctModuleEmitter::getPortWidthAttr(TypedAttr attr) {
   if (!attr)
@@ -1096,6 +1123,35 @@ CirctModuleEmitter::getPortWidthAttr(TypedAttr attr) {
         StringAttr::get(builder.getContext(), declRef.getName().getValue()),
         i32);
   if (auto expr = dyn_cast<KGEN::ParamOperatorAttr>(attr)) {
+    if (expr.getOpcode() == KGEN::POC::Apply && !expr.getOperands().empty()) {
+      std::string callee;
+      llvm::raw_string_ostream calleeStream(callee);
+      expr.getOperands().front().print(calleeStream);
+      calleeStream.flush();
+      StringRef helper;
+      if (StringRef(callee).contains("math::max"))
+        helper = "hdl_max";
+      else if (StringRef(callee).contains("math::min"))
+        helper = "hdl_min";
+      if (!helper.empty()) {
+        SmallVector<std::string> arguments;
+        for (TypedAttr operand : expr.getOperands().drop_front())
+          if (auto text = getParamOperandText(operand))
+            arguments.push_back(*text);
+        if (arguments.size() >= 2) {
+          std::string call = helper.str() + "(";
+          for (unsigned i = 0; i < arguments.size(); ++i) {
+            if (i)
+              call += ", ";
+            call += arguments[i];
+          }
+          call += ")";
+          paramHelpers.insert(helper.str());
+          return hw::ParamVerbatimAttr::get(
+              StringAttr::get(builder.getContext(), call), i32);
+        }
+      }
+    }
     std::optional<hw::PEO> opcode;
     switch (expr.getOpcode()) {
     case KGEN::POC::Add: opcode = hw::PEO::Add; break;
@@ -6449,6 +6505,16 @@ LogicalResult CirctModuleEmitter::build() {
     domainReset[m] = body->getArgument(portIndex++);
   }
 
+  if (!paramHelpers.empty()) {
+    SmallVector<Attribute> helpers;
+    if (auto existing = scratch->getAttrOfType<ArrayAttr>("hdl.param_helpers"))
+      for (Attribute attr : existing)
+        helpers.push_back(attr);
+    for (const std::string &helper : paramHelpers)
+      helpers.push_back(StringAttr::get(ctx, helper));
+    scratch->setAttr("hdl.param_helpers", ArrayAttr::get(ctx, helpers));
+  }
+
   SmallVector<Value> outputValues;
   for (unsigned m = 0; m < methods.size(); ++m) {
     currentMethod = m;
@@ -7094,6 +7160,32 @@ LogicalResult lowerHDLHLMemToSV(ModuleOp module) {
 }
 
 LogicalResult exportHDLSystemVerilog(ModuleOp module, raw_ostream &os) {
+  if (auto helpers = module->getAttrOfType<ArrayAttr>("hdl.param_helpers")) {
+    bool needMax = false, needMin = false;
+    for (Attribute attr : helpers) {
+      StringRef name = cast<StringAttr>(attr).getValue();
+      if (name == "hdl_max")
+        needMax = true;
+      else if (name == "hdl_min")
+        needMin = true;
+    }
+    if (needMax || needMin) {
+      std::string text;
+      if (needMax)
+        text += "function automatic integer hdl_max(input integer a, "
+                "input integer b);\n"
+                "  return (a > b) ? a : b;\n"
+                "endfunction\n";
+      if (needMin)
+        text += "function automatic integer hdl_min(input integer a, "
+                "input integer b);\n"
+                "  return (a < b) ? a : b;\n"
+                "endfunction\n";
+      OpBuilder builder(module.getContext());
+      builder.setInsertionPointToStart(module.getBody());
+      sv::VerbatimOp::create(builder, module.getLoc(), text);
+    }
+  }
   return circt::exportVerilog(module, os);
 }
 
