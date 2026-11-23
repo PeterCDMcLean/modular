@@ -727,15 +727,24 @@ static std::optional<bool> getConstantBool(Operation *op) {
 // HDLToCIRCT
 //===----------------------------------------------------------------------===//
 
+static KGEN::StructGeneratorOp findStructGenerator(ModuleOp source,
+                                                   StringRef name);
+static KGEN::StructInstanceType getStructInstanceType(ModuleOp source,
+                                                      StringRef name);
+static bool isSimpleParametricStruct(ModuleOp source, StringRef name,
+                                     ArrayAttr modules);
+
 /// Emits one `hw.module` per `@module` struct by building real CIRCT ops.
 class CirctModuleEmitter {
 public:
   CirctModuleEmitter(ModuleOp source, StringRef structName, StringRef moduleName,
-                     const ParamBindings &bindings, ModuleOp scratch,
+                     const ParamBindings &bindings,
+                     ArrayRef<KGEN::ParamDeclAttr> params, ModuleOp scratch,
                      ArrayAttr hdlModules)
       : source(source), structName(structName), moduleName(moduleName),
-        bindings(bindings), scratch(scratch), hdlModules(hdlModules),
-        builder(scratch.getContext()), loc(scratch.getLoc()) {}
+        bindings(bindings), params(params), scratch(scratch),
+        hdlModules(hdlModules), builder(scratch.getContext()),
+        loc(scratch.getLoc()) {}
 
   LogicalResult build();
   hw::HWModuleOp getModule() const { return builtModule; }
@@ -751,6 +760,7 @@ private:
     unsigned width;
     bool isInput;
     bool isLogic;
+    Type type;
   };
 
   struct LogicValue {
@@ -807,6 +817,7 @@ private:
   StringRef structName;
   std::string moduleName;
   ParamBindings bindings;
+  SmallVector<KGEN::ParamDeclAttr> params;
   ModuleOp scratch;
   ArrayAttr hdlModules;
   OpBuilder builder;
@@ -875,6 +886,8 @@ private:
   DenseMap<Value, Value> structFieldAliases;
   DenseMap<Value, SmallVector<std::pair<unsigned, StructFieldInit>>>
       structFieldInits;
+  std::optional<TypedAttr> getPortWidthAttr(TypedAttr attr);
+  Type getPortType(Type sourceType, bool &isLogic);
   Value getStructFieldSlot(Operation *gep, Value root,
                            ArrayRef<unsigned> path);
   std::optional<StructFieldPath> resolveStructFieldPath(Value base,
@@ -1005,6 +1018,8 @@ private:
   SmallVector<std::string> fieldNames;
   SmallVector<std::string> fieldStructNames;
   SmallVector<std::string> fieldModuleNames;
+  DenseMap<unsigned, SmallVector<std::pair<std::string, llvm::APInt>>>
+      fieldParamValues;
   SmallVector<bool> fieldIsInstance;
   SmallVector<bool> fieldIsLogic;
   SmallVector<bool> fieldIsConfig;
@@ -1059,6 +1074,80 @@ private:
   hw::HWModuleOp builtModule;
 };
 
+std::optional<TypedAttr>
+CirctModuleEmitter::getPortWidthAttr(TypedAttr attr) {
+  if (!attr)
+    return std::nullopt;
+  auto i32 = IntegerType::get(builder.getContext(), 32);
+  if (auto integer = dyn_cast<IntegerAttr>(attr))
+    return IntegerAttr::get(i32, integer.getValue().zextOrTrunc(32));
+  if (auto simd = dyn_cast<KGEN::SIMDAttr>(attr))
+    if (simd.getValues().size() == 1)
+      return IntegerAttr::get(i32,
+                              simd.getValues()[0].getIntVal().zextOrTrunc(32));
+  if (auto index = dyn_cast<KGEN::ParamIndexRefAttr>(attr);
+      index && index.getDepth() == 0 && index.getIndex() < params.size())
+    return hw::ParamDeclRefAttr::get(
+        StringAttr::get(builder.getContext(),
+                        params[index.getIndex()].getName().getValue()),
+        i32);
+  if (auto declRef = dyn_cast<KGEN::ParamDeclRefAttr>(attr))
+    return hw::ParamDeclRefAttr::get(
+        StringAttr::get(builder.getContext(), declRef.getName().getValue()),
+        i32);
+  if (auto expr = dyn_cast<KGEN::ParamOperatorAttr>(attr)) {
+    std::optional<hw::PEO> opcode;
+    switch (expr.getOpcode()) {
+    case KGEN::POC::Add: opcode = hw::PEO::Add; break;
+    case KGEN::POC::Mul:
+    case KGEN::POC::MulNoWrap: opcode = hw::PEO::Mul; break;
+    case KGEN::POC::Shl: opcode = hw::PEO::Shl; break;
+    case KGEN::POC::Shr: opcode = hw::PEO::ShrU; break;
+    case KGEN::POC::Div:
+    case KGEN::POC::DivU: opcode = hw::PEO::DivU; break;
+    case KGEN::POC::DivS:
+    case KGEN::POC::FloorDivS: opcode = hw::PEO::DivS; break;
+    case KGEN::POC::Mod:
+    case KGEN::POC::RemU: opcode = hw::PEO::ModU; break;
+    case KGEN::POC::RemS: opcode = hw::PEO::ModS; break;
+    default: return std::nullopt;
+    }
+    SmallVector<TypedAttr> operands;
+    for (TypedAttr operand : expr.getOperands()) {
+      auto converted = getPortWidthAttr(operand);
+      if (!converted)
+        return std::nullopt;
+      operands.push_back(*converted);
+    }
+    return hw::ParamExprAttr::get(*opcode, operands);
+  }
+  return std::nullopt;
+}
+
+Type CirctModuleEmitter::getPortType(Type sourceType, bool &isLogic) {
+  isLogic = isLogicType(sourceType);
+  Type type = sourceType;
+  if (auto pointer = dyn_cast<KGEN::PointerType>(type))
+    type = pointer.getElementType();
+  if (auto typeValue = dyn_cast<KGEN::TypeValueType>(type)) {
+    auto ref = dyn_cast<KGEN::TypeGeneratorRefAttr>(typeValue.getTypeValue());
+    StringRef name =
+        ref ? ref.getSymbol().getLeafReference().getValue() : StringRef();
+    if (ref && (name.contains("Bits") || name.contains("Logic")) &&
+        !ref.getParamValues().empty()) {
+      TypedAttr widthAttr = ref.getParamValues().front();
+      if (auto width = getTypedAttrInt(widthAttr, &bindings))
+        return IntegerType::get(builder.getContext(), width->getZExtValue());
+      if (auto width = getPortWidthAttr(widthAttr))
+        return hw::IntType::get(*width);
+    }
+  }
+  unsigned width = getHdlWidth(sourceType, &bindings);
+  if (!width)
+    return {};
+  return IntegerType::get(builder.getContext(), width);
+}
+
 LogicalResult CirctModuleEmitter::collectPorts() {
   llvm::StringSet<> seen;
 
@@ -1095,13 +1184,17 @@ LogicalResult CirctModuleEmitter::collectPorts() {
                       sourceFunc.getArgConvention(index) ==
                           ArgConvention::ByRefResult;
       Type sourceType = sourceFunc ? sourceFunc.getArgument(index) : argType;
-      unsigned width = getHdlWidth(sourceType, &bindings);
-      if (!width)
-        width = getHdlWidth(argType, &bindings);
-      if (!width) {
+      bool isLogic = false;
+      Type portType = getPortType(sourceType, isLogic);
+      if (!portType) {
+        portType = getPortType(argType, isLogic);
+        sourceType = argType;
+      }
+      if (!portType) {
         fn->emitError() << "HDL lowering: unsupported port type " << sourceType;
         return failure();
       }
+      unsigned width = getHdlWidth(sourceType, &bindings);
 
       std::string name;
       if (isResult) {
@@ -1127,8 +1220,7 @@ LogicalResult CirctModuleEmitter::collectPorts() {
         fn->emitError() << "HDL lowering: duplicate port name '" << name << "'";
         return failure();
       }
-      bool isLogic = isLogicType(sourceType);
-      ports.push_back({name, width, /*isInput=*/!isResult, isLogic});
+      ports.push_back({name, width, /*isInput=*/!isResult, isLogic, portType});
       if (isLogic) {
         // A 4-state value is carried as a value net plus an X/Z mask net.
         std::string maskName = name + "_xz";
@@ -1137,7 +1229,8 @@ LogicalResult CirctModuleEmitter::collectPorts() {
                           << "'";
           return failure();
         }
-        ports.push_back({maskName, width, /*isInput=*/!isResult, false});
+        ports.push_back({maskName, width, /*isInput=*/!isResult, false,
+                         portType});
       }
     }
 
@@ -1145,11 +1238,13 @@ LogicalResult CirctModuleEmitter::collectPorts() {
     for (Type resType : body.getResults()) {
       if (isa<KGEN::NoneType>(resType))
         continue;
-      unsigned width = getHdlWidth(resType, &bindings);
-      if (!width) {
+      bool isLogic = false;
+      Type portType = getPortType(resType, isLogic);
+      if (!portType) {
         fn->emitError() << "HDL lowering: unsupported port type " << resType;
         return failure();
       }
+      unsigned width = getHdlWidth(resType, &bindings);
       std::string name;
       if (returnNames && outputIndex < returnNames.size())
         name = cast<StringAttr>(returnNames[outputIndex]).getValue().str();
@@ -1166,8 +1261,7 @@ LogicalResult CirctModuleEmitter::collectPorts() {
         fn->emitError() << "HDL lowering: duplicate port name '" << name << "'";
         return failure();
       }
-      bool isLogic = isLogicType(resType);
-      ports.push_back({name, width, /*isInput=*/false, isLogic});
+      ports.push_back({name, width, /*isInput=*/false, isLogic, portType});
       if (isLogic) {
         std::string maskName = name + "_xz";
         if (!seen.insert(maskName).second) {
@@ -1175,7 +1269,7 @@ LogicalResult CirctModuleEmitter::collectPorts() {
                           << "'";
           return failure();
         }
-        ports.push_back({maskName, width, /*isInput=*/false, false});
+        ports.push_back({maskName, width, /*isInput=*/false, false, portType});
       }
     }
     methodOutputCounts.push_back(methodOutputCount);
@@ -1765,9 +1859,27 @@ LogicalResult CirctModuleEmitter::collectFieldWidths() {
     fieldIsInstance.push_back(isInstance);
     fieldIsLogic.push_back(isLogicType(fieldType));
     if (isInstance) {
+      unsigned fieldIndex = fieldNames.size() - 1;
+      auto childGenerator = findStructGenerator(source, typeName);
+      bool genericChild =
+          childGenerator &&
+          !childGenerator.getInputParams().empty() &&
+          isSimpleParametricStruct(source, typeName, hdlModules);
+      auto childParams = genericChild ? childGenerator.getInputParams()
+                                      : ArrayRef<KGEN::ParamDeclAttr>();
+      auto childBindings = getDslTypeBindings(fieldType, &bindings);
       std::string display = StringRef(typeName).rsplit("::").second.str();
-      for (auto binding : getDslTypeBindings(fieldType, &bindings))
-        display += "_" + std::to_string(binding.getZExtValue());
+      if (!childParams.empty()) {
+        // The child is emitted once with parameters; the field supplies the
+        // concrete values for this instance.
+        for (unsigned i = 0; i < childParams.size() && i < childBindings.size();
+             ++i)
+          fieldParamValues[fieldIndex].push_back(
+              {childParams[i].getName().getValue().str(), childBindings[i]});
+      } else {
+        for (auto binding : childBindings)
+          display += "_" + std::to_string(binding.getZExtValue());
+      }
       fieldModuleNames.push_back(display);
     } else {
       fieldModuleNames.push_back({});
@@ -3982,9 +4094,21 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                  << " outputs is not supported";
         }
 
+        ArrayAttr instanceParams;
+        if (auto values = fieldParamValues.find(fieldIndex);
+            values != fieldParamValues.end() && !values->second.empty()) {
+          SmallVector<Attribute> attrs;
+          auto paramType = IntegerType::get(ctx, 32);
+          for (auto &[name, value] : values->second)
+            attrs.push_back(hw::ParamDeclAttr::get(
+                StringAttr::get(ctx, name),
+                IntegerAttr::get(paramType, value.zextOrTrunc(32))));
+          instanceParams = ArrayAttr::get(ctx, attrs);
+        }
         auto instanceOp = hw::InstanceOp::create(
             builder, loc, childOp,
-            StringAttr::get(ctx, fieldNames[fieldIndex]), inputs);
+            StringAttr::get(ctx, fieldNames[fieldIndex]), inputs,
+            instanceParams);
         if (childHasClock) {
           InstanceCallState &state = instanceCalls[fieldIndex];
           state.op = instanceOp;
@@ -6234,7 +6358,7 @@ LogicalResult CirctModuleEmitter::build() {
   for (const Port &port : ports) {
     hw::PortInfo info;
     info.name = StringAttr::get(ctx, port.name);
-    info.type = IntegerType::get(ctx, port.width);
+    info.type = port.type ? port.type : IntegerType::get(ctx, port.width);
     if (port.isInput) {
       info.dir = hw::ModulePort::Direction::Input;
       info.argNum = inputs.size();
@@ -6271,10 +6395,15 @@ LogicalResult CirctModuleEmitter::build() {
     inputs.push_back(resetInfo);
   }
 
+  SmallVector<Attribute> moduleParams;
+  auto paramType = IntegerType::get(ctx, 32);
+  for (KGEN::ParamDeclAttr param : params)
+    moduleParams.push_back(hw::ParamDeclAttr::get(param.getName(), paramType));
+
   builder.setInsertionPointToEnd(scratch.getBody());
   builtModule = hw::HWModuleOp::create(
       builder, loc, StringAttr::get(ctx, moduleName),
-      hw::ModulePortInfo(inputs, outputs));
+      hw::ModulePortInfo(inputs, outputs), ArrayAttr::get(ctx, moduleParams));
 
   Block *body = builtModule.getBodyBlock();
   size_t portIndex = 0;
@@ -6437,10 +6566,31 @@ static KGEN::StructInstanceType getStructInstanceType(ModuleOp source,
   return {};
 }
 
+/// True when a parameterized struct has no state of its own: every field is a
+/// child instance (or it has no fields). Such modules can be emitted once with
+/// symbolic parameter widths; stateful modules still specialize until their
+/// field widths and constants are parameterized.
+static bool isSimpleParametricStruct(ModuleOp source, StringRef name,
+                                     ArrayAttr modules) {
+  auto type = getStructInstanceType(source, name);
+  if (!type)
+    return false;
+  llvm::StringSet<> known;
+  for (Attribute attr : modules)
+    known.insert(cast<StringAttr>(attr).getValue());
+  for (StructDefFieldAttr field : type.getFields()) {
+    StringRef child = getDslTypeName(getTypeFromAttr(field.getTypeValue()));
+    if (!child.empty() && !known.contains(child))
+      return false;
+  }
+  return true;
+}
+
 struct ModuleSpec {
   std::string structName;
   std::string displayName;
   ParamBindings bindings;
+  SmallVector<KGEN::ParamDeclAttr> params;
 };
 
 static KGEN::StructGeneratorOp findStructGenerator(ModuleOp source,
@@ -6493,9 +6643,22 @@ static SmallVector<ModuleSpec> collectModuleSpecs(ModuleOp source,
     auto generator = findStructGenerator(source, name);
     std::string unqualified = StringRef(name).rsplit("::").second.str();
     if (!generator || generator.getInputParams().empty()) {
-      specs[unqualified] = ModuleSpec{name, unqualified, ParamBindings()};
+      specs[unqualified] = ModuleSpec{name, unqualified, ParamBindings(), {}};
       continue;
     }
+    if (isSimpleParametricStruct(source, name, modules)) {
+      // A parameterized module with no state is emitted once. Concrete values
+      // are supplied at each instance site, not by specializing the body.
+      ModuleSpec spec;
+      spec.structName = name;
+      spec.displayName = unqualified;
+      for (KGEN::ParamDeclAttr param : generator.getInputParams())
+        spec.params.push_back(param);
+      specs[unqualified] = spec;
+      continue;
+    }
+    // Stateful parameterized modules still specialize until their field widths
+    // and constants are parameterized.
     auto params = generator.getInputParams();
     for (const BindingTuple &tuple : discovered[name]) {
       ModuleSpec spec;
@@ -6505,8 +6668,6 @@ static SmallVector<ModuleSpec> collectModuleSpecs(ModuleOp source,
         spec.displayName += "_" + std::to_string(tuple[i]);
         StringRef paramName = params[i].getName().getValue();
         spec.bindings[paramName] = llvm::APInt(64, tuple[i]);
-        // The lowered body refers to struct parameters by index (for example
-        // `*(0, 0)`), so bind indices as well.
         spec.bindings["#" + std::to_string(i)] = llvm::APInt(64, tuple[i]);
       }
       specs[spec.displayName] = spec;
@@ -6524,8 +6685,14 @@ static SmallVector<ModuleSpec> collectModuleSpecs(ModuleOp source,
       if (!known.contains(child))
         continue;
       std::string childDisplay = StringRef(child).rsplit("::").second.str();
-      for (auto binding : getDslTypeBindings(fieldType, &spec.bindings))
-        childDisplay += "_" + std::to_string(binding.getZExtValue());
+      auto childGenerator = findStructGenerator(source, child);
+      if (childGenerator && !childGenerator.getInputParams().empty() &&
+          isSimpleParametricStruct(source, child, modules)) {
+        // Parameterized children have one generic module definition.
+      } else {
+        for (auto binding : getDslTypeBindings(fieldType, &spec.bindings))
+          childDisplay += "_" + std::to_string(binding.getZExtValue());
+      }
       if (specs.contains(childDisplay))
         edges[key].push_back(childDisplay);
     }
@@ -6596,7 +6763,8 @@ public:
       SmallVector<std::pair<std::string, SmallVector<std::string>>> adapters;
       for (const ModuleSpec &spec : collectModuleSpecs(module, modules)) {
         CirctModuleEmitter emitter(module, spec.structName, spec.displayName,
-                                   spec.bindings, *scratch, modules);
+                                   spec.bindings, spec.params, *scratch,
+                                   modules);
         SmallVector<std::string> processes;
         if (failed(emitter.collectProcesses(processes))) {
           signalPassFailure();
@@ -6630,7 +6798,8 @@ public:
     OwningOpRef<ModuleOp> scratch = ModuleOp::create(module.getLoc());
     for (const ModuleSpec &spec : collectModuleSpecs(module, modules)) {
       CirctModuleEmitter emitter(module, spec.structName, spec.displayName,
-                                 spec.bindings, *scratch, modules);
+                                 spec.bindings, spec.params, *scratch,
+                                 modules);
       if (failed(emitter.build())) {
         signalPassFailure();
         return;
