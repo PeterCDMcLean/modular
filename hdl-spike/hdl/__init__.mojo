@@ -17,6 +17,7 @@ from .ram import Ram
 from .wire import Wire
 from .hdl_type import HdlType
 from .reg import Reg
+from .param import clog2
 
 
 struct ResetStyle[style: Int = 0](Copyable, Movable):

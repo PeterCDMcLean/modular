@@ -1361,6 +1361,12 @@ CirctModuleEmitter::getParamExprText(KGEN::ParamOperatorAttr expr) {
     llvm::raw_string_ostream stream(callee);
     operands.front().print(stream);
     stream.flush();
+    if (StringRef(callee).contains("clog2") && operands.size() == 2) {
+      auto argument = getParamOperandText(operands[1]);
+      if (!argument)
+        return std::nullopt;
+      return "$clog2(" + *argument + ")";
+    }
     if (!isArithmeticParamCallee(callee))
       return std::nullopt;
     SmallVector<std::string> args;
@@ -1473,6 +1479,17 @@ CirctModuleEmitter::getPortWidthAttr(TypedAttr attr) {
         paramHelpers.insert(helper.str());
         return hw::ParamVerbatimAttr::get(
             StringAttr::get(builder.getContext(), call), i32);
+      }
+      // `$clog2` has a structured parameter-expression opcode.
+      if (auto func = KGEN::FuncSymbolGenerator::dynCast(
+              expr.getOperands().front());
+          func && func.getSymbol().getLeafReference().getValue().contains(
+                      "clog2") &&
+          expr.getOperands().size() == 2) {
+        if (auto argument = getPortWidthAttr(expr.getOperands()[1])) {
+          TypedAttr operands[] = {*argument};
+          return hw::ParamExprAttr::get(hw::PEO::CLog2, operands);
+        }
       }
       // Arithmetic helpers (`W // 2`) are spelled as SystemVerilog text.
       if (isArithmeticParamCallee(callee))
@@ -3417,6 +3434,14 @@ std::string CirctModuleEmitter::widthAttrText(TypedAttr attr) {
   if (auto verbatim = dyn_cast<hw::ParamVerbatimAttr>(attr))
     return verbatim.getValue().getValue().str();
   if (auto expr = dyn_cast<hw::ParamExprAttr>(attr)) {
+    if (expr.getOpcode() == hw::PEO::CLog2) {
+      if (expr.getOperands().size() != 1)
+        return {};
+      std::string operand = widthAttrText(expr.getOperands()[0]);
+      if (operand.empty())
+        return {};
+      return "($clog2(" + operand + "))";
+    }
     if (expr.getOpcode() == hw::PEO::Add) {
       std::string text = "(";
       bool first = true;
@@ -7479,6 +7504,11 @@ static bool isSpellableParamWidth(TypedAttr attr) {
     llvm::raw_string_ostream stream(callee);
     operands.front().print(stream);
     stream.flush();
+    if (StringRef(callee).contains("clog2")) {
+      if (operands.size() != 2)
+        return false;
+      return isSpellableParamWidth(operands[1]);
+    }
     if (!isArithmeticParamCallee(callee))
       return false;
     operands = operands.drop_front();
