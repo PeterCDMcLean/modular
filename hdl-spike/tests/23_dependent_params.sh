@@ -27,17 +27,28 @@ fi
 "$MOJO" build --emit=circt -o "$out/23_dependent_params.mlir" "${inc[@]}" \
     "$root/hdl-spike/designs/23_dependent_params.mojo"
 diff -u "$root/hdl-spike/expected/23_dependent_params.mlir" "$out/23_dependent_params.mlir"
-grep -q 'hw.module @DepCounter_8_1.*out out : i9' "$out/23_dependent_params.mlir"
-grep -q 'hw.module @DepCounter_16_4.*out out : i20' "$out/23_dependent_params.mlir"
-grep -q 'comb.add %1, %c1_i9 : i9' "$out/23_dependent_params.mlir"
-grep -q 'comb.add %1, %c4_i20 : i20' "$out/23_dependent_params.mlir"
+# One generic module with symbolic W+E state, not one per binding tuple.
+grep -q 'hw.module @DepCounter<W: i32 = 8, E: i32 = 1>' "$out/23_dependent_params.mlir"
+! grep -q 'DepCounter_8_1\|DepCounter_16_4' "$out/23_dependent_params.mlir"
+grep -q 'out out : !hw.int<#hw.param.expr.add<' "$out/23_dependent_params.mlir"
+grep -q "sv.verbatim.expr \"(E + W)'(E)\"" "$out/23_dependent_params.mlir"
+grep -q 'hw.instance "a" @DepCounter<W: i32 = 8, E: i32 = 1>' \
+    "$out/23_dependent_params.mlir"
+grep -q 'hw.instance "b" @DepCounter<W: i32 = 16, E: i32 = 4>' \
+    "$out/23_dependent_params.mlir"
 
 "$MOJO" build --emit=sv -o "$out/23_dependent_params.raw.sv" "${inc[@]}" \
     "$root/hdl-spike/designs/23_dependent_params.mojo"
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' "$out/23_dependent_params.raw.sv" \
     | grep -v '^$' > "$out/23_dependent_params.sv"
 diff -u "$root/hdl-spike/expected/23_dependent_params.sv" "$out/23_dependent_params.sv"
-grep -q 'output wire \[8:0\] out' "$out/23_dependent_params.sv"
-grep -q 'output wire \[19:0\] out' "$out/23_dependent_params.sv"
+grep -q '^  #(parameter W = 8,$' "$out/23_dependent_params.sv"
+grep -q '^    parameter E = 1) ($' "$out/23_dependent_params.sv"
+grep -q 'output wire \[E + W - 1:0\] out' "$out/23_dependent_params.sv"
+grep -q "assign _GEN = _GEN_0 + (E + W)'(E);" "$out/23_dependent_params.sv"
+grep -q '^  DepCounter a ($' "$out/23_dependent_params.sv"
+grep -q '^    .E(4)$' "$out/23_dependent_params.sv"
+grep -q 'output wire \[8:0\]  run_a_out' "$out/23_dependent_params.sv"
+grep -q 'output wire \[19:0\] run_b_out' "$out/23_dependent_params.sv"
 
 echo "23_dependent_params: ok"

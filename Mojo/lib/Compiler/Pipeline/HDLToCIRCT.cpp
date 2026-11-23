@@ -764,6 +764,7 @@ static bool isSimpleParametricStruct(ModuleOp source, StringRef name,
                                      ArrayAttr modules);
 static bool isGenericParametricStruct(ModuleOp source, StringRef name,
                                       ArrayAttr modules);
+static bool isSpellableParamWidth(TypedAttr attr);
 static std::optional<std::string>
 emitParamFunctionText(ModuleOp source, StringRef symbol,
                       ArrayRef<std::string> arguments, std::string &svName,
@@ -833,6 +834,7 @@ private:
   Type fieldType(unsigned index);
   std::string widthAttrText(TypedAttr attr);
   Value constantOfType(Type type, const llvm::APInt &value);
+  Value constantOfType(Type type, StringRef valueText);
   Type callWidthType(Operation *op);
   LogicValue getLogicValue(Value value);
   LogicValue getOrCreateLogicReg(unsigned fieldIndex, unsigned width);
@@ -871,6 +873,9 @@ private:
   DenseMap<unsigned, LogicValue> logicRegs;
   DenseMap<unsigned, LogicValue> logicNext;
   DenseMap<Value, llvm::APInt> intConstants;
+  /// Parameter-valued constants (`Bits[W + E](E)`); their text is consumed by
+  /// the width-cast path rather than materialized on their own.
+  DenseMap<Value, TypedAttr> paramConstants;
   DenseMap<Value, unsigned> fieldPtrs;
   DenseMap<Value, unsigned> instancePtrs;
   DenseMap<unsigned, unsigned> instanceMethod;
@@ -928,6 +933,7 @@ private:
   DenseMap<Value, SmallVector<std::pair<unsigned, StructFieldInit>>>
       structFieldInits;
   std::optional<std::string> getParamOperandText(TypedAttr attr);
+  std::optional<std::string> getParamExprText(KGEN::ParamOperatorAttr expr);
   std::optional<std::string> getParamStructText(TypedAttr value, bool packed);
   std::optional<TypedAttr> getPortWidthAttr(TypedAttr attr);
   Type getPortType(Type sourceType, bool &isLogic);
@@ -1120,6 +1126,15 @@ private:
   hw::HWModuleOp builtModule;
 };
 
+/// True for the `SIMD` helpers that parameter arithmetic uses in width
+/// expressions (`W // 2`, `W * 2`, ...).
+static bool isArithmeticParamCallee(StringRef callee) {
+  return callee.contains("__floordiv__") || callee.contains("::__div__") ||
+         callee.contains("__ceildiv__") || callee.contains("__mod__") ||
+         callee.contains("__mul__") || callee.contains("__add__") ||
+         callee.contains("__sub__");
+}
+
 static unsigned paramFieldBits(Type type) {
   unsigned width = getBitWidth(type);
   return width ? width : 64;
@@ -1176,19 +1191,26 @@ static std::string paramStructLeafName(TypedAttr constructor) {
   return name;
 }
 
+/// Negate a previously spelled expression, cancelling a leading `!(...)`.
+static std::string negateParamText(std::string text) {
+  if (StringRef(text).starts_with("!(") && text.ends_with(")"))
+    return text.substr(2, text.size() - 3);
+  return "!(" + text + ")";
+}
+
 std::optional<std::string>
 CirctModuleEmitter::getParamOperandText(TypedAttr attr) {
   if (!attr)
     return std::nullopt;
   if (auto integer = dyn_cast<IntegerAttr>(attr)) {
     SmallString<16> text;
-    integer.getValue().toString(text, 10, /*signed=*/false);
+    integer.getValue().toString(text, 10, /*signed=*/true);
     return text.str().str();
   }
   if (auto simd = dyn_cast<KGEN::SIMDAttr>(attr))
     if (simd.getValues().size() == 1) {
       SmallString<16> text;
-      simd.getValues()[0].getIntVal().toString(text, 10, false);
+      simd.getValues()[0].getIntVal().toString(text, 10, /*signed=*/true);
       return text.str().str();
     }
   if (auto index = dyn_cast<KGEN::ParamIndexRefAttr>(attr);
@@ -1203,10 +1225,170 @@ CirctModuleEmitter::getParamOperandText(TypedAttr attr) {
   // `apply` producing a struct value directly.
   if (auto store = dyn_cast<StoreToMemAttr>(attr))
     return getParamStructText(store.getValue(), /*packed=*/false);
-  if (isa<KGEN::ParamOperatorAttr>(attr))
+  if (auto expr = dyn_cast<KGEN::ParamOperatorAttr>(attr)) {
     if (isa<KGEN::StructType>(attr.getType()))
-      return getParamStructText(attr, /*packed=*/true);
+      return getParamStructText(expr, /*packed=*/true);
+    return getParamExprText(expr);
+  }
+  if (auto identical = dyn_cast<KGEN::ParamIdenticalAttr>(attr)) {
+    auto values = identical.getOperands();
+    if (values.size() == 2)
+      if (auto constant = getTypedAttrBool(values[1], nullptr)) {
+        auto operand = getParamOperandText(values[0]);
+        if (!operand)
+          return std::nullopt;
+        return *constant ? *operand : negateParamText(*operand);
+      }
+    SmallVector<std::string> operands;
+    for (TypedAttr operand : values) {
+      auto text = getParamOperandText(operand);
+      if (!text)
+        return std::nullopt;
+      operands.push_back(*text);
+    }
+    if (operands.size() < 2)
+      return std::nullopt;
+    std::string text = "(" + operands[0];
+    for (unsigned i = 1; i < operands.size(); ++i)
+      text += " == " + operands[i];
+    return text + ")";
+  }
   return std::nullopt;
+}
+
+/// Spell a parameter operator as SystemVerilog text. This covers expressions
+/// that have no `hw.param.expr` opcode (`cond`, arithmetic `apply`) and is
+/// used both for width fallbacks and for parameter-valued constants.
+std::optional<std::string>
+CirctModuleEmitter::getParamExprText(KGEN::ParamOperatorAttr expr) {
+  auto operandText = [&](size_t index) -> std::optional<std::string> {
+    auto operands = expr.getOperands();
+    if (index >= operands.size())
+      return std::nullopt;
+    return getParamOperandText(operands[index]);
+  };
+  auto fold = [&](StringRef separator) -> std::optional<std::string> {
+    std::string text = "(";
+    for (unsigned i = 0; i < expr.getOperands().size(); ++i) {
+      auto operand = operandText(i);
+      if (!operand)
+        return std::nullopt;
+      if (i)
+        text += separator.str();
+      text += *operand;
+    }
+    return text + ")";
+  };
+  switch (expr.getOpcode()) {
+  case KGEN::POC::Add: {
+    // `W - 1` is normalized to `add(W, -1)`; spell negative addends as
+    // subtraction.
+    std::string text = "(";
+    bool first = true;
+    for (TypedAttr operand : expr.getOperands()) {
+      if (auto constant = getTypedAttrInt(operand, nullptr);
+          constant && constant->isNegative()) {
+        SmallString<16> value;
+        (-*constant).toString(value, 10, /*signed=*/false);
+        text += first ? std::string("-") + value.str().str()
+                      : std::string(" - ") + value.str().str();
+      } else {
+        auto spelled = getParamOperandText(operand);
+        if (!spelled)
+          return std::nullopt;
+        if (!first)
+          text += " + ";
+        text += *spelled;
+      }
+      first = false;
+    }
+    return text + ")";
+  }
+  case KGEN::POC::Mul:
+  case KGEN::POC::MulNoWrap: return fold(" * ");
+  case KGEN::POC::And: return fold(" & ");
+  case KGEN::POC::Or: return fold(" | ");
+  case KGEN::POC::Xor: {
+    // Logical negation is encoded as `xor(x, true)`.
+    if (expr.getOperands().size() == 2) {
+      if (auto constant = getTypedAttrBool(expr.getOperands()[1], nullptr))
+        if (*constant) {
+          auto operand = getParamOperandText(expr.getOperands()[0]);
+          if (!operand)
+            return std::nullopt;
+          return negateParamText(*operand);
+        }
+    }
+    return fold(" ^ ");
+  }
+  case KGEN::POC::Shl: return fold(" << ");
+  case KGEN::POC::Shr: return fold(" >> ");
+  case KGEN::POC::Div:
+  case KGEN::POC::DivS:
+  case KGEN::POC::DivU:
+  case KGEN::POC::FloorDivS: return fold(" / ");
+  case KGEN::POC::Mod:
+  case KGEN::POC::RemS:
+  case KGEN::POC::RemU: return fold(" % ");
+  case KGEN::POC::EQ: return fold(" == ");
+  case KGEN::POC::LT: return fold(" < ");
+  case KGEN::POC::LE: return fold(" <= ");
+  case KGEN::POC::Max:
+  case KGEN::POC::Min: {
+    auto lhs = operandText(0);
+    auto rhs = operandText(1);
+    if (!lhs || !rhs)
+      return std::nullopt;
+    StringRef comparison = expr.getOpcode() == KGEN::POC::Max ? " > " : " < ";
+    return "(" + *lhs + comparison.str() + *rhs + " ? " + *lhs + " : " + *rhs +
+           ")";
+  }
+  case KGEN::POC::Cond: {
+    if (expr.getOperands().size() != 3)
+      return std::nullopt;
+    auto condition = operandText(0);
+    auto whenTrue = operandText(1);
+    auto whenFalse = operandText(2);
+    if (!condition || !whenTrue || !whenFalse)
+      return std::nullopt;
+    return "(" + *condition + " ? " + *whenTrue + " : " + *whenFalse + ")";
+  }
+  case KGEN::POC::Apply: {
+    auto operands = expr.getOperands();
+    if (operands.size() < 2)
+      return std::nullopt;
+    std::string callee;
+    llvm::raw_string_ostream stream(callee);
+    operands.front().print(stream);
+    stream.flush();
+    if (!isArithmeticParamCallee(callee))
+      return std::nullopt;
+    SmallVector<std::string> args;
+    for (TypedAttr operand : operands.drop_front()) {
+      auto text = getParamOperandText(operand);
+      if (!text)
+        return std::nullopt;
+      args.push_back(*text);
+    }
+    if (args.size() != 2)
+      return std::nullopt;
+    if (StringRef(callee).contains("__ceildiv__"))
+      return "((" + args[0] + " + " + args[1] + " - 1) / " + args[1] + ")";
+    StringRef separator = " + ";
+    if (StringRef(callee).contains("__floordiv__") ||
+        StringRef(callee).contains("::__div__"))
+      separator = " / ";
+    else if (StringRef(callee).contains("__mod__"))
+      separator = " % ";
+    else if (StringRef(callee).contains("__mul__"))
+      separator = " * ";
+    else if (StringRef(callee).contains("__sub__"))
+      separator = " - ";
+    return "(" + args[0] + separator.str() + args[1] + ")";
+  }
+  default:
+    return std::nullopt;
+  }
 }
 
 std::optional<std::string>
@@ -1292,12 +1474,18 @@ CirctModuleEmitter::getPortWidthAttr(TypedAttr attr) {
         return hw::ParamVerbatimAttr::get(
             StringAttr::get(builder.getContext(), call), i32);
       }
+      // Arithmetic helpers (`W // 2`) are spelled as SystemVerilog text.
+      if (isArithmeticParamCallee(callee))
+        if (auto text = getParamExprText(expr))
+          return hw::ParamVerbatimAttr::get(
+              StringAttr::get(builder.getContext(), *text), i32);
       // User-defined pure parameter function: generate an SV function.
       auto at = callee.find("@\"");
       auto quote = at == std::string::npos
                        ? std::string::npos
                        : callee.find("\"", at + 2);
-      if (at != std::string::npos && quote != std::string::npos &&
+      if (!isArithmeticParamCallee(callee) && at != std::string::npos &&
+          quote != std::string::npos &&
           arguments.size() == expr.getOperands().size() - 1) {
         StringRef symbol = StringRef(callee).slice(at + 2, quote);
         std::string svName;
@@ -1330,7 +1518,13 @@ CirctModuleEmitter::getPortWidthAttr(TypedAttr attr) {
     case KGEN::POC::Mod:
     case KGEN::POC::RemU: opcode = hw::PEO::ModU; break;
     case KGEN::POC::RemS: opcode = hw::PEO::ModS; break;
-    default: return std::nullopt;
+    default:
+      // `cond`, subtraction normalized to `add(W, -1)`, and other forms that
+      // have no structured opcode fall back to verbatim SystemVerilog text.
+      if (auto text = getParamOperandText(attr))
+        return hw::ParamVerbatimAttr::get(
+            StringAttr::get(builder.getContext(), *text), i32);
+      return std::nullopt;
     }
     SmallVector<TypedAttr> operands;
     for (TypedAttr operand : expr.getOperands()) {
@@ -3197,11 +3391,38 @@ Type CirctModuleEmitter::fieldType(unsigned index) {
 std::string CirctModuleEmitter::widthAttrText(TypedAttr attr) {
   if (!attr)
     return {};
+  if (auto integer = dyn_cast<IntegerAttr>(attr)) {
+    SmallString<16> text;
+    integer.getValue().toString(text, 10, /*signed=*/true);
+    return text.str().str();
+  }
   if (auto declRef = dyn_cast<hw::ParamDeclRefAttr>(attr))
     return declRef.getName().getValue().str();
   if (auto verbatim = dyn_cast<hw::ParamVerbatimAttr>(attr))
     return verbatim.getValue().getValue().str();
   if (auto expr = dyn_cast<hw::ParamExprAttr>(attr)) {
+    if (expr.getOpcode() == hw::PEO::Add) {
+      std::string text = "(";
+      bool first = true;
+      for (TypedAttr operand : expr.getOperands()) {
+        if (auto integer = dyn_cast<IntegerAttr>(operand);
+            integer && integer.getValue().isNegative()) {
+          SmallString<16> value;
+          (-integer.getValue()).toString(value, 10, /*signed=*/false);
+          text += first ? std::string("-") + value.str().str()
+                      : std::string(" - ") + value.str().str();
+        } else {
+          std::string spelled = widthAttrText(operand);
+          if (spelled.empty())
+            return {};
+          if (!first)
+            text += " + ";
+          text += spelled;
+        }
+        first = false;
+      }
+      return text + ")";
+    }
     StringRef op;
     switch (expr.getOpcode()) {
     case hw::PEO::Add: op = " + "; break;
@@ -3249,6 +3470,19 @@ Value CirctModuleEmitter::constantOfType(Type type, const llvm::APInt &value) {
   value.toString(text, 10, /*signed=*/false);
   return sv::VerbatimExprOp::create(builder, loc, type,
                                     (width + "'(" + text + ")").str());
+}
+
+/// Materialize a parameter-valued constant of `type` from already-spelled
+/// SystemVerilog text, e.g. `(W + E)'(E)`.
+Value CirctModuleEmitter::constantOfType(Type type, StringRef valueText) {
+  auto intType = dyn_cast<hw::IntType>(type);
+  if (!intType)
+    return {};
+  std::string width = widthAttrText(intType.getWidth());
+  if (width.empty())
+    return {};
+  return sv::VerbatimExprOp::create(builder, loc, type,
+                                    (width + "'(" + valueText + ")").str());
 }
 
 /// The symbolic integer type of a `Bits[W]`/`Logic[W]` call's first type
@@ -3733,6 +3967,11 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     }
     if (auto value = getConstantInt(op, &bindings)) {
       intConstants[op->getResult(0)] = *value;
+      return success();
+    }
+    if (TypedAttr value = op->getAttrOfType<TypedAttr>("value");
+        value && isSpellableParamWidth(value)) {
+      paramConstants[op->getResult(0)] = value;
       return success();
     }
     return op->emitError()
@@ -5450,11 +5689,25 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
           Type constantType =
               width ? IntegerType::get(builder.getContext(), width)
                     : callWidthType(op);
-          if (!constantType || !value)
+          if (!constantType)
             return op->emitError()
                    << "HDL lowering: unsupported Bits constructor argument";
-          Value constant = constantOfType(
-              constantType, value->zextOrTrunc(width ? width : 64));
+          Value constant;
+          if (value) {
+            constant = constantOfType(
+                constantType, value->zextOrTrunc(width ? width : 64));
+          } else if (!width) {
+            // Parameter-valued argument, e.g. `Bits[W + E](E)`.
+            TypedAttr valueAttr =
+                valueOp ? valueOp->getAttrOfType<TypedAttr>("value")
+                        : TypedAttr();
+            if (auto text =
+                    valueAttr ? getParamOperandText(valueAttr) : std::nullopt)
+              constant = constantOfType(constantType, *text);
+          }
+          if (!constant)
+            return op->emitError()
+                   << "HDL lowering: unsupported Bits constructor argument";
           values[op->getOperand(1)] = constant;
           if (op->getOperand(1) == resultPtr)
             recordReturn(constant);
@@ -7178,13 +7431,63 @@ static bool isSimpleParametricStruct(ModuleOp source, StringRef name,
   return true;
 }
 
-/// True when a width attribute can be printed as a SystemVerilog width without
-/// any parameter-expression rewriting: an integer literal or a direct
-/// reference to a parameter.
-static bool isDirectParamWidth(TypedAttr attr) {
-  return isa<IntegerAttr>(attr) || isa<KGEN::SIMDAttr>(attr) ||
-         isa<KGEN::ParamDeclRefAttr>(attr) ||
-         isa<KGEN::ParamIndexRefAttr>(attr);
+/// True when a width attribute can be spelled as a SystemVerilog width, either
+/// through `hw.param.expr` or through the verbatim text fallback.
+static bool isSpellableParamWidth(TypedAttr attr) {
+  if (!attr)
+    return false;
+  if (isa<IntegerAttr>(attr) || isa<KGEN::SIMDAttr>(attr) ||
+      isa<KGEN::ParamDeclRefAttr>(attr) ||
+      isa<KGEN::ParamIndexRefAttr>(attr) ||
+      isa<hw::ParamVerbatimAttr>(attr))
+    return true;
+  if (auto identical = dyn_cast<KGEN::ParamIdenticalAttr>(attr)) {
+    for (TypedAttr operand : identical.getOperands())
+      if (!isSpellableParamWidth(operand))
+        return false;
+    return true;
+  }
+  auto expr = dyn_cast<KGEN::ParamOperatorAttr>(attr);
+  if (!expr)
+    return false;
+  ArrayRef<TypedAttr> operands = expr.getOperands();
+  if (expr.getOpcode() == KGEN::POC::Apply) {
+    if (operands.size() < 2)
+      return false;
+    std::string callee;
+    llvm::raw_string_ostream stream(callee);
+    operands.front().print(stream);
+    stream.flush();
+    if (!isArithmeticParamCallee(callee))
+      return false;
+    operands = operands.drop_front();
+  } else {
+    switch (expr.getOpcode()) {
+    case KGEN::POC::Add:
+    case KGEN::POC::Mul:
+    case KGEN::POC::MulNoWrap:
+    case KGEN::POC::And:
+    case KGEN::POC::Or:
+    case KGEN::POC::Xor:
+    case KGEN::POC::Max:
+    case KGEN::POC::Min:
+    case KGEN::POC::Shl:
+    case KGEN::POC::Shr:
+    case KGEN::POC::Div:
+    case KGEN::POC::Mod:
+    case KGEN::POC::EQ:
+    case KGEN::POC::LT:
+    case KGEN::POC::LE:
+    case KGEN::POC::Cond:
+      break;
+    default:
+      return false;
+    }
+  }
+  for (TypedAttr operand : operands)
+    if (!isSpellableParamWidth(operand))
+      return false;
+  return true;
 }
 
 /// True when a parameterized module can be emitted once with symbolic widths.
@@ -7226,7 +7529,7 @@ static bool isGenericParametricStruct(ModuleOp source, StringRef name,
         return false;
     }
     if (StringRef(getDslTypeName(valueType)).contains("Bits") &&
-        !isDirectParamWidth(getDslTypeParamAttr(valueType, 0)))
+        !isSpellableParamWidth(getDslTypeParamAttr(valueType, 0)))
       return false;
   }
   // The shared body can only spell constructor constants that are literals.
@@ -7249,7 +7552,12 @@ static bool isGenericParametricStruct(ModuleOp source, StringRef name,
       if (op->getNumOperands() != 2)
         return;
       Operation *valueOp = op->getOperand(0).getDefiningOp();
-      if (!valueOp || !getConstantInt(valueOp, nullptr))
+      if (valueOp && getConstantInt(valueOp, nullptr))
+        return;
+      // Parameter-valued constants are spelled as `width'(expr)`.
+      TypedAttr valueAttr =
+          valueOp ? valueOp->getAttrOfType<TypedAttr>("value") : TypedAttr();
+      if (!valueAttr || !isSpellableParamWidth(valueAttr))
         literals = false;
     });
   });

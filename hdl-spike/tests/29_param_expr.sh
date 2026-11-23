@@ -27,20 +27,26 @@ fi
 "$MOJO" build --emit=circt -o "$out/29_param_expr.mlir" "${inc[@]}" \
     "$root/hdl-spike/designs/29_param_expr.mojo"
 diff -u "$root/hdl-spike/expected/29_param_expr.mlir" "$out/29_param_expr.mlir"
-grep -q 'hw.module @SubMod_8.*out out : i8' "$out/29_param_expr.mlir"
-grep -q '%c1_i7 = hw.constant 1' "$out/29_param_expr.mlir"
-grep -q '%c2_i4 = hw.constant 2' "$out/29_param_expr.mlir"
-grep -q '%c3_i8 = hw.constant 3' "$out/29_param_expr.mlir"
-grep -q 'hw.module @DivMod_9' "$out/29_param_expr.mlir"
-grep -q 'hw.module @MaxMod_8_2' "$out/29_param_expr.mlir"
+# One generic module per expression form; state widths stay symbolic.
+grep -q 'hw.module @SubMod<W: i32 = 8>' "$out/29_param_expr.mlir"
+grep -q 'hw.module @DivMod<W: i32 = 8>' "$out/29_param_expr.mlir"
+grep -q 'hw.module @MaxMod<W: i32 = 8, E: i32 = 2>' "$out/29_param_expr.mlir"
+! grep -q 'SubMod_8\|DivMod_9\|MaxMod_8_2' "$out/29_param_expr.mlir"
+grep -q '#hw.param.expr.add<#hw.param.decl.ref<"W">, -1>' \
+    "$out/29_param_expr.mlir"
+grep -q '#hw.param.verbatim<"(W / 2)">' "$out/29_param_expr.mlir"
+grep -q '#hw.param.verbatim<"((E < W) ? W : E)">' "$out/29_param_expr.mlir"
 
 "$MOJO" build --emit=sv -o "$out/29_param_expr.raw.sv" "${inc[@]}" \
     "$root/hdl-spike/designs/29_param_expr.mojo"
 sed -e 's/[[:space:]]*\/\/.*$//' -e 's/[[:space:]]*$//' "$out/29_param_expr.raw.sv" \
     | grep -v '^$' > "$out/29_param_expr.sv"
 diff -u "$root/hdl-spike/expected/29_param_expr.sv" "$out/29_param_expr.sv"
-grep -q 'logic \[6:0\] _GEN_0 = 7.h1' "$out/29_param_expr.sv"
-grep -q 'logic \[3:0\] _GEN_0 = 4.h2' "$out/29_param_expr.sv"
-grep -q 'logic \[7:0\] _GEN_0 = 8.h3' "$out/29_param_expr.sv"
+grep -q 'wire \[W - 2:0\] _GEN;' "$out/29_param_expr.sv"
+grep -q "assign out = W'(0);" "$out/29_param_expr.sv"
+grep -q 'wire \[(W / 2) - 1:0\] _GEN;' "$out/29_param_expr.sv"
+grep -q "_GEN_0 <= (W - 1)'(1);" "$out/29_param_expr.sv"
+grep -q 'wire \[((E < W) ? W : E) - 1:0\] _GEN;' "$out/29_param_expr.sv"
+grep -q "_GEN_0 <= ((E < W) ? W : E)'(3);" "$out/29_param_expr.sv"
 
 echo "29_param_expr: ok"
