@@ -729,10 +729,14 @@ static std::optional<bool> getConstantBool(Operation *op) {
 
 static KGEN::StructGeneratorOp findStructGenerator(ModuleOp source,
                                                    StringRef name);
+static Operation *findFunctionInModule(ModuleOp source, StringRef name);
 static KGEN::StructInstanceType getStructInstanceType(ModuleOp source,
                                                       StringRef name);
 static bool isSimpleParametricStruct(ModuleOp source, StringRef name,
                                      ArrayAttr modules);
+static std::optional<std::string>
+emitParamFunctionText(ModuleOp source, StringRef symbol,
+                      ArrayRef<std::string> arguments, std::string &svName);
 
 /// Emits one `hw.module` per `@module` struct by building real CIRCT ops.
 class CirctModuleEmitter {
@@ -819,6 +823,7 @@ private:
   ParamBindings bindings;
   SmallVector<KGEN::ParamDeclAttr> params;
   std::set<std::string> paramHelpers;
+  std::set<std::string> paramHelperTexts;
   ModuleOp scratch;
   ArrayAttr hdlModules;
   OpBuilder builder;
@@ -1133,20 +1138,41 @@ CirctModuleEmitter::getPortWidthAttr(TypedAttr attr) {
         helper = "hdl_max";
       else if (StringRef(callee).contains("math::min"))
         helper = "hdl_min";
-      if (!helper.empty()) {
-        SmallVector<std::string> arguments;
-        for (TypedAttr operand : expr.getOperands().drop_front())
-          if (auto text = getParamOperandText(operand))
-            arguments.push_back(*text);
-        if (arguments.size() >= 2) {
-          std::string call = helper.str() + "(";
+      SmallVector<std::string> arguments;
+      for (TypedAttr operand : expr.getOperands().drop_front())
+        if (auto text = getParamOperandText(operand))
+          arguments.push_back(*text);
+      if (!helper.empty() && arguments.size() >= 2) {
+        std::string call = helper.str() + "(";
+        for (unsigned i = 0; i < arguments.size(); ++i) {
+          if (i)
+            call += ", ";
+          call += arguments[i];
+        }
+        call += ")";
+        paramHelpers.insert(helper.str());
+        return hw::ParamVerbatimAttr::get(
+            StringAttr::get(builder.getContext(), call), i32);
+      }
+      // User-defined pure parameter function: generate an SV function.
+      auto at = callee.find("@\"");
+      auto quote = at == std::string::npos
+                       ? std::string::npos
+                       : callee.find("\"", at + 2);
+      if (at != std::string::npos && quote != std::string::npos &&
+          arguments.size() == expr.getOperands().size() - 1) {
+        StringRef symbol = StringRef(callee).slice(at + 2, quote);
+        std::string svName;
+        if (auto text =
+                emitParamFunctionText(source, symbol, arguments, svName)) {
+          paramHelperTexts.insert(*text);
+          std::string call = svName + "(";
           for (unsigned i = 0; i < arguments.size(); ++i) {
             if (i)
               call += ", ";
             call += arguments[i];
           }
           call += ")";
-          paramHelpers.insert(helper.str());
           return hw::ParamVerbatimAttr::get(
               StringAttr::get(builder.getContext(), call), i32);
         }
@@ -2177,6 +2203,171 @@ Value CirctModuleEmitter::getStructFieldSlot(Operation *gep, Value root,
         }
   }
   return slot;
+}
+
+static Operation *findFunctionInModule(ModuleOp source, StringRef name) {
+  Operation *result = nullptr;
+  source.walk([&](Operation *op) {
+    if (result)
+      return;
+    auto symbol =
+        op->getAttrOfType<StringAttr>(SymbolTable::getSymbolAttrName());
+    if (symbol && symbol.getValue() == name)
+      result = op;
+  });
+  return result;
+}
+
+static std::optional<std::string>
+emitParamFunctionText(ModuleOp source, StringRef symbol,
+                      ArrayRef<std::string> arguments, std::string &svName) {
+  Operation *fn = findFunctionInModule(source, symbol);
+  if (!fn || fn->getNumRegions() == 0 || fn->getRegion(0).empty())
+    return std::nullopt;
+  Block &body = fn->getRegion(0).front();
+  if (body.getNumArguments() != arguments.size())
+    return std::nullopt;
+
+  StringRef base = symbol.split('(').first;
+  StringRef leaf = base.rsplit("::").second;
+  if (leaf.empty())
+    return std::nullopt;
+  svName = "hdl_" + leaf.str();
+
+  DenseMap<Value, std::string> values;
+  for (unsigned i = 0; i < arguments.size(); ++i)
+    values[body.getArgument(i)] = "a" + std::to_string(i);
+
+  std::string text = "function automatic integer " + svName + "(";
+  for (unsigned i = 0; i < arguments.size(); ++i) {
+    if (i)
+      text += ", ";
+    text += "input integer a" + std::to_string(i);
+  }
+  text += ");\n";
+
+  auto expression = [&](Value value) -> std::optional<std::string> {
+    auto found = values.find(value);
+    if (found == values.end())
+      return std::nullopt;
+    return found->second;
+  };
+  auto pad = [](int indent) { return std::string(indent * 2, ' '); };
+  auto hasBody = [](Region &region) {
+    if (region.empty())
+      return false;
+    for (Operation &inner : region.front())
+      if (inner.getName().getStringRef() != "hlcf.yield")
+        return true;
+    return false;
+  };
+
+  std::function<bool(Block &, int)> emitBlock =
+      [&](Block &block, int indent) -> bool {
+    for (Operation &op : block) {
+      StringRef name = op.getName().getStringRef();
+      if (name == "hlcf.yield")
+        continue;
+      if (name == "hlcf.return") {
+        if (op.getNumOperands() != 1)
+          return false;
+        auto value = expression(op.getOperand(0));
+        if (!value)
+          return false;
+        text += pad(indent) + "return " + *value + ";\n";
+        continue;
+      }
+      if (name == "hlcf.if") {
+        if (op.getNumOperands() != 1 || op.getNumRegions() != 2)
+          return false;
+        auto condition = expression(op.getOperand(0));
+        if (!condition)
+          return false;
+        text += pad(indent) + "if (" + *condition + ") begin\n";
+        if (!emitBlock(op.getRegion(0).front(), indent + 1))
+          return false;
+        if (hasBody(op.getRegion(1))) {
+          text += pad(indent) + "end else begin\n";
+          if (!emitBlock(op.getRegion(1).front(), indent + 1))
+            return false;
+        }
+        text += pad(indent) + "end\n";
+        continue;
+      }
+      if (name == "kgen.param.constant" || name == "pop.constant") {
+        if (auto constant = getConstantInt(&op, nullptr)) {
+          SmallString<16> value;
+          constant->toString(value, 10, /*signed=*/false);
+          values[op.getResult(0)] = value.str().str();
+          continue;
+        }
+        return false;
+      }
+      if (name == "kgen.call") {
+        StringRef callee = callCalleeName(&op);
+        if (callee.contains("__mlir_bool__") && op.getNumOperands() == 1) {
+          auto value = expression(op.getOperand(0));
+          if (!value)
+            return false;
+          values[op.getResult(0)] = *value;
+          continue;
+        }
+        StringRef binary;
+        if (callee.contains("SIMD::__lt__"))
+          binary = "<";
+        else if (callee.contains("SIMD::__le__"))
+          binary = "<=";
+        else if (callee.contains("SIMD::__gt__"))
+          binary = ">";
+        else if (callee.contains("SIMD::__ge__"))
+          binary = ">=";
+        else if (callee.contains("SIMD::__eq__"))
+          binary = "==";
+        else if (callee.contains("SIMD::__ne__"))
+          binary = "!=";
+        else if (callee.contains("SIMD::__add__"))
+          binary = "+";
+        else if (callee.contains("SIMD::__sub__"))
+          binary = "-";
+        else if (callee.contains("SIMD::__mul__"))
+          binary = "*";
+        else if (callee.contains("SIMD::__floordiv__") ||
+                 callee.contains("SIMD::__div__"))
+          binary = "/";
+        else if (callee.contains("SIMD::__mod__"))
+          binary = "%";
+        else if (callee.contains("SIMD::__and__"))
+          binary = "&";
+        else if (callee.contains("SIMD::__or__"))
+          binary = "|";
+        else if (callee.contains("SIMD::__xor__"))
+          binary = "^";
+        else if (callee.contains("SIMD::__shl__"))
+          binary = "<<";
+        else if (callee.contains("SIMD::__shr__"))
+          binary = ">>";
+        if (!binary.empty() && op.getNumOperands() == 2) {
+          auto lhs = expression(op.getOperand(0));
+          auto rhs = expression(op.getOperand(1));
+          if (!lhs || !rhs)
+            return false;
+          values[op.getResult(0)] =
+              "(" + *lhs + " " + binary.str() + " " + *rhs + ")";
+          continue;
+        }
+        return false;
+      }
+      if (name.starts_with("pop.stack_alloc") || name.starts_with("debuginfo."))
+        continue;
+      return false;
+    }
+    return true;
+  };
+
+  if (!emitBlock(body, 1))
+    return std::nullopt;
+  text += "endfunction\n";
+  return text;
 }
 
 LogicalResult CirctModuleEmitter::emitStructConstructor(Operation *op,
@@ -6514,6 +6705,16 @@ LogicalResult CirctModuleEmitter::build() {
       helpers.push_back(StringAttr::get(ctx, helper));
     scratch->setAttr("hdl.param_helpers", ArrayAttr::get(ctx, helpers));
   }
+  if (!paramHelperTexts.empty()) {
+    SmallVector<Attribute> texts;
+    if (auto existing =
+            scratch->getAttrOfType<ArrayAttr>("hdl.param_helper_texts"))
+      for (Attribute attr : existing)
+        texts.push_back(attr);
+    for (const std::string &text : paramHelperTexts)
+      texts.push_back(StringAttr::get(ctx, text));
+    scratch->setAttr("hdl.param_helper_texts", ArrayAttr::get(ctx, texts));
+  }
 
   SmallVector<Value> outputValues;
   for (unsigned m = 0; m < methods.size(); ++m) {
@@ -7160,8 +7361,9 @@ LogicalResult lowerHDLHLMemToSV(ModuleOp module) {
 }
 
 LogicalResult exportHDLSystemVerilog(ModuleOp module, raw_ostream &os) {
+  bool needMax = false, needMin = false;
+  std::string text;
   if (auto helpers = module->getAttrOfType<ArrayAttr>("hdl.param_helpers")) {
-    bool needMax = false, needMin = false;
     for (Attribute attr : helpers) {
       StringRef name = cast<StringAttr>(attr).getValue();
       if (name == "hdl_max")
@@ -7169,22 +7371,25 @@ LogicalResult exportHDLSystemVerilog(ModuleOp module, raw_ostream &os) {
       else if (name == "hdl_min")
         needMin = true;
     }
-    if (needMax || needMin) {
-      std::string text;
-      if (needMax)
-        text += "function automatic integer hdl_max(input integer a, "
-                "input integer b);\n"
-                "  return (a > b) ? a : b;\n"
-                "endfunction\n";
-      if (needMin)
-        text += "function automatic integer hdl_min(input integer a, "
-                "input integer b);\n"
-                "  return (a < b) ? a : b;\n"
-                "endfunction\n";
-      OpBuilder builder(module.getContext());
-      builder.setInsertionPointToStart(module.getBody());
-      sv::VerbatimOp::create(builder, module.getLoc(), text);
-    }
+  }
+  if (needMax)
+    text += "function automatic integer hdl_max(input integer a, "
+            "input integer b);\n"
+            "  return (a > b) ? a : b;\n"
+            "endfunction\n";
+  if (needMin)
+    text += "function automatic integer hdl_min(input integer a, "
+            "input integer b);\n"
+            "  return (a < b) ? a : b;\n"
+            "endfunction\n";
+  if (auto texts =
+          module->getAttrOfType<ArrayAttr>("hdl.param_helper_texts"))
+    for (Attribute attr : texts)
+      text += cast<StringAttr>(attr).getValue().str();
+  if (!text.empty()) {
+    OpBuilder builder(module.getContext());
+    builder.setInsertionPointToStart(module.getBody());
+    sv::VerbatimOp::create(builder, module.getLoc(), text);
   }
   return circt::exportVerilog(module, os);
 }
