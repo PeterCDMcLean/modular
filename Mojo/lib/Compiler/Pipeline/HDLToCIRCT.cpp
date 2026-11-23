@@ -837,7 +837,7 @@ private:
   Value constantOfType(Type type, StringRef valueText);
   Type callWidthType(Operation *op);
   LogicValue getLogicValue(Value value);
-  LogicValue getOrCreateLogicReg(unsigned fieldIndex, unsigned width);
+  LogicValue getOrCreateLogicReg(unsigned fieldIndex, Type type);
   LogicalResult storeLogicField(unsigned fieldIndex, LogicValue value,
                                 Value condition);
   Value bitNot(Value value);
@@ -3215,14 +3215,17 @@ CirctModuleEmitter::LogicValue CirctModuleEmitter::getLogicValue(Value value) {
   auto field = fieldPtrs.find(value);
   if (field != fieldPtrs.end() && field->second < fieldIsLogic.size() &&
       fieldIsLogic[field->second]) {
+    Type type = fieldType(field->second);
+    if (!type)
+      return {};
     fieldReaders[field->second].insert(currentMethod);
-    return getOrCreateLogicReg(field->second, fieldWidths[field->second]);
+    return getOrCreateLogicReg(field->second, type);
   }
   return {};
 }
 
 CirctModuleEmitter::LogicValue
-CirctModuleEmitter::getOrCreateLogicReg(unsigned fieldIndex, unsigned width) {
+CirctModuleEmitter::getOrCreateLogicReg(unsigned fieldIndex, Type type) {
   if (auto delayed = delayedLogicNextRegs.find(fieldIndex);
       delayed != delayedLogicNextRegs.end() && !delayed->second.empty())
     return delayed->second.back();
@@ -3230,7 +3233,7 @@ CirctModuleEmitter::getOrCreateLogicReg(unsigned fieldIndex, unsigned width) {
   if (found != logicRegs.end())
     return found->second;
 
-  auto type = IntegerType::get(builder.getContext(), width);
+  unsigned width = type.isIntOrIndex() ? type.getIntOrFloatBitWidth() : 64;
   llvm::APInt resetValue(width, 0);
   if (auto value = resetValues.find(fieldIndex); value != resetValues.end())
     resetValue = value->second.zextOrTrunc(width);
@@ -3273,8 +3276,10 @@ LogicalResult CirctModuleEmitter::storeLogicField(unsigned fieldIndex,
            << domainName(currentMethod) << "')";
   fieldWriter[fieldIndex] = currentMethod;
 
-  LogicValue regs =
-      getOrCreateLogicReg(fieldIndex, value.val.getType().getIntOrFloatBitWidth());
+  Type regType = fieldType(fieldIndex);
+  if (!regType)
+    regType = value.val.getType();
+  LogicValue regs = getOrCreateLogicReg(fieldIndex, regType);
   LogicValue hold = logicNext.lookup(fieldIndex);
   LogicValue next = value;
   if (condition && hold) {
@@ -3289,8 +3294,19 @@ LogicalResult CirctModuleEmitter::storeLogicField(unsigned fieldIndex,
 
 /// Bitwise complement at the operand's width.
 Value CirctModuleEmitter::bitNot(Value value) {
-  unsigned width = value.getType().getIntOrFloatBitWidth();
-  auto ones = hw::ConstantOp::create(builder, loc, llvm::APInt::getAllOnes(width));
+  Type type = value.getType();
+  Value ones;
+  if (type.isIntOrIndex()) {
+    ones = hw::ConstantOp::create(
+        builder, loc, llvm::APInt::getAllOnes(type.getIntOrFloatBitWidth()));
+  } else if (auto intType = dyn_cast<hw::IntType>(type)) {
+    std::string width = widthAttrText(intType.getWidth());
+    if (width.empty())
+      return {};
+    ones = sv::VerbatimExprOp::create(builder, loc, type, width + "'(-1)");
+  }
+  if (!ones)
+    return {};
   return comb::XorOp::create(builder, loc, value, ones);
 }
 
@@ -3467,7 +3483,7 @@ Value CirctModuleEmitter::constantOfType(Type type, const llvm::APInt &value) {
   if (width.empty())
     return {};
   SmallString<32> text;
-  value.toString(text, 10, /*signed=*/false);
+  value.toString(text, 10, /*signed=*/value.isNegative());
   return sv::VerbatimExprOp::create(builder, loc, type,
                                     (width + "'(" + text + ")").str());
 }
@@ -4219,8 +4235,8 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
                << "HDL lowering: multiple delayed next on Logic field '"
                << fieldNames[field] << "'";
 
-      unsigned width = value.val.getType().getIntOrFloatBitWidth();
-      auto type = IntegerType::get(builder.getContext(), width);
+      Type type = value.val.getType();
+      unsigned width = type.isIntOrIndex() ? type.getIntOrFloatBitWidth() : 64;
       llvm::APInt resetBits(width, 0);
       if (auto reset = resetValues.find(field); reset != resetValues.end())
         resetBits = reset->second.zextOrTrunc(width);
@@ -4255,14 +4271,16 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
 
     auto pastLogicValue = [&](unsigned field,
                               unsigned delay) -> LogicValue {
-      unsigned width = fieldWidths[field];
-      LogicValue current = getOrCreateLogicReg(field, width);
+      Type type = fieldType(field);
+      if (!type)
+        return {};
+      unsigned width = type.isIntOrIndex() ? type.getIntOrFloatBitWidth() : 64;
+      LogicValue current = getOrCreateLogicReg(field, type);
       if (!current || delay == 0)
         return current;
       auto &chain = pastLogicChains[field][delay];
       if (!chain.empty())
         return chain.back();
-      auto type = IntegerType::get(builder.getContext(), width);
       llvm::APInt resetBits(width, 0);
       if (auto reset = resetValues.find(field); reset != resetValues.end())
         resetBits = reset->second.zextOrTrunc(width);
@@ -4931,6 +4949,9 @@ LogicalResult CirctModuleEmitter::emitOp(Operation *op, Value condition,
     // nets. Binary calls take `(lhs, rhs, out-ptr)`, `mux_logic` takes
     // `(cond, a, b, out-ptr)`, and `__invert__` takes `(src, out-ptr)`.
     if (callee.contains("Logic::") || callee.contains("mux_logic")) {
+      // Destructor bookkeeping has no hardware effect.
+      if (callee.contains("::__deinit__") || callee.contains("::__del__"))
+        return success();
       auto storeResult = [&](Value dest, LogicValue value) -> LogicalResult {
         if (!value)
           return failure();
@@ -7492,9 +7513,9 @@ static bool isSpellableParamWidth(TypedAttr attr) {
 
 /// True when a parameterized module can be emitted once with symbolic widths.
 /// Stateless modules always can.  Stateful ones qualify when every field is
-/// plain 2-state `Bits` state (optionally wrapped in `Reg`) whose width is a
-/// literal or a direct parameter reference, and every constructor constant is
-/// an integer literal, so the body needs no specialization.
+/// plain `Bits`/`Logic` state (optionally wrapped in `Reg`) whose width is
+/// spellable, and every constructor constant is a literal or a parameter
+/// reference, so the body needs no specialization.
 static bool isGenericParametricStruct(ModuleOp source, StringRef name,
                                       ArrayAttr modules) {
   if (isSimpleParametricStruct(source, name, modules))
@@ -7515,20 +7536,21 @@ static bool isGenericParametricStruct(ModuleOp source, StringRef name,
     if (typeName.contains("ResetStyle") || typeName.contains("PowerOn") ||
         typeName.contains("ClockDivider"))
       continue; // Compile-time configuration markers.
-    if (typeName.contains("Logic") || typeName.contains("Wire") ||
-        typeName.contains("Array") || typeName.contains("Ram") ||
-        typeName.contains("Mem") || typeName.contains("Packed"))
+    if (typeName.contains("Wire") || typeName.contains("Array") ||
+        typeName.contains("Ram") || typeName.contains("Mem") ||
+        typeName.contains("Packed"))
       return false;
     Type valueType = fieldType;
     if (typeName.ends_with("Reg")) {
       valueType = getDslTypeParam(fieldType, 0);
       StringRef elementName =
           valueType ? getDslTypeName(valueType) : StringRef();
-      if (!valueType || elementName.contains("Logic") ||
-          elementName.contains("Array") || elementName.contains("Packed"))
+      if (!valueType || elementName.contains("Array") ||
+          elementName.contains("Packed"))
         return false;
     }
-    if (StringRef(getDslTypeName(valueType)).contains("Bits") &&
+    StringRef valueName = getDslTypeName(valueType);
+    if ((valueName.contains("Bits") || valueName.contains("Logic")) &&
         !isSpellableParamWidth(getDslTypeParamAttr(valueType, 0)))
       return false;
   }
